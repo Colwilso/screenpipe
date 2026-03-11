@@ -1,0 +1,40 @@
+model_list:
+  - model_name: claude-4-5-sonnet
+    litellm_params:
+      model: bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0 #bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0
+      aws_profile_name: nasc_lma #gr-grid-genai
+      aws_region_name: us-east-1
+      drop_params: true
+      # aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID
+      # aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
+      # aws_region_name: os.environ/AWS_REGION_NAME
+      
+  - model_name: cohere-embed #titan-embed
+    litellm_params:
+      model: bedrock/cohere.embed-v4:0 #amazon.titan-embed-text-v1 #amazon.titan-embed-text-v2:0 #global.cohere.embed-v4:0 #
+      aws_region_name: us-east-1
+      aws_profile_name:  nasc_lma #gr-grid-genai
+      drop_params: true
+      # aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID
+      # aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
+      # aws_region_name: os.environ/AWS_REGION_NAME
+
+  - model_name: titan-embed-512
+    litellm_params:
+      model: bedrock/amazon.titan-embed-text-v2:0 #global.cohere.embed-v4:0 #bedrock/cohere.embed-v4:0 #amazon.titan-embed-text-v1 #amazon.titan-embed-text-v2:0 #
+      aws_region_name: us-east-1
+      aws_profile_name:  nasc_lma #gr-grid-genai
+      drop_params: true
+      dimensions: 512
+      # aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID
+      # aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
+      # aws_region_name: os.environ/AWS_REGION_NAME
+
+
+general_settings:
+  master_key: sk-1234
+
+litellm_settings:
+  modify_params: true
+  drop_params: true
+  aws_profile_name: nasc_lma
