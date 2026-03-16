@@ -135,6 +135,12 @@ pub async fn stop_screenpipe(
 
 #[tauri::command]
 #[specta::specta]
+// TODO: Bundle LiteLLM as a dependency and start the proxy automatically here
+// alongside the screenpipe engine. The proxy config lives at the repo root
+// (litellm_config.yaml) and should be shipped with the app. Goal: users should
+// never need to manually start `litellm --config ... --port 4000` -- the app
+// should manage the proxy lifecycle (start on launch, stop on exit, restart on
+// crash) the same way it manages the screenpipe engine process.
 pub async fn spawn_screenpipe(
     state: State<'_, RecordingState>,
     app: tauri::AppHandle,

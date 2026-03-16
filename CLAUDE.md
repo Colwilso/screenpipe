@@ -141,6 +141,87 @@ Note: The Tauri app (`apps/screenpipe-app-tauri/src-tauri`) is excluded from the
 brew install pkg-config ffmpeg jq cmake wget git-lfs
 ```
 
+## LiteLLM Proxy (local AI routing)
+
+The desktop app routes all LLM requests through a local LiteLLM proxy. This is required for Pi (the in-app chat assistant) and for pipes that call LLM APIs (e.g. obsidian-sync).
+
+### How it works
+
+```
+Pi / Pipes → localhost:4000/v1 (LiteLLM proxy) → AWS Bedrock (Claude Sonnet 4.5)
+```
+
+The app's Pi module (`apps/screenpipe-app-tauri/src-tauri/src/pi.rs`) hardcodes `http://localhost:4000/v1` as its API endpoint. LiteLLM translates OpenAI-compatible requests into Bedrock API calls using the `nasc_lma` AWS profile.
+
+### Components
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| LiteLLM binary | `.litellm-venv/bin/litellm` | Python venv with LiteLLM v1.82.0 (Python 3.13) |
+| Config file | `litellm_config.yaml` (repo root) | Defines model routing: `claude-4-5-sonnet`, `cohere-embed`, `titan-embed-512` |
+| Master key | `sk-1234` (in config) | Auth key for the proxy -- used by Pi to authenticate requests |
+| AWS profile | `nasc_lma` | Provides Bedrock credentials via `~/.aws/` -- requires active Midway session |
+
+### Models available through the proxy
+
+- `claude-4-5-sonnet` -- routes to `bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0` (us-east-1)
+- `cohere-embed` -- routes to `bedrock/cohere.embed-v4:0` (us-east-1)
+- `titan-embed-512` -- routes to `bedrock/amazon.titan-embed-text-v2:0` (us-east-1, 512 dimensions)
+
+### Starting the proxy
+
+```bash
+# Manual start (background, survives terminal close)
+nohup /Users/colwilso/workplace/github/screenpipe/.litellm-venv/bin/litellm --config /Users/colwilso/workplace/github/screenpipe/litellm_config.yaml --port 4000 > /tmp/litellm.log 2>&1 &
+
+# Verify
+curl -s -H "Authorization: Bearer sk-1234" http://localhost:4000/health
+```
+
+### Prerequisites
+
+1. **Midway authentication** -- `mwinit` must be run to refresh AWS credentials. Without it, Bedrock calls fail with `CredentialRetrievalError` / status 401.
+2. **AWS profile** -- `nasc_lma` must exist in `~/.aws/config` with Bedrock access in us-east-1.
+3. **The venv** -- `.litellm-venv/` is gitignored. If missing, recreate: `python3 -m venv .litellm-venv && .litellm-venv/bin/pip install litellm`
+
+### Failure modes
+
+- **"Connection error" in Pi** -- LiteLLM proxy is not running. Start it manually (see above).
+- **401 from Bedrock** -- Midway session expired. Run `mwinit`.
+- **Pipes fail with LLM errors** -- Same root causes. Check `/tmp/litellm.log` for details.
+
+### TODO
+
+The proxy must be started manually before the app can use Pi or run LLM-backed pipes. The goal is to bundle LiteLLM as an app dependency and manage its lifecycle automatically (start on launch, stop on exit, restart on crash). See the TODO in `apps/screenpipe-app-tauri/src-tauri/src/recording.rs` at `spawn_screenpipe`.
+
+## Runtime Dependency Chain
+
+The full set of processes required for a fully functional screenpipe installation:
+
+```
+1. mwinit                          (refreshes AWS/Midway credentials)
+     |
+2. LiteLLM proxy (port 4000)      (routes LLM requests to Bedrock)
+     |
+3. screenpipe engine (port 3030)   (screen/audio capture, REST API, pipes)
+     |
+4. screenpipe desktop app          (Tauri shell: UI, tray, permissions, Pi chat)
+     |
+5. screenpipe-mcp (optional)       (MCP server for Claude Desktop/Cursor)
+```
+
+Process 1 is a one-time auth step (expires after ~12h). Processes 2-4 must all be running for full functionality. Process 5 is optional and only needed for external AI tool access.
+
+### macOS permissions (required by process 3/4)
+
+The desktop app needs these macOS TCC permissions, which can be revoked silently after rebuilds or OS updates:
+
+- **Screen Recording** -- required for screen capture
+- **Microphone** -- required for audio capture
+- **Accessibility** -- required for accessibility tree capture
+
+If the app enters a permission-recovery loop on startup, re-grant these in System Settings > Privacy & Security.
+
 ## Git Usage
 - Multiple agents work on this codebase in parallel — never delete local code, use `git reset --hard`, or force-push
 - Performance target: <20% CPU, <3GB RAM on release builds
