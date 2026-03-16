@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 pub const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent@0.83.0";
 pub const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.83.0";
 pub const PI_NAMESPACE_DIR: &str = "@earendil-works";
-pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
+pub const SCREENPIPE_API_URL: &str = "http://localhost:4000/v1";
 const CUSTOM_PROVIDER_USER_AGENT: &str = "screenpipe";
 
 /// Apply compatibility settings required by OpenAI-compatible custom endpoints.
