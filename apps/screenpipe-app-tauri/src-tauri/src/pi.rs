@@ -161,7 +161,7 @@ fn check_package_bin(pkg_dir: std::path::PathBuf, bin_name: &str) -> Option<Stri
 }
 
 const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.51.1";
-const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
+const SCREENPIPE_API_URL: &str = "http://localhost:4000/v1";
 
 /// Pool of Pi sessions — each session_id gets its own PiManager/process.
 pub struct PiPool {

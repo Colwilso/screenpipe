@@ -124,43 +124,9 @@ the pipe.md file MUST start with --- on the very first line (YAML front-matter).
 create the pipe.md file, install it, and enable it. here is what the user wants:`;
 
 function parsePipeError(stderr: string): {
-  type: "daily_limit" | "credits_exhausted" | "rate_limit" | "unknown";
+  type: "unknown";
   message: string;
-  used?: number;
-  limit?: number;
-  resets_at?: string;
-  credits_remaining?: number;
 } {
-  // stderr format: '429 "{\"error\":...}"\n' — inner quotes are backslash-escaped
-  const jsonMatch = stderr.match(/\d{3}\s+"(.+)"/s);
-  if (jsonMatch) {
-    try {
-      const raw = jsonMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      const parsed = JSON.parse(raw);
-      if (parsed.error === "daily_limit_exceeded") {
-        return {
-          type: "daily_limit",
-          message: `daily limit reached (${parsed.used_today}/${parsed.limit_today})`,
-          used: parsed.used_today,
-          limit: parsed.limit_today,
-          resets_at: parsed.resets_at,
-        };
-      }
-      if (parsed.error === "rate limit exceeded") {
-        return {
-          type: "rate_limit",
-          message: `rate limited — retrying automatically`,
-        };
-      }
-      if (parsed.error === "credits_exhausted") {
-        return {
-          type: "credits_exhausted",
-          message: parsed.message || "no credits remaining — buy more at screenpi.pe",
-          credits_remaining: parsed.credits_remaining ?? 0,
-        };
-      }
-    } catch {}
-  }
   return { type: "unknown", message: stderr.slice(0, 150) };
 }
 
@@ -1038,36 +1004,6 @@ export function PipesSection() {
         </Card>
       ) : (
         <div className="space-y-2">
-          {/* Global daily limit / credits exhausted banner — shown once at top */}
-          {(() => {
-            const errors = filteredPipes
-              .filter((p) => p.last_success === false && p.last_error)
-              .map((p) => parsePipeError(p.last_error!));
-            const limitError = errors.find(
-              (e) => e.type === "credits_exhausted" || e.type === "daily_limit"
-            );
-            if (!limitError) return null;
-            return (
-              <div className="flex items-center gap-2 text-xs px-4 py-2 border rounded-md">
-                <span className="text-muted-foreground">
-                  {limitError.type === "credits_exhausted"
-                    ? "no credits remaining — buy more at screenpi.pe"
-                    : limitError.message}
-                  {limitError.resets_at && (
-                    <> · resets {new Date(limitError.resets_at).toLocaleTimeString()}</>
-                  )}
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-6 text-[11px] px-2"
-                  onClick={() => openUrl("https://screenpi.pe/billing")}
-                >
-                  buy credits →
-                </Button>
-              </div>
-            );
-          })()}
           {filteredPipes.map((pipe) => {
             const recentExecs = pipeExecutions[pipe.config.name] || [];
             const isRunning = pipe.is_running || runningPipe === pipe.config.name;
@@ -1189,15 +1125,9 @@ export function PipesSection() {
                   </div>
                 )}
 
-                {/* Per-pipe error (skip daily_limit/credits_exhausted — shown globally above) */}
+                {/* Per-pipe error */}
                 {!isRunning && pipe.last_success === false && pipe.last_error && (() => {
                   const error = parsePipeError(pipe.last_error);
-                  if (error.type === "daily_limit" || error.type === "credits_exhausted") return null;
-                  if (error.type === "rate_limit") {
-                    return (
-                      <p className="mt-2 text-xs text-muted-foreground">{error.message}</p>
-                    );
-                  }
                   return (
                     <p className="mt-2 text-xs text-muted-foreground truncate max-w-full">
                       {error.message}

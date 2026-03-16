@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
 const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.53.0";
-pub const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
+pub const SCREENPIPE_API_URL: &str = "http://localhost:4000/v1";
 
 /// Returns the screenpipe cloud models array as a serde_json::Value.
 /// Shared between server-side pipe executor and desktop Pi chat so the
