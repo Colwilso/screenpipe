@@ -59,10 +59,22 @@ cd packages/screenpipe-js/browser-sdk && bun run build # @screenpipe/browser
 cd packages/screenpipe-js/cli && bun run build         # @screenpipe/dev CLI
 ```
 
-### Running the engine on alternate port (useful for dev)
+### Running the engine standalone
+
+The Tauri desktop app (`bun tauri dev`) auto-starts the engine internally, but this is unreliable in dev mode. For manual standalone starts, use the npm-installed CLI (`screenpipe@0.3.180` at `/opt/homebrew/bin/screenpipe`):
+
 ```bash
-./target/release/screenpipe --port 3035 --data-dir /tmp/sp
+# Standard start (background, logs to file)
+screenpipe record --port 3030 --disable-telemetry --use-system-default-audio > /tmp/screenpipe-engine.log 2>&1 &
+
+# Verify
+curl -s http://localhost:3030/health
+
+# Alternate port (useful when Tauri app owns 3030)
+screenpipe record --port 3035 --disable-telemetry --use-system-default-audio
 ```
+
+Note: There is no cargo-built engine binary. The workspace root `cargo build` does not produce a standalone `screenpipe` or `screenpipe-engine` binary -- the Tauri app embeds the engine crates as library dependencies. The npm CLI is the only standalone engine available.
 
 ## Testing
 ```bash
