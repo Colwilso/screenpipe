@@ -401,7 +401,7 @@ const AISection = ({
         break;
       case "bedrock":
         newUrl = ""; // Bedrock uses AWS SDK, not HTTP
-        newModel = "us.anthropic.claude-sonnet-4-6";
+        newModel = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
         break;
       case "pi":
         newUrl = ""; // Pi uses RPC mode, not HTTP
@@ -852,9 +852,10 @@ const AISection = ({
           // selected AWS profile. Would need a Tauri command that shells out to
           // `aws bedrock list-inference-profiles --profile <awsProfile> --region <awsRegion>`
           // and parses the result. For now, hardcoded list of common Anthropic models.
+          // Models must match Pi's built-in registry (@mariozechner/pi-ai models.generated.js).
+          // Pi v0.51.1 does not include Sonnet 4.6 or Opus 4.6 -- adding them here will cause
+          // "Model not found" errors. Update this list when Pi is updated.
           setModels([
-            { id: "us.anthropic.claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-6-v1", name: "Claude Opus 4.6", provider: "bedrock" },
             { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5", provider: "bedrock" },
             { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", name: "Claude Opus 4.5", provider: "bedrock" },
             { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5", provider: "bedrock" },
