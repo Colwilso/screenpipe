@@ -234,7 +234,7 @@ let DEFAULT_SETTINGS: Settings = {
 
 			fps: 0.5,
 			vadSensitivity: "medium",
-			analyticsEnabled: true,
+			analyticsEnabled: false,
 			audioChunkDuration: 30,
 			useChineseMirror: false,
 			languages: [],

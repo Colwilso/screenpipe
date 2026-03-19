@@ -513,7 +513,7 @@ impl Default for SettingsStore {
 
             fps: 0.5,
             vad_sensitivity: "medium".to_string(),
-            analytics_enabled: true,
+            analytics_enabled: false,
             audio_chunk_duration: 30,
             use_chinese_mirror: false,
             languages: vec![],

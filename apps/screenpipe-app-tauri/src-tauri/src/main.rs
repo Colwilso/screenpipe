@@ -1186,7 +1186,7 @@ async fn main() {
         .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
         .and_then(|data| data.get("analyticsEnabled").and_then(|v| v.as_bool()))
         .map(|enabled| !enabled)
-        .unwrap_or(false);
+        .unwrap_or(true); // telemetry disabled by default
 
     let app_version = env!("CARGO_PKG_VERSION");
     let sentry_guard = if !telemetry_disabled {
