@@ -538,7 +538,7 @@ async fn main() {
     // opt-in so the desktop-app e2e suite never reaches Sentry/PostHog.
     let telemetry_disabled = store_bool("analyticsEnabled")
         .map(|enabled| !enabled)
-        .unwrap_or(false)
+        .unwrap_or(true) // telemetry disabled by default
         || screenpipe_engine::analytics::telemetry_disabled_by_env();
     let _posthog_disabled = telemetry_disabled;
 

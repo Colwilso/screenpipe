@@ -611,7 +611,7 @@ const AISection = ({
         break;
       case "bedrock":
         newUrl = ""; // Bedrock uses AWS SDK, not HTTP
-        newModel = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        newModel = "us.anthropic.claude-sonnet-4-6";
         break;
       case "screenpipe-cloud":
         newUrl = ""; // Pi uses RPC mode, not HTTP
@@ -1138,12 +1138,18 @@ const AISection = ({
         }
 
         case "bedrock": {
+          // TODO: dynamically fetch available models from Bedrock using the
+          // selected AWS profile. Would need a Tauri command that shells out to
+          // `aws bedrock list-inference-profiles --profile <awsProfile> --region <awsRegion>`
+          // and parses the result. For now, hardcoded list of common Anthropic models.
           setModels([
-            { id: "us.anthropic.claude-opus-4-6-20250828-v1:0", name: "Claude Opus 4.6", provider: "bedrock" },
+            { id: "us.anthropic.claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "bedrock" },
+            { id: "us.anthropic.claude-opus-4-6-v1", name: "Claude Opus 4.6", provider: "bedrock" },
             { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5", provider: "bedrock" },
+            { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", name: "Claude Opus 4.5", provider: "bedrock" },
             { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4", provider: "bedrock" },
             { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4", provider: "bedrock" },
+            { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4", provider: "bedrock" },
           ]);
           break;
         }

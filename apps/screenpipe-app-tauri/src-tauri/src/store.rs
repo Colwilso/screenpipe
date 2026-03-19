@@ -1416,6 +1416,7 @@ Rules:
                 audio_devices: vec!["default".to_string()],
                 use_pii_removal: true,
                 analytics_id: uuid::Uuid::new_v4().to_string(),
+                analytics_enabled: false, // telemetry disabled by default
                 ignored_windows,
                 ..screenpipe_config::RecordingSettings::default()
             },
