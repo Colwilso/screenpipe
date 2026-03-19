@@ -180,7 +180,7 @@ const INITIAL_DIAGNOSTICS: DiagnosticResults = {
 };
 
 export interface AIProviderCardProps {
-  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "screenpipe-cloud" | "acp";
+  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "bedrock" | "custom" | "embedded" | "screenpipe-cloud" | "acp";
   title: string;
   description: string;
   imageSrc: string;
@@ -609,6 +609,10 @@ const AISection = ({
         newUrl = "https://api.anthropic.com";
         newModel = "claude-sonnet-5";
         break;
+      case "bedrock":
+        newUrl = ""; // Bedrock uses AWS SDK, not HTTP
+        newModel = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        break;
       case "screenpipe-cloud":
         newUrl = ""; // Pi uses RPC mode, not HTTP
         newModel = "auto";
@@ -641,7 +645,7 @@ const AISection = ({
   const [modelSearch, setModelSearch] = useState("");
 
   const runDiagnostics = useCallback(async () => {
-    if (settingsPreset?.provider === "screenpipe-cloud") return;
+    if (settingsPreset?.provider === "screenpipe-cloud" || settingsPreset?.provider === "bedrock") return;
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
@@ -964,6 +968,7 @@ const AISection = ({
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
     settingsPreset?.provider !== "anthropic" &&
+    settingsPreset?.provider !== "bedrock" &&
     settingsPreset?.url !== "https://api.screenpipe.com/v1" &&
     settingsPreset?.url !== "http://localhost:11434/v1" &&
     settingsPreset?.url !== "embedded";
@@ -1132,6 +1137,17 @@ const AISection = ({
           break;
         }
 
+        case "bedrock": {
+          setModels([
+            { id: "us.anthropic.claude-opus-4-6-20250828-v1:0", name: "Claude Opus 4.6", provider: "bedrock" },
+            { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5", provider: "bedrock" },
+            { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5", provider: "bedrock" },
+            { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4", provider: "bedrock" },
+            { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4", provider: "bedrock" },
+          ]);
+          break;
+        }
+
         case "screenpipe-cloud": {
           // Fetch models from gateway so new models appear automatically
           try {
@@ -1217,7 +1233,7 @@ const AISection = ({
 
   // Auto-trigger diagnostics when provider + url + apiKey are set (debounced)
   useEffect(() => {
-    if (settingsPreset?.provider === "screenpipe-cloud") return;
+    if (settingsPreset?.provider === "screenpipe-cloud" || settingsPreset?.provider === "bedrock") return;
     if (!settingsPreset?.provider) return;
 
     const needsApiKey =
@@ -1281,6 +1297,15 @@ const AISection = ({
                 handleAiProviderChange("anthropic");
               }
             }}
+          />
+
+          <AIProviderCard
+            type="bedrock"
+            title="AWS Bedrock"
+            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
+            imageSrc="/images/custom.png"
+            selected={settingsPreset?.provider === "bedrock"}
+            onClick={() => handleAiProviderChange("bedrock")}
           />
 
           <AIProviderCard
@@ -1412,6 +1437,39 @@ const AISection = ({
             </div>
           </div>
         )}
+
+      {settingsPreset?.provider === "bedrock" && (
+        <div className="w-full">
+          <div className="flex flex-col gap-4 mb-4 w-full">
+            <Label htmlFor="awsProfile" className="flex items-center gap-1">
+              AWS Profile
+            </Label>
+            <Input
+              id="awsProfile"
+              value={(settingsPreset as any)?.awsProfile || ""}
+              onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
+              placeholder="default"
+            />
+            <p className="text-xs text-muted-foreground">
+              AWS profile name from ~/.aws/config (leave empty for default)
+            </p>
+          </div>
+          <div className="flex flex-col gap-4 mb-4 w-full">
+            <Label htmlFor="awsRegion" className="flex items-center gap-1">
+              AWS Region
+            </Label>
+            <Input
+              id="awsRegion"
+              value={(settingsPreset as any)?.awsRegion || ""}
+              onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
+              placeholder="us-east-1"
+            />
+            <p className="text-xs text-muted-foreground">
+              AWS region for Bedrock API calls
+            </p>
+          </div>
+        </div>
+      )}
 
       {settingsPreset?.provider === "openai-chatgpt" && (
         <div className="w-full">
@@ -1730,7 +1788,7 @@ const AISection = ({
         helperText="This prompt will be used to guide the AI's responses"
       />
 
-      {settingsPreset?.provider !== "screenpipe-cloud" && settingsPreset?.provider !== "acp" && (
+      {settingsPreset?.provider !== "screenpipe-cloud" && settingsPreset?.provider !== "acp" && settingsPreset?.provider !== "bedrock" && (
         <div className="w-full">
           <Label htmlFor="maxTokens" className="text-sm font-medium">
             Max Output Tokens
@@ -1775,7 +1833,7 @@ const AISection = ({
         </div>
       )}
 
-      {settingsPreset?.provider !== "screenpipe-cloud" && settingsPreset?.provider !== "acp" && (
+      {settingsPreset?.provider !== "screenpipe-cloud" && settingsPreset?.provider !== "acp" && settingsPreset?.provider !== "bedrock" && (
         <div className="w-full border rounded-lg">
           <button
             type="button"
@@ -1935,6 +1993,7 @@ const providerImageSrc: Record<string, string> = {
   openai: "/images/openai.png",
   "openai-chatgpt": "/images/openai.png",
   anthropic: "/images/claude-ai.svg",
+  bedrock: "/images/custom.png",
   "native-ollama": "/images/ollama.png",
   custom: "/images/custom.png",
   pi: "/images/screenpipe.png",
@@ -2450,7 +2509,7 @@ useEffect(() => {
                     isDefault={preset.defaultPreset}
                     hasValidation={preset.provider === "acp"
                       ? Boolean(preset.acpAgent?.id?.trim() && preset.apiKey?.trim())
-                      : Boolean(preset.provider && preset.model && (preset.url || preset.provider === "screenpipe-cloud" || preset.provider === "openai-chatgpt"))}
+                      : Boolean(preset.provider && preset.model && (preset.url || preset.provider === "screenpipe-cloud" || preset.provider === "openai-chatgpt" || preset.provider === "bedrock"))}
                     chatgptTokenExpired={preset.provider === "openai-chatgpt" && chatgptTokenValid === false}
                     onEdit={() => {
                       setSelectedPreset(preset);

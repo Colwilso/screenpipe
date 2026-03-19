@@ -1085,6 +1085,8 @@ pub enum AIProviderType {
     /// External Agent Client Protocol adapter, launched via the ACP runtime.
     #[serde(rename = "acp")]
     Acp,
+    #[serde(rename = "bedrock")]
+    Bedrock,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -1108,6 +1110,10 @@ pub struct AIPreset {
     /// The external adapter to launch when `provider` is `acp`.
     #[serde(rename = "acpAgent", default)]
     pub acp_agent: Option<crate::pi::AcpAgentConfig>,
+    #[serde(rename = "awsProfile", default)]
+    pub aws_profile: Option<String>,
+    #[serde(rename = "awsRegion", default)]
+    pub aws_region: Option<String>,
 }
 
 fn default_max_tokens() -> i32 {
@@ -1127,6 +1133,8 @@ impl Default for AIPreset {
             max_context_chars: 512000,
             max_tokens: 4096,
             acp_agent: None,
+            aws_profile: None,
+            aws_region: None,
         }
     }
 }
@@ -1396,6 +1404,8 @@ Rules:
             max_context_chars: 128000,
             max_tokens: 4096,
             acp_agent: None,
+            aws_profile: None,
+            aws_region: None,
         };
 
         Self {
@@ -1532,6 +1542,7 @@ impl SettingsStore {
                 "opencode",
                 "pi",
                 "anthropic",
+                "bedrock",
             ];
             if let Some(presets) = obj.get_mut("aiPresets") {
                 if let Some(arr) = presets.as_array_mut() {

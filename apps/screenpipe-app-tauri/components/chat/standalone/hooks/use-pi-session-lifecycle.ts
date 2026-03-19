@@ -157,6 +157,8 @@ export function usePiSessionLifecycle({
       maxTokens: p.maxTokens ?? 4096,
       maxContextChars: p.maxContextChars ?? null,
       systemPrompt,
+      awsProfile: ("awsProfile" in p ? (p as any).awsProfile : null) || null,
+      awsRegion: ("awsRegion" in p ? (p as any).awsRegion : null) || null,
     };
   }, [
     activePreset?.acpAgent,
@@ -167,6 +169,8 @@ export function usePiSessionLifecycle({
     activePreset?.prompt,
     activePreset?.provider,
     activePreset?.url,
+    (activePreset as any)?.awsProfile,
+    (activePreset as any)?.awsRegion,
     allConnectionItems,
     appItems,
     connections,
