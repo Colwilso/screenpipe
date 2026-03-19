@@ -268,9 +268,11 @@ function SettingsPageContent() {
     { id: "privacy", label: "Privacy", icon: <Shield className="h-4 w-4" />, group: "data" },
     { id: "storage", label: "Storage", icon: <HardDrive className="h-4 w-4" />, group: "data" },
     { id: "connections", label: "Connections", icon: <Plug className="h-4 w-4" />, group: "data" },
-    ...(!isEnterprise ? [{ id: "account" as SettingsModalSection, label: "Account", icon: <User className="h-4 w-4" />, group: "account" }] : []),
-    { id: "team", label: "Team", icon: <Users className="h-4 w-4" />, group: "account" },
-    ...(!isEnterprise ? [{ id: "referral" as SettingsModalSection, label: "Get free month", icon: <Gift className="h-4 w-4" />, group: "account" }] : []),
+    // Account, Team, and Referral sections hidden (cloud account features disabled for now)
+    // To restore: uncomment these lines and the "Account" sidebar group rendering below
+    // ...(!isEnterprise ? [{ id: "account" as SettingsModalSection, label: "Account", icon: <User className="h-4 w-4" />, group: "account" }] : []),
+    // { id: "team", label: "Team", icon: <Users className="h-4 w-4" />, group: "account" },
+    // ...(!isEnterprise ? [{ id: "referral" as SettingsModalSection, label: "Get free month", icon: <Gift className="h-4 w-4" />, group: "account" }] : []),
   ];
 
   const appGroup = settingsModalSections.filter(s => s.group === "app");
@@ -313,7 +315,7 @@ function SettingsPageContent() {
             )}
           >
             <div className={cn("py-3 border-b flex items-center overflow-hidden", sidebarCollapsed ? "px-2 justify-center" : "px-4 justify-between gap-2")}>
-              {!sidebarCollapsed && <h1 className="text-lg font-bold text-foreground truncate min-w-0">screenpipe</h1>}
+              {!sidebarCollapsed && <h1 className="text-lg font-bold text-foreground shrink-0">Alioth</h1>}
               <div className="flex items-center gap-2 flex-shrink-0">
                 {!sidebarCollapsed && (() => {
                   const monitors = recordingDevices.filter((d) => d.kind === "monitor");
@@ -406,28 +408,12 @@ function SettingsPageContent() {
               {/* Spacer */}
               <div className="flex-1" />
 
-              {/* Team promo card — hidden when user already has a team, sidebar collapsed, or enterprise */}
-              {!teamState.team && !sidebarCollapsed && !isEnterprise && (
-                <div className="mx-1 mb-3 p-3 border border-border bg-card">
-                  <h3 className="text-sm font-medium text-foreground">
-                    Add your team to screenpipe
-                  </h3>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Push pipe configs and content filters to all members.
-                  </p>
-                  <button
-                    onClick={() => openModal("team")}
-                    className="mt-2.5 px-3 py-1.5 text-xs font-medium border border-border bg-background hover:bg-foreground hover:text-background transition-colors duration-150"
-                  >
-                    ADD YOUR TEAM
-                  </button>
-                </div>
-              )}
+              {/* Team promo card — hidden (cloud account features disabled for now) */}
 
               {/* Bottom items */}
               <div className="space-y-0.5 border-t border-border pt-2">
-                {/* Team link — hide invite promo in enterprise */}
-                {(!isEnterprise || teamState.team) && (() => {
+                {/* Team link — hidden (cloud account features disabled for now) */}
+                {false && (!isEnterprise || teamState.team) && (() => {
                   const teamLabel = teamState.team
                     ? `Your team (${teamState.members.length})`
                     : "Invite your team";
@@ -454,8 +440,8 @@ function SettingsPageContent() {
                   return btn;
                 })()}
 
-                {/* Get free month — hidden in enterprise */}
-                {!isEnterprise && (() => {
+                {/* Get free month — hidden (cloud account features disabled for now) */}
+                {false && !isEnterprise && (() => {
                   const btn = (
                     <button
                       onClick={() => openModal("referral")}
@@ -649,7 +635,9 @@ function SettingsPageContent() {
                         </div>
                       </div>
 
-                      {/* Account group */}
+                      {/* Account group — hidden (cloud account features disabled for now) */}
+                      {/* To restore: uncomment this block and the account/team/referral entries in settingsModalSections */}
+                      {accountGroup.length > 0 && (
                       <div>
                         <div className="px-2 pb-1">
                           <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
@@ -682,6 +670,7 @@ function SettingsPageContent() {
                           ))}
                         </div>
                       </div>
+                      )}
                     </div>
                   </div>
 

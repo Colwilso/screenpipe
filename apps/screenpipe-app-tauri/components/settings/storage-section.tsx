@@ -22,7 +22,8 @@ export function StorageSection() {
 
   const tabs: { id: StorageTab; label: string; hidden?: boolean }[] = [
     { id: "local", label: "Local" },
-    { id: "archive", label: "Archive" },
+    // Cloud archive hidden for now (will be replaced with S3 sync)
+    { id: "archive", label: "Archive", hidden: true },
     { id: "sync", label: "Sync", hidden: !showCloudSync },
   ];
 
@@ -35,7 +36,7 @@ export function StorageSection() {
           Storage
         </h1>
         <p className="text-muted-foreground text-sm">
-          Local disk, cloud archive, and sync
+          Local disk usage and sync
         </p>
       </div>
 

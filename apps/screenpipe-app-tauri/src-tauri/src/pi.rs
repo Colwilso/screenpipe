@@ -581,6 +581,10 @@ pub struct PiProviderConfig {
     /// Max output tokens (default 4096)
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
+    /// AWS profile name for Bedrock provider
+    pub aws_profile: Option<String>,
+    /// AWS region for Bedrock provider
+    pub aws_region: Option<String>,
 }
 
 fn default_max_tokens() -> i32 {
@@ -635,11 +639,16 @@ fn ensure_pi_config(
             "openai-chatgpt" => "openai-chatgpt",
             "native-ollama" => "ollama",
             "anthropic" => "anthropic-byok",
+            "bedrock" => "amazon-bedrock",
             "custom" => "custom",
             _ => "", // screenpipe-cloud already added above
         };
 
-        if !provider_name.is_empty() {
+        // Bedrock provider is built into Pi -- no models.json entry needed.
+        // Auth is handled via AWS_PROFILE env var at spawn time.
+        if provider_name == "amazon-bedrock" {
+            // skip models.json entry
+        } else if !provider_name.is_empty() {
             let base_url = if config.provider == "native-ollama" && config.url.is_empty() {
                 "http://localhost:11434/v1".to_string()
             } else if config.provider == "openai-chatgpt" {
@@ -931,6 +940,7 @@ pub async fn pi_start_inner(
                 "openai-chatgpt" => "openai-chatgpt",
                 "native-ollama" => "ollama",
                 "anthropic" => "anthropic-byok",
+                "bedrock" => "amazon-bedrock",
                 "custom" => "custom",
                 "screenpipe-cloud" | "pi" | _ => "screenpipe",
             };
@@ -1137,6 +1147,16 @@ pub async fn pi_start_inner(
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // Bedrock: inject AWS credentials via env vars
+        if config.provider == "bedrock" {
+            if let Some(ref profile) = config.aws_profile {
+                cmd.env("AWS_PROFILE", profile);
+            }
+            if let Some(ref region) = config.aws_region {
+                cmd.env("AWS_REGION", region);
             }
         }
     }

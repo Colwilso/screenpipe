@@ -1332,6 +1332,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       model: activePreset.model || "",
       apiKey: ("apiKey" in activePreset ? (activePreset.apiKey as string) : null) || null,
       maxTokens: (activePreset as any).maxTokens ?? 4096,
+      awsProfile: ("awsProfile" in activePreset ? (activePreset as any).awsProfile : null) || null,
+      awsRegion: ("awsRegion" in activePreset ? (activePreset as any).awsRegion : null) || null,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens]);

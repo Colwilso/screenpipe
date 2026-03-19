@@ -107,7 +107,7 @@ const INITIAL_DIAGNOSTICS: DiagnosticResults = {
 };
 
 export interface AIProviderCardProps {
-  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "pi";
+  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "bedrock" | "custom" | "embedded" | "pi";
   title: string;
   description: string;
   imageSrc: string;
@@ -399,6 +399,10 @@ const AISection = ({
         newUrl = "https://api.anthropic.com";
         newModel = "claude-sonnet-4-5-20250514";
         break;
+      case "bedrock":
+        newUrl = ""; // Bedrock uses AWS SDK, not HTTP
+        newModel = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        break;
       case "pi":
         newUrl = ""; // Pi uses RPC mode, not HTTP
         newModel = "claude-haiku-4-5";
@@ -416,7 +420,7 @@ const AISection = ({
   const [isLoadingModels, setIsLoadingModels] = useState(false);
 
   const runDiagnostics = useCallback(async () => {
-    if (settingsPreset?.provider === "pi") return;
+    if (settingsPreset?.provider === "pi" || settingsPreset?.provider === "bedrock") return;
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
@@ -685,6 +689,7 @@ const AISection = ({
 
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
+    settingsPreset?.provider !== "bedrock" &&
     settingsPreset?.url !== "https://api.screenpi.pe/v1" &&
     settingsPreset?.url !== "http://localhost:11434/v1" &&
     settingsPreset?.url !== "embedded";
@@ -842,6 +847,17 @@ const AISection = ({
           break;
         }
 
+        case "bedrock": {
+          setModels([
+            { id: "us.anthropic.claude-opus-4-6-20250828-v1:0", name: "Claude Opus 4.6", provider: "bedrock" },
+            { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5", provider: "bedrock" },
+            { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5", provider: "bedrock" },
+            { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4", provider: "bedrock" },
+            { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4", provider: "bedrock" },
+          ]);
+          break;
+        }
+
         case "pi": {
           const piModels: AIModel[] = [
             { id: "claude-haiku-4-5", name: "Haiku 4.5 (fast)", provider: "screenpipe" },
@@ -890,7 +906,7 @@ const AISection = ({
 
   // Auto-trigger diagnostics when provider + url + apiKey are set (debounced)
   useEffect(() => {
-    if (settingsPreset?.provider === "pi") return;
+    if (settingsPreset?.provider === "pi" || settingsPreset?.provider === "bedrock") return;
     if (!settingsPreset?.provider) return;
 
     const needsApiKey =
@@ -950,6 +966,15 @@ const AISection = ({
             imageSrc="/images/anthropic.png"
             selected={settingsPreset?.provider === "anthropic"}
             onClick={() => handleAiProviderChange("anthropic")}
+          />
+
+          <AIProviderCard
+            type="bedrock"
+            title="AWS Bedrock"
+            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
+            imageSrc="/images/custom.png"
+            selected={settingsPreset?.provider === "bedrock"}
+            onClick={() => handleAiProviderChange("bedrock")}
           />
 
           <AIProviderCard
@@ -1059,6 +1084,39 @@ const AISection = ({
             </div>
           </div>
         )}
+
+      {settingsPreset?.provider === "bedrock" && (
+        <div className="w-full">
+          <div className="flex flex-col gap-4 mb-4 w-full">
+            <Label htmlFor="awsProfile" className="flex items-center gap-1">
+              AWS Profile
+            </Label>
+            <Input
+              id="awsProfile"
+              value={(settingsPreset as any)?.awsProfile || ""}
+              onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
+              placeholder="default"
+            />
+            <p className="text-xs text-muted-foreground">
+              AWS profile name from ~/.aws/config (leave empty for default)
+            </p>
+          </div>
+          <div className="flex flex-col gap-4 mb-4 w-full">
+            <Label htmlFor="awsRegion" className="flex items-center gap-1">
+              AWS Region
+            </Label>
+            <Input
+              id="awsRegion"
+              value={(settingsPreset as any)?.awsRegion || ""}
+              onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
+              placeholder="us-east-1"
+            />
+            <p className="text-xs text-muted-foreground">
+              AWS region for Bedrock API calls
+            </p>
+          </div>
+        </div>
+      )}
 
       {settingsPreset?.provider === "openai-chatgpt" && (
         <div className="w-full">
@@ -1225,7 +1283,7 @@ const AISection = ({
         helperText="This prompt will be used to guide the AI's responses"
       />
 
-      {settingsPreset?.provider !== "pi" && (
+      {settingsPreset?.provider !== "pi" && settingsPreset?.provider !== "bedrock" && (
         <div className="w-full">
           <Label htmlFor="maxTokens" className="text-sm font-medium">
             Max Output Tokens
@@ -1246,7 +1304,7 @@ const AISection = ({
         </div>
       )}
 
-      {settingsPreset?.provider !== "pi" && (
+      {settingsPreset?.provider !== "pi" && settingsPreset?.provider !== "bedrock" && (
         <div className="w-full border rounded-lg">
           <button
             type="button"
@@ -1387,6 +1445,7 @@ const providerImageSrc: Record<string, string> = {
   openai: "/images/openai.png",
   "openai-chatgpt": "/images/openai.png",
   anthropic: "/images/anthropic.png",
+  bedrock: "/images/custom.png",
   "native-ollama": "/images/ollama.png",
   custom: "/images/custom.png",
   pi: "/images/screenpipe.png",
@@ -1617,7 +1676,7 @@ export const AIPresets = () => {
       <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-6">
         {settings.aiPresets.map((preset) => {
           const isDefault = preset.defaultPreset;
-          const hasValidation = preset.provider && preset.model && preset.url;
+          const hasValidation = preset.provider && preset.model && (preset.url || preset.provider === "bedrock" || preset.provider === "pi");
           
           return (
             <Card

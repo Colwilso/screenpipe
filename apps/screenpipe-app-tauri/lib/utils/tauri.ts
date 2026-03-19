@@ -945,8 +945,8 @@ async getHardwareCapability() : Promise<HardwareCapability> {
 
 /** user-defined types **/
 
-export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
-export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
+export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number; awsProfile?: string | null; awsRegion?: string | null }
+export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic" | "bedrock"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
 export type BrowserLogEntry = { level: string; message: string }
 export type CachedSuggestions = { suggestions: Suggestion[]; generatedAt: string; mode: string; aiGenerated: boolean; tags: string[] }
@@ -1014,7 +1014,15 @@ apiKey: string | null;
 /**
  * Max output tokens (default 4096)
  */
-maxTokens?: number }
+maxTokens?: number; 
+/**
+ * AWS profile name for Bedrock provider
+ */
+awsProfile: string | null; 
+/**
+ * AWS region for Bedrock provider
+ */
+awsRegion: string | null }
 export type ReminderItem = { identifier: string; title: string; notes: string | null; completed: boolean }
 export type RemindersStatus = { available: boolean; authorized: boolean; authorizationStatus: string; schedulerRunning: boolean; reminderCount: number }
 export type ScanResult = { remindersCreated: bigint; items: ReminderItem[]; contextChars: bigint; error: string | null }

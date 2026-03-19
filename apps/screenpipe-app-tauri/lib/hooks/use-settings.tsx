@@ -14,6 +14,7 @@ export type AIProviderType =
 	| "openai"
 	| "openai-chatgpt"
 	| "anthropic"
+	| "bedrock"
 	| "custom"
 	| "embedded"
 	| "pi";
@@ -62,6 +63,11 @@ export type AIPreset = {
 	  }
 	| {
 			provider: "openai-chatgpt";
+	  }
+	| {
+			provider: "bedrock";
+			awsProfile?: string;
+			awsRegion?: string;
 	  }
 );
 
