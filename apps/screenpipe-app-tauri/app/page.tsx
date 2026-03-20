@@ -24,6 +24,8 @@ import { ModelDownloadTracker } from "../components/model-download-tracker";
 import Timeline from "@/components/rewind/timeline";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { ActivityDashboard } from "@/components/activity/activity-dashboard";
 import { RefreshCw, AlertTriangle, WifiOff, Upload, Loader, Check, Calendar, X } from "lucide-react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { readTextFile } from "@tauri-apps/plugin-fs";
@@ -333,6 +335,14 @@ export default function Home() {
     }
   };
 
+  const [activeTab, setActiveTab] = useState("timeline");
+
+  const handleNavigateToTimeline = useCallback((timestamp: string) => {
+    setActiveTab("timeline");
+    // The timeline component picks up date from its own store;
+    // setting the tab is enough for now.
+  }, []);
+
   // Determine what to show:
   // 1. If user has data (cached or live) -> always show timeline, even if server is down
   // 2. If no data AND server is down -> show server error screen
@@ -357,28 +367,53 @@ export default function Home() {
           <UpdateBanner />
           
           {showTimeline ? (
-            <div className="w-full scrollbar-hide bg-background relative">
-              {/* Subtle disconnected indicator - only show if we have data but no connection */}
-              {hasAnyData && !isConnected && isServerDown && (
-                <div className="fixed top-10 right-4 z-50 flex items-center gap-2 px-3 py-1.5 bg-muted/90 backdrop-blur-sm rounded-full text-xs text-muted-foreground border">
-                  <WifiOff className="h-3 w-3" />
-                  <span>reconnecting...</span>
+            <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+              <div className="fixed top-0 left-0 right-0 z-[999] pt-8">
+                <TabsList className="w-auto mx-auto flex justify-center bg-transparent gap-0 h-8 p-0">
+                  <TabsTrigger
+                    value="timeline"
+                    className="px-3 py-1 text-xs font-mono rounded-none border-b-2 border-transparent data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none bg-transparent"
+                  >
+                    timeline
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="activity"
+                    className="px-3 py-1 text-xs font-mono rounded-none border-b-2 border-transparent data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none bg-transparent"
+                  >
+                    activity
+                  </TabsTrigger>
+                </TabsList>
+              </div>
+
+              <TabsContent value="timeline" className="mt-0">
+                <div className="w-full scrollbar-hide bg-background relative">
+                  {/* Subtle disconnected indicator - only show if we have data but no connection */}
+                  {hasAnyData && !isConnected && isServerDown && (
+                    <div className="fixed top-10 right-4 z-50 flex items-center gap-2 px-3 py-1.5 bg-muted/90 backdrop-blur-sm rounded-full text-xs text-muted-foreground border">
+                      <WifiOff className="h-3 w-3" />
+                      <span>reconnecting...</span>
+                    </div>
+                  )}
+
+                  {/* Show connecting overlay only if NO data and still loading */}
+                  {!hasAnyData && isHealthLoading && (
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+                      <div className="flex flex-col items-center gap-3">
+                        <RefreshCw className="h-6 w-6 animate-spin text-muted-foreground" />
+                        <p className="text-sm text-muted-foreground">connecting to screenpipe...</p>
+                      </div>
+                    </div>
+                  )}
+                  <TimelineErrorBoundary>
+                    <Timeline />
+                  </TimelineErrorBoundary>
                 </div>
-              )}
-              
-              {/* Show connecting overlay only if NO data and still loading */}
-              {!hasAnyData && isHealthLoading && (
-                <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
-                  <div className="flex flex-col items-center gap-3">
-                    <RefreshCw className="h-6 w-6 animate-spin text-muted-foreground" />
-                    <p className="text-sm text-muted-foreground">connecting to screenpipe...</p>
-                  </div>
-                </div>
-              )}
-              <TimelineErrorBoundary>
-                <Timeline />
-              </TimelineErrorBoundary>
-            </div>
+              </TabsContent>
+
+              <TabsContent value="activity" className="mt-0">
+                <ActivityDashboard onNavigateToTimeline={handleNavigateToTimeline} />
+              </TabsContent>
+            </Tabs>
           ) : showServerError ? (
             <div className="flex items-center justify-center h-screen p-4 bg-background w-full">
               <div className="max-w-lg w-full space-y-6">
