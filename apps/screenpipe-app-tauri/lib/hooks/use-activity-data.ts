@@ -85,24 +85,14 @@ async function rawSql<T>(sql: string): Promise<T[]> {
   return rows;
 }
 
-function estimateHours(frameCount: number, firstSeen: string, lastSeen: string): number {
-  if (frameCount <= 1) return 0;
-  const start = new Date(firstSeen).getTime();
-  const end = new Date(lastSeen).getTime();
-  const spanSeconds = (end - start) / 1000;
+// Estimate hours from frame count using the capture interval.
+// screenpipe captures approximately every 5 seconds when active.
+// Using frame count avoids double-counting when multiple apps overlap in time.
+const CAPTURE_INTERVAL_SECONDS = 5;
 
-  // If span exceeds what gap-based counting would give, cap it
-  // Average interval between frames = span / (frameCount - 1)
-  // If avg interval > ACTIVE_GAP_SECONDS, use frameCount * assumed-interval
-  const avgInterval = spanSeconds / (frameCount - 1);
-  let activeSeconds: number;
-  if (avgInterval <= ACTIVE_GAP_SECONDS) {
-    activeSeconds = spanSeconds;
-  } else {
-    // Count each frame as a 30-second active window
-    activeSeconds = frameCount * 30;
-  }
-  return activeSeconds / 3600;
+function estimateHours(frameCount: number, _firstSeen: string, _lastSeen: string): number {
+  if (frameCount <= 0) return 0;
+  return (frameCount * CAPTURE_INTERVAL_SECONDS) / 3600;
 }
 
 function formatDateForSql(d: Date): string {
@@ -137,6 +127,7 @@ export function useActivityData(
           AND app_name IS NOT NULL AND app_name != ''
         GROUP BY DATE(timestamp), app_name
         ORDER BY date, frame_count DESC
+        LIMIT 10000
       `;
 
       const rows = await rawSql<RawFrameRow>(sql);
@@ -284,6 +275,7 @@ export function useActivityLog(
         const countSql = `
           SELECT COUNT(*) as cnt FROM frames
           WHERE ${conditions.join(" AND ")}
+          LIMIT 1
         `;
 
         const dataSql = `

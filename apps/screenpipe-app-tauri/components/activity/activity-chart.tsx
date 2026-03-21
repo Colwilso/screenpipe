@@ -120,21 +120,6 @@ export function ActivityChart({ data, isLoading, onBarClick }: ActivityChartProp
         <BarChart
           data={chartData}
           margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
-          onClick={(state: any) => {
-            if (state?.activePayload?.[0]?.payload) {
-              const payload = state.activePayload[0].payload;
-              // Find the category with the most hours for this bar
-              let topCat: CategoryKey = "other";
-              let topVal = 0;
-              for (const k of CATEGORY_KEYS) {
-                if ((payload[k] || 0) > topVal) {
-                  topVal = payload[k];
-                  topCat = k;
-                }
-              }
-              onBarClick?.(payload.date, topCat);
-            }
-          }}
         >
           <CartesianGrid
             strokeDasharray="3 3"
@@ -171,6 +156,11 @@ export function ActivityChart({ data, isLoading, onBarClick }: ActivityChartProp
               name={getCategoryDef(key).label}
               radius={0}
               cursor="pointer"
+              onClick={(data: any) => {
+                if (data?.date) {
+                  onBarClick?.(data.date, key);
+                }
+              }}
             />
           ))}
         </BarChart>
