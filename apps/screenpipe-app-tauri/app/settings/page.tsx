@@ -27,6 +27,7 @@ import {
   Volume2,
   PanelLeftClose,
   PanelLeftOpen,
+  BarChart3,
 } from "lucide-react";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
@@ -44,6 +45,7 @@ import { PrivacySection } from "@/components/settings/privacy-section";
 import { StorageSection } from "@/components/settings/storage-section";
 import { StandaloneChat } from "@/components/standalone-chat";
 import Timeline from "@/components/rewind/timeline";
+import { ActivityDashboard } from "@/components/activity/activity-dashboard";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -59,7 +61,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
-type MainSection = "home" | "timeline" | "pipes" | "help";
+type MainSection = "home" | "timeline" | "pipes" | "activity" | "help";
 
 type SettingsModalSection =
   | "account"
@@ -217,6 +219,8 @@ function SettingsPageContent() {
         return <Timeline embedded />;
       case "pipes":
         return <PipesSection />;
+      case "activity":
+        return <ActivityDashboard />;
       case "help":
         return <FeedbackSection />;
       default:
@@ -256,6 +260,7 @@ function SettingsPageContent() {
     { id: "home", label: "Home", icon: <Home className="h-4 w-4" /> },
     { id: "pipes", label: "Pipes", icon: <Workflow className="h-4 w-4" /> },
     { id: "timeline", label: "Timeline", icon: <Clock className="h-4 w-4" /> },
+    { id: "activity", label: "Activity", icon: <BarChart3 className="h-4 w-4" /> },
   ];
 
   // Settings modal sidebar items

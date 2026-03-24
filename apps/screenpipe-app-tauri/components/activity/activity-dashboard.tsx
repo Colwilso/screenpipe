@@ -7,11 +7,12 @@
 import React, { useState, useCallback } from "react";
 import { Download, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { DateRangePicker } from "./date-range-picker";
-import { SummaryCards } from "./summary-cards";
+import { ActivityChart } from "./activity-chart";
+import { AppUsageList } from "./app-usage-list";
 import { CategoryFilter } from "./category-filter";
 import { ActiveFilters } from "./active-filters";
-import { ActivityChart } from "./activity-chart";
 import { ActivityLogTable } from "./activity-log-table";
 import {
   useActivityData,
@@ -37,6 +38,14 @@ function today(): Date {
   return d;
 }
 
+function formatTotalTime(hours: number): string {
+  const h = Math.floor(hours);
+  const m = Math.round((hours - h) * 60);
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
+}
+
 export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardProps) {
   const [dateRange, setDateRange] = useState<DateRange>({
     start: daysAgo(7),
@@ -48,7 +57,7 @@ export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardPro
   const [selectedApp, setSelectedApp] = useState<string | null>(null);
   const [logPage, setLogPage] = useState(0);
 
-  const { dailyData, summary, isLoading, error, refetch } = useActivityData(
+  const { dailyData, appUsage, summary, isLoading, error, refetch } = useActivityData(
     dateRange,
     categoryFilter
   );
@@ -66,6 +75,18 @@ export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardPro
     setSelectedApp(null);
     setLogPage(0);
   }, []);
+
+  const handleAppClick = useCallback((appName: string) => {
+    setSelectedApp(appName);
+    setLogPage(0);
+    // If no date selected, use the most recent day with data
+    if (!selectedDate && dailyData.length > 0) {
+      const lastActive = [...dailyData]
+        .reverse()
+        .find((d) => d.totalHours > 0);
+      if (lastActive) setSelectedDate(lastActive.date);
+    }
+  }, [selectedDate, dailyData]);
 
   const handleRowClick = useCallback(
     (timestamp: string) => {
@@ -103,10 +124,28 @@ export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardPro
   }, [dailyData, dateRange]);
 
   return (
-    <div className="flex flex-col gap-6 p-6 pt-12 pb-8 max-w-[1400px] mx-auto w-full">
-      {/* Toolbar */}
-      <div className="flex items-center justify-between gap-4">
-        <DateRangePicker value={dateRange} onChange={setDateRange} />
+    <div className="flex flex-col gap-6 p-6 pt-10 pb-8 max-w-[720px] mx-auto w-full">
+      {/* Header: total time + controls */}
+      <div className="flex items-start justify-between">
+        <div>
+          <p className="text-xs text-muted-foreground font-mono mb-1">
+            screen time
+          </p>
+          {isLoading ? (
+            <Skeleton className="h-10 w-32" />
+          ) : (
+            <p className="text-4xl font-mono font-medium tracking-tight">
+              {formatTotalTime(summary.totalHours)}
+            </p>
+          )}
+          {!isLoading && summary.activeDays > 0 && (
+            <p className="text-xs text-muted-foreground font-mono mt-1">
+              {summary.activeDays} active day{summary.activeDays !== 1 ? "s" : ""}
+              {summary.meetingHours > 0 &&
+                ` -- ${formatTotalTime(summary.meetingHours)} in meetings`}
+            </p>
+          )}
+        </div>
         <div className="flex items-center gap-2">
           <Button
             variant="outline"
@@ -126,10 +165,12 @@ export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardPro
             disabled={isLoading}
           >
             <RefreshCw className={`h-3 w-3 ${isLoading ? "animate-spin" : ""}`} />
-            refresh
           </Button>
         </div>
       </div>
+
+      {/* Date range picker */}
+      <DateRangePicker value={dateRange} onChange={setDateRange} />
 
       {/* Error state */}
       {error && (
@@ -146,28 +187,32 @@ export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardPro
         </div>
       )}
 
-      {/* Main layout: chart + sidebar */}
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-6">
-        {/* Chart area */}
-        <div className="min-w-0">
-          <ActivityChart
-            data={dailyData}
-            isLoading={isLoading}
-            onBarClick={handleBarClick}
-          />
-        </div>
+      {/* Stacked bar chart */}
+      <ActivityChart
+        data={dailyData}
+        isLoading={isLoading}
+        onBarClick={handleBarClick}
+      />
 
-        {/* Sidebar */}
-        <div className="space-y-6">
-          <SummaryCards summary={summary} isLoading={isLoading} />
-          <CategoryFilter
-            selected={categoryFilter}
-            onChange={setCategoryFilter}
-          />
-        </div>
+      {/* Category legend / filter */}
+      <CategoryFilter
+        selected={categoryFilter}
+        onChange={setCategoryFilter}
+      />
+
+      {/* App usage list */}
+      <div>
+        <p className="text-xs text-muted-foreground font-mono mb-3">
+          apps
+        </p>
+        <AppUsageList
+          apps={appUsage}
+          isLoading={isLoading}
+          onAppClick={handleAppClick}
+        />
       </div>
 
-      {/* Active filters */}
+      {/* Active filters + detail table (drill-down) */}
       <ActiveFilters
         selectedDate={selectedDate}
         selectedCategory={selectedCategory}
@@ -187,17 +232,18 @@ export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardPro
         onClearAll={clearAllFilters}
       />
 
-      {/* Activity log table */}
-      <ActivityLogTable
-        rows={logRows}
-        totalRows={logTotal}
-        page={logPage}
-        pageSize={100}
-        isLoading={logLoading}
-        error={logError}
-        onPageChange={setLogPage}
-        onRowClick={handleRowClick}
-      />
+      {(selectedDate || selectedApp) && (
+        <ActivityLogTable
+          rows={logRows}
+          totalRows={logTotal}
+          page={logPage}
+          pageSize={100}
+          isLoading={logLoading}
+          error={logError}
+          onPageChange={setLogPage}
+          onRowClick={handleRowClick}
+        />
+      )}
     </div>
   );
 }

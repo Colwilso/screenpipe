@@ -36,6 +36,12 @@ export interface ActivitySummary {
   activeDays: number;
 }
 
+export interface AppUsage {
+  appName: string;
+  category: CategoryKey;
+  hours: number;
+}
+
 export interface ActivityLogRow {
   timestamp: string;
   appName: string;
@@ -59,6 +65,11 @@ interface RawLogRow {
   timestamp: string;
   app_name: string;
   window_name: string;
+}
+
+interface RawMeetingRow {
+  date: string;
+  meeting_hours: number;
 }
 
 // Gaps under 15 minutes count as continuous active time.
@@ -107,8 +118,29 @@ function computeActiveHours(sortedMs: number[]): number {
   return activeMs / 3_600_000;
 }
 
+// Day boundary at 5am local -- activity before 5am counts toward the previous day.
+const DAY_START_HOUR = 5;
+
+function formatDateLocal(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// Returns the "logical date" for a timestamp, shifting activity before 5am
+// to the previous calendar day.
+function logicalDate(d: Date): string {
+  if (d.getHours() < DAY_START_HOUR) {
+    const prev = new Date(d);
+    prev.setDate(prev.getDate() - 1);
+    return formatDateLocal(prev);
+  }
+  return formatDateLocal(d);
+}
+
 function formatDateForSql(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  return formatDateLocal(d);
 }
 
 // Group a flat list of {date, ms} into per-date sorted arrays
@@ -147,61 +179,114 @@ export function useActivityData(
     setError(null);
 
     try {
-      // 1. Per-app aggregation (for category breakdown + top app)
+      // 1. Per-app aggregation (for category breakdown + top app).
+      // Use localtime with a -5 hour offset so activity before 5am local
+      // counts toward the previous calendar day.
       const appSql = `
-        SELECT DATE(timestamp) as date, app_name,
+        SELECT DATE(timestamp, 'localtime', '-5 hours') as date, app_name,
           COUNT(*) as frame_count,
           MIN(timestamp) as first_seen, MAX(timestamp) as last_seen
         FROM frames
-        WHERE timestamp >= '${startStr}' AND timestamp < DATE('${endStr}', '+1 day')
+        WHERE DATE(timestamp, 'localtime') >= '${startStr}'
+          AND DATE(timestamp, 'localtime') <= '${endStr}'
           AND app_name IS NOT NULL AND app_name != ''
-        GROUP BY DATE(timestamp), app_name
+        GROUP BY DATE(timestamp, 'localtime', '-5 hours'), app_name
         ORDER BY date, frame_count DESC
         LIMIT 10000
       `;
 
-      // 2. All distinct frame timestamps (for gap-based total per day)
-      const frameTsSql = `
-        SELECT DISTINCT timestamp FROM frames
-        WHERE timestamp >= '${startStr}' AND timestamp < DATE('${endStr}', '+1 day')
-        ORDER BY timestamp
+      // 2. Real meeting hours from the meetings table (detected by MeetingDetector).
+      // Timestamps are stored as UTC in SQLite, so DATE(x, 'localtime') converts
+      // to the user's timezone for grouping. meeting_end may be empty string
+      // instead of NULL, so NULLIF handles that.
+      // For meetings without an end time, use current time but cap at 30 min
+      // to prevent stale/orphaned meetings from inflating the count.
+      const meetingsSql = `
+        SELECT DATE(meeting_start, 'localtime', '-5 hours') as date,
+          SUM(
+            MIN(
+              (JULIANDAY(COALESCE(NULLIF(meeting_end, ''), DATETIME('now')))
+               - JULIANDAY(meeting_start)) * 24.0,
+              0.5
+            )
+          ) as meeting_hours
+        FROM meetings
+        WHERE DATE(meeting_start, 'localtime') >= '${startStr}'
+          AND DATE(meeting_start, 'localtime') <= '${endStr}'
+        GROUP BY DATE(meeting_start, 'localtime', '-5 hours')
         LIMIT 10000
       `;
 
-      // 3. All audio timestamps (fills gaps where screen didn't capture)
-      const audioTsSql = `
-        SELECT DISTINCT timestamp FROM audio_transcriptions
-        WHERE timestamp >= '${startStr}' AND timestamp < DATE('${endStr}', '+1 day')
-        ORDER BY timestamp
-        LIMIT 10000
-      `;
-
-      const [appRows, frameTs, audioTs] = await Promise.all([
+      const [appRows, meetingRows] = await Promise.all([
         rawSql<RawFrameRow>(appSql),
-        rawSql<RawTimestampRow>(frameTsSql),
-        rawSql<RawTimestampRow>(audioTsSql),
+        rawSql<RawMeetingRow>(meetingsSql).catch((e) => {
+          console.error("meetings query failed:", e);
+          return [] as RawMeetingRow[];
+        }),
       ]);
 
-      // Merge frame + audio timestamps into per-date arrays for gap analysis
-      const allEntries: Array<{ date: string; ms: number }> = [];
+      // 3. Fetch per-calendar-day timestamps (frames + audio), then group
+      // by logical date (5am boundary) on the client. Each calendar day
+      // is queried independently to stay under the 10000 row LIMIT.
+      const calendarDays: string[] = [];
+      {
+        // Fetch one extra day on each side to capture 5am boundary spillover.
+        // Append T12:00:00 so the date string is parsed as local noon, not
+        // UTC midnight (which can shift to the previous day in negative offsets).
+        const cursor = new Date(startStr + "T12:00:00");
+        cursor.setDate(cursor.getDate() - 1);
+        const end = new Date(endStr + "T12:00:00");
+        end.setDate(end.getDate() + 1);
+        while (cursor <= end) {
+          calendarDays.push(formatDateLocal(cursor));
+          cursor.setDate(cursor.getDate() + 1);
+        }
+      }
+
+      const allTimestampMs: number[] = [];
+      await Promise.all(
+        calendarDays.map(async (day) => {
+          const [frameTsDay, audioTsDay] = await Promise.all([
+            rawSql<RawTimestampRow>(`
+              SELECT DISTINCT timestamp FROM frames
+              WHERE DATE(timestamp, 'localtime') = '${day}'
+              ORDER BY timestamp
+              LIMIT 10000
+            `),
+            rawSql<RawTimestampRow>(`
+              SELECT DISTINCT timestamp FROM audio_transcriptions
+              WHERE DATE(timestamp, 'localtime') = '${day}'
+              ORDER BY timestamp
+              LIMIT 10000
+            `),
+          ]);
+
+          for (const r of frameTsDay) {
+            allTimestampMs.push(new Date(r.timestamp).getTime());
+          }
+          for (const r of audioTsDay) {
+            allTimestampMs.push(new Date(r.timestamp).getTime());
+          }
+        })
+      );
+
+      // Deduplicate and group by logical date (5am boundary)
       const seen = new Set<number>();
-      for (const r of frameTs) {
-        const d = new Date(r.timestamp);
-        const ms = d.getTime();
+      const logicalEntries: Array<{ date: string; ms: number }> = [];
+      for (const ms of allTimestampMs) {
         if (!seen.has(ms)) {
           seen.add(ms);
-          allEntries.push({ date: formatDateForSql(d), ms });
+          logicalEntries.push({ date: logicalDate(new Date(ms)), ms });
         }
       }
-      for (const r of audioTs) {
-        const d = new Date(r.timestamp);
-        const ms = d.getTime();
-        if (!seen.has(ms)) {
-          seen.add(ms);
-          allEntries.push({ date: formatDateForSql(d), ms });
-        }
+      const dailyTimestamps = groupByDate(logicalEntries);
+
+      // Build detected meeting hours lookup (date -> hours)
+      const detectedMeetingHours = new Map<string, number>();
+      for (const m of meetingRows) {
+        detectedMeetingHours.set(m.date, Math.max(0, m.meeting_hours || 0));
       }
-      const dailyTimestamps = groupByDate(allEntries);
+      const hasDetectedMeetings = detectedMeetingHours.size > 0;
 
       // Build per-app data and category proportions per day
       const apps: AppActivity[] = [];
@@ -233,8 +318,8 @@ export function useActivityData(
       // For each day: compute total active hours from combined timestamps,
       // then distribute across categories proportionally by frame count.
       const daily: DailyActivity[] = [];
-      const cursor = new Date(startStr);
-      const endDate = new Date(endStr);
+      const cursor = new Date(startStr + "T12:00:00");
+      const endDate = new Date(endStr + "T12:00:00");
       while (cursor <= endDate) {
         const key = formatDateForSql(cursor);
         const timestamps = dailyTimestamps.get(key);
@@ -242,23 +327,52 @@ export function useActivityData(
 
         const catFrames = dailyCategoryFrames.get(key);
         const categories = {} as Record<CategoryKey, number>;
+        const realMeetingHrs = hasDetectedMeetings
+          ? Math.max(0, detectedMeetingHours.get(key) || 0)
+          : 0;
 
         if (catFrames && totalHours > 0) {
           const totalFrames = Object.values(catFrames).reduce(
             (a, b) => a + b,
             0
           );
-          for (const k of CATEGORY_KEYS) {
-            categories[k] =
-              totalFrames > 0
-                ? totalHours * (catFrames[k] / totalFrames)
-                : 0;
+
+          if (hasDetectedMeetings) {
+            // Use real meeting data: set meetings category from detector,
+            // distribute remaining hours across non-meeting categories
+            // proportionally by their frame counts.
+            const clampedMeetingHrs = Math.min(realMeetingHrs, totalHours);
+            categories.meetings = clampedMeetingHrs;
+            const remainingHours = totalHours - clampedMeetingHrs;
+            const nonMeetingFrames = CATEGORY_KEYS
+              .filter((k) => k !== "meetings")
+              .reduce((sum, k) => sum + catFrames[k], 0);
+            for (const k of CATEGORY_KEYS) {
+              if (k === "meetings") continue;
+              categories[k] =
+                nonMeetingFrames > 0
+                  ? remainingHours * (catFrames[k] / nonMeetingFrames)
+                  : 0;
+            }
+          } else {
+            // Fallback: distribute all hours by frame proportion (including
+            // heuristic-based meeting categorization from app names)
+            for (const k of CATEGORY_KEYS) {
+              categories[k] =
+                totalFrames > 0
+                  ? totalHours * (catFrames[k] / totalFrames)
+                  : 0;
+            }
           }
         } else {
+          // No frame data for this day -- still include detected meetings
           for (const k of CATEGORY_KEYS) categories[k] = 0;
+          if (realMeetingHrs > 0) {
+            categories.meetings = realMeetingHrs;
+          }
         }
 
-        daily.push({ date: key, categories, totalHours });
+        daily.push({ date: key, categories, totalHours: Math.max(totalHours, realMeetingHrs) });
         cursor.setDate(cursor.getDate() + 1);
       }
 
@@ -275,7 +389,7 @@ export function useActivityData(
       }
       for (const app of apps) {
         // Find which date this app entry belongs to
-        const appDate = formatDateForSql(new Date(app.firstSeen));
+        const appDate = logicalDate(new Date(app.firstSeen));
         const tf = dayTotalFrames.get(appDate) || 1;
         const th = dayTotalHours.get(appDate) || 0;
         app.hours = th * (app.frameCount / tf);
@@ -315,7 +429,8 @@ export function useActivityData(
 
   const summary = useMemo((): ActivitySummary => {
     const totalHours = dailyData.reduce((sum, d) => sum + d.totalHours, 0);
-    const activeDays = dailyData.filter((d) => d.totalHours > 0).length;
+    // Only count days with at least 15 minutes of activity
+    const activeDays = dailyData.filter((d) => d.totalHours >= 0.25).length;
 
     const appHours = new Map<string, number>();
     for (const app of appData) {
@@ -334,16 +449,36 @@ export function useActivityData(
     }
 
     const meetingHours = dailyData.reduce(
-      (sum, d) => sum + d.categories.meetings,
+      (sum, d) => sum + (d.categories.meetings || 0),
       0
     );
 
     return { totalHours, topApp, meetingHours, activeDays };
   }, [dailyData, appData]);
 
+  // Aggregated per-app usage sorted by hours descending
+  const appUsage = useMemo((): AppUsage[] => {
+    const byApp = new Map<string, { category: CategoryKey; hours: number }>();
+    for (const app of appData) {
+      const existing = byApp.get(app.appName);
+      if (existing) {
+        existing.hours += app.hours;
+      } else {
+        byApp.set(app.appName, {
+          category: categorizeApp(app.appName),
+          hours: app.hours,
+        });
+      }
+    }
+    return Array.from(byApp.entries())
+      .map(([appName, { category, hours }]) => ({ appName, category, hours }))
+      .sort((a, b) => b.hours - a.hours);
+  }, [appData]);
+
   return {
     dailyData: filteredDaily,
     appData,
+    appUsage,
     summary,
     isLoading,
     error,

@@ -46,7 +46,7 @@ export function SummaryCards({ summary, isLoading }: SummaryCardsProps) {
     {
       label: "meeting time",
       value: formatHours(summary.meetingHours),
-      tooltip: "time spent in meeting apps (zoom, teams, meet, etc.)",
+      tooltip: "time in detected meetings (from meeting detector, falls back to app heuristic)",
     },
     {
       label: "active days",
@@ -70,7 +70,7 @@ export function SummaryCards({ summary, isLoading }: SummaryCardsProps) {
                     {isLoading ? (
                       <Skeleton className="h-6 w-16" />
                     ) : (
-                      <p className="text-lg font-mono font-medium truncate">
+                      <p className="text-lg font-mono font-medium break-words">
                         {card.value}
                       </p>
                     )}
