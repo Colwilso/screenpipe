@@ -25,6 +25,8 @@ import Timeline from "@/components/rewind/timeline";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { RefreshCw, AlertTriangle, WifiOff, Upload, Loader, Check, Calendar, X } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { ActivityDashboard } from "@/components/activity/activity-dashboard";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import { getVersion } from "@tauri-apps/api/app";
@@ -86,6 +88,7 @@ export default function Home() {
   const [isRestarting, setIsRestarting] = useState(false);
   const [isSendingLogs, setIsSendingLogs] = useState(false);
   const [logsSent, setLogsSent] = useState(false);
+  const [activeTab, setActiveTab] = useState("timeline");
   const isProcessingRef = useRef(false);
   
   // Listen for update events from Rust backend
@@ -333,6 +336,11 @@ export default function Home() {
     }
   };
 
+  const handleNavigateToTimeline = useCallback((timestamp: string) => {
+    setActiveTab("timeline");
+    // TODO: scroll Timeline to this timestamp once Timeline exposes a seek API
+  }, []);
+
   // Determine what to show:
   // 1. If user has data (cached or live) -> always show timeline, even if server is down
   // 2. If no data AND server is down -> show server error screen
@@ -355,8 +363,25 @@ export default function Home() {
           {!isEnterprise && <LoginDialog />}
           <ModelDownloadTracker />
           <UpdateBanner />
-          
-          {showTimeline ? (
+
+          <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full flex-1 flex flex-col">
+            <TabsList className="bg-transparent h-8 gap-0 px-4 pt-10 pb-0 justify-start rounded-none border-b border-border">
+              <TabsTrigger
+                value="timeline"
+                className="rounded-none border-b-2 border-transparent data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none text-xs font-mono px-3 py-1"
+              >
+                timeline
+              </TabsTrigger>
+              <TabsTrigger
+                value="activity"
+                className="rounded-none border-b-2 border-transparent data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none text-xs font-mono px-3 py-1"
+              >
+                activity
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="timeline" className="flex-1 mt-0">
+              {showTimeline ? (
                 <div className="w-full scrollbar-hide bg-background relative">
                   {/* Subtle disconnected indicator - only show if we have data but no connection */}
                   {hasAnyData && !isConnected && isServerDown && (
@@ -379,7 +404,7 @@ export default function Home() {
                     <Timeline />
                   </TimelineErrorBoundary>
                 </div>
-          ) : showServerError ? (
+              ) : showServerError ? (
             <div className="flex items-center justify-center h-screen p-4 bg-background w-full">
               <div className="max-w-lg w-full space-y-6">
                 {/* Header */}
@@ -494,6 +519,12 @@ export default function Home() {
               </div>
             </div>
           )}
+            </TabsContent>
+
+            <TabsContent value="activity" className="flex-1 mt-0">
+              <ActivityDashboard onNavigateToTimeline={handleNavigateToTimeline} />
+            </TabsContent>
+          </Tabs>
         </>
       ) : (
         <SplashScreen />
