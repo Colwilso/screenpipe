@@ -338,6 +338,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             "openai" => Some("openai"),
             "openai-chatgpt" => Some("openai-chatgpt"),
             "custom" => Some("custom"), // custom uses openai-compatible API at a user-specified URL
+            "bedrock" => Some("amazon-bedrock"),
             _ => None,
         })
         .map(|s| s.to_string());

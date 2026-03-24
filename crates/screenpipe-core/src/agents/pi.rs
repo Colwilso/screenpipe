@@ -312,9 +312,10 @@ impl PiExecutor {
             }
         }
 
-        // Add the pipe's own provider (ollama, openai, custom) if specified
+        // Add the pipe's own provider (ollama, openai, custom) if specified.
+        // Bedrock is built into Pi — auth via AWS_PROFILE env var, no models.json entry needed.
         if let (Some(prov), Some(mdl)) = (provider, model) {
-            if prov != "screenpipe" {
+            if prov != "screenpipe" && prov != "amazon-bedrock" {
                 let (pi_provider_name, base_url, api_key) = match prov {
                     "ollama" => (
                         "ollama",
