@@ -155,6 +155,7 @@ export function ActivityChart({ data, isLoading, onBarClick }: ActivityChartProp
               fill={getCategoryDef(key).color}
               name={getCategoryDef(key).label}
               radius={0}
+              isAnimationActive={false}
               cursor="pointer"
               onClick={(data: any) => {
                 if (data?.date) {
