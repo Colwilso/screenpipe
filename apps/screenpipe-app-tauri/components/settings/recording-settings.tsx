@@ -506,6 +506,7 @@ export function RecordingSettings() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [showOpenAIApiKey, setShowOpenAIApiKey] = useState(false);
   const [isRefreshingSubscription, setIsRefreshingSubscription] = useState(false);
+  const [isTogglingAudio, setIsTogglingAudio] = useState(false);
   const { checkLogin } = useLoginDialog();
   const team = useTeam();
   const isTeamAdmin = !!team.team && team.role === "admin";
@@ -909,8 +910,32 @@ export function RecordingSettings() {
     handleSettingsChange({ usePiiRemoval: checked }, true);
   };
 
-  const handleDisableAudioChange = (checked: boolean) => {
-    handleSettingsChange({ disableAudio: checked }, true);
+  const handleDisableAudioChange = async (checked: boolean) => {
+    setIsTogglingAudio(true);
+    const endpoint = checked
+      ? `http://localhost:${settings.port}/audio/stop`
+      : `http://localhost:${settings.port}/audio/start`;
+    try {
+      const response = await fetch(endpoint, { method: "POST" });
+      if (!response.ok) throw new Error(await response.text());
+      // Update the store without marking for restart
+      handleSettingsChange({ disableAudio: checked }, false);
+      toast({
+        title: checked ? "audio recording stopped" : "audio recording started",
+        description: checked
+          ? "audio capture has been disabled"
+          : "audio capture has been enabled",
+      });
+    } catch (e) {
+      console.error("failed to toggle audio:", e);
+      toast({
+        title: "failed to toggle audio",
+        description: String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setIsTogglingAudio(false);
+    }
   };
 
   const handleAnalyticsToggle = (checked: boolean) => {
@@ -1199,7 +1224,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <p className="text-xs text-muted-foreground">Capture audio from microphone and system</p>
                 </div>
               </div>
-              <Switch id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
+              {isTogglingAudio ? (
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              ) : (
+                <Switch id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
+              )}
             </div>
           </CardContent>
         </Card>

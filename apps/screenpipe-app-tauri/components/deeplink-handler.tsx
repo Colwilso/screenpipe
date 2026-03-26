@@ -212,23 +212,39 @@ export function DeeplinkHandler() {
       }),
 
       listen("shortcut-start-audio", async () => {
-        await commands.stopScreenpipe();
-        await commands.spawnScreenpipe(null);
-
-        toast({
-          title: "audio recording started",
-          description: "audio capture has been enabled",
-        });
+        try {
+          const response = await fetch("http://localhost:3030/audio/start", { method: "POST" });
+          if (!response.ok) throw new Error(await response.text());
+          toast({
+            title: "audio recording started",
+            description: "audio capture has been enabled",
+          });
+        } catch (e) {
+          console.error("failed to start audio:", e);
+          toast({
+            title: "failed to start audio",
+            description: String(e),
+            variant: "destructive",
+          });
+        }
       }),
 
       listen("shortcut-stop-audio", async () => {
-        await commands.stopScreenpipe();
-        await commands.spawnScreenpipe(null);
-
-        toast({
-          title: "audio recording stopped",
-          description: "audio capture has been disabled",
-        });
+        try {
+          const response = await fetch("http://localhost:3030/audio/stop", { method: "POST" });
+          if (!response.ok) throw new Error(await response.text());
+          toast({
+            title: "audio recording stopped",
+            description: "audio capture has been disabled",
+          });
+        } catch (e) {
+          console.error("failed to stop audio:", e);
+          toast({
+            title: "failed to stop audio",
+            description: String(e),
+            variant: "destructive",
+          });
+        }
       }),
 
       listen("cli-login", async (event) => {
