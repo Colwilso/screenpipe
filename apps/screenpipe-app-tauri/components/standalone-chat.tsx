@@ -1290,6 +1290,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const needsLogin = (activePreset?.provider === "screenpipe-cloud" || activePreset?.provider === "pi") && !settings.user?.token;
   // Pi auto-starts on first message, so don't block chat when Pi is not running
   const canChat = hasPresets && hasValidModel && !needsLogin && !piStarting;
+  // BYOK providers (bedrock, ollama, openai, custom, anthropic) should not
+  // show the screenpipe upgrade/credits dialog on rate-limit errors.
+  const isScreenpipeCloudProvider = !activePreset?.provider || activePreset.provider === "screenpipe-cloud" || activePreset.provider === "pi";
 
   const getDisabledReason = (): string | null => {
     if (!hasPresets) return "No AI presets configured";
@@ -1540,25 +1543,32 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const isDailyLimit = errorStr.includes("daily_limit_exceeded");
             const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
 
-            // Extract reset time if available
-            try {
-              const resetMatch = errorStr.match(/"reset_in":\s*(\d+)/);
-              const resetsAtMatch = errorStr.match(/"resets_at":\s*"([^"]+)"/);
-              if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-              else if (resetMatch) setUpgradeResetsAt(`${resetMatch[1]} seconds`);
-            } catch {}
+            if (isScreenpipeCloudProvider) {
+              // Extract reset time if available
+              try {
+                const resetMatch = errorStr.match(/"reset_in":\s*(\d+)/);
+                const resetsAtMatch = errorStr.match(/"resets_at":\s*"([^"]+)"/);
+                if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
+                else if (resetMatch) setUpgradeResetsAt(`${resetMatch[1]} seconds`);
+              } catch {}
 
-            if (isDailyLimit) {
-              setUpgradeReason("daily_limit");
-              posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
-            } else {
-              setUpgradeReason("rate_limit");
+              if (isDailyLimit) {
+                setUpgradeReason("daily_limit");
+                posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
+              } else {
+                setUpgradeReason("rate_limit");
+              }
             }
 
             if (piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
               let content: string;
-              if (isDailyLimit) {
+              if (!isScreenpipeCloudProvider) {
+                // BYOK provider — show neutral error, not upgrade upsell
+                const waitMatch = errorStr.match(/wait (\d+) seconds/i);
+                const waitTime = waitMatch ? waitMatch[1] : "a moment";
+                content = `Request failed (429) — check your provider configuration or wait ${waitTime}.`;
+              } else if (isDailyLimit) {
                 content = "You've used all your free queries for today.";
               } else if (isPerMinuteRate) {
                 // Extract wait time from error
@@ -1593,27 +1603,36 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const fullError = `${reason} ${errorDetail}`.trim();
 
             if (fullError.includes("daily_limit_exceeded") || fullError.includes("429") || fullError.includes("rate limit")) {
-              const isDailyLimit = fullError.includes("daily_limit_exceeded");
-              const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
-              if (isDailyLimit) {
-                try {
-                  const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
-                  if (match) setUpgradeResetsAt(match[1]);
-                } catch {}
-                setUpgradeReason("daily_limit");
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
-                );
-              } else {
-                setUpgradeReason("rate_limit");
+              if (!isScreenpipeCloudProvider) {
+                // BYOK provider — neutral error, no upgrade upsell
                 const waitMatch = fullError.match(/wait (\d+) seconds/i);
                 const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                const content = isPerMinuteRate
-                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                  : "Rate limited — try again in a moment or switch to a different model.";
                 setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content } : m)
+                  prev.map((m) => m.id === msgId ? { ...m, content: `Request failed (429) — check your provider configuration or wait ${waitTime}.` } : m)
                 );
+              } else {
+                const isDailyLimit = fullError.includes("daily_limit_exceeded");
+                const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
+                if (isDailyLimit) {
+                  try {
+                    const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
+                    if (match) setUpgradeResetsAt(match[1]);
+                  } catch {}
+                  setUpgradeReason("daily_limit");
+                  setMessages((prev) =>
+                    prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                  );
+                } else {
+                  setUpgradeReason("rate_limit");
+                  const waitMatch = fullError.match(/wait (\d+) seconds/i);
+                  const waitTime = waitMatch ? waitMatch[1] : "a moment";
+                  const content = isPerMinuteRate
+                    ? `Rate limited — please wait ${waitTime} seconds and try again.`
+                    : "Rate limited — try again in a moment or switch to a different model.";
+                  setMessages((prev) =>
+                    prev.map((m) => m.id === msgId ? { ...m, content } : m)
+                  );
+                }
               }
             } else if (fullError.includes("model_not_allowed")) {
               setUpgradeReason("model_not_allowed");
@@ -1640,20 +1659,32 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const msgId = piMessageIdRef.current;
 
             if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("429")) {
-              try {
-                const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
-                if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-              } catch {}
-              setUpgradeReason("daily_limit");
-              posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
-              setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
-              );
+              if (!isScreenpipeCloudProvider) {
+                setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: "Request failed (429) — check your provider configuration." } : m)
+                );
+              } else {
+                try {
+                  const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
+                  if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
+                } catch {}
+                setUpgradeReason("daily_limit");
+                posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
+                setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                );
+              }
             } else if (errMsg.includes("rate limit") || errMsg.includes("rate_limit")) {
-              setUpgradeReason("rate_limit");
-              setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
-              );
+              if (!isScreenpipeCloudProvider) {
+                setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
+                );
+              } else {
+                setUpgradeReason("rate_limit");
+                setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
+                );
+              }
             } else {
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: `Error: ${errMsg}` } : m)
@@ -1698,14 +1729,20 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             if (agentEndError && !content) {
               const errStr = agentEndError;
               if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("429")) {
-                try {
-                  const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
-                  if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-                } catch {}
-                setUpgradeReason("daily_limit");
-                content = "You've used all your free queries for today.";
+                if (isScreenpipeCloudProvider) {
+                  try {
+                    const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
+                    if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
+                  } catch {}
+                  setUpgradeReason("daily_limit");
+                  content = "You've used all your free queries for today.";
+                } else {
+                  content = "Request failed (429) — check your provider configuration.";
+                }
               } else if (errStr.includes("rate limit")) {
-                setUpgradeReason("rate_limit");
+                if (isScreenpipeCloudProvider) {
+                  setUpgradeReason("rate_limit");
+                }
                 content = "Rate limited — try again in a moment.";
               } else {
                 content = `Error: ${errStr}`;
@@ -1778,27 +1815,36 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const msgId = piMessageIdRef.current;
 
             if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
-              const isDailyLimit = errorStr.includes("daily_limit_exceeded");
-              const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
-              if (isDailyLimit) {
-                try {
-                  const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
-                  if (match) setUpgradeResetsAt(match[1]);
-                } catch {}
-                setUpgradeReason("daily_limit");
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
-                );
-              } else {
-                setUpgradeReason("rate_limit");
+              if (!isScreenpipeCloudProvider) {
+                // BYOK provider — neutral error, no upgrade upsell
                 const waitMatch = errorStr.match(/wait (\d+) seconds/i);
                 const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                const content = isPerMinuteRate
-                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                  : "Rate limited — try again in a moment or switch to a different model.";
                 setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content } : m)
+                  prev.map((m) => m.id === msgId ? { ...m, content: `Request failed (429) — check your provider configuration or wait ${waitTime}.` } : m)
                 );
+              } else {
+                const isDailyLimit = errorStr.includes("daily_limit_exceeded");
+                const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
+                if (isDailyLimit) {
+                  try {
+                    const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
+                    if (match) setUpgradeResetsAt(match[1]);
+                  } catch {}
+                  setUpgradeReason("daily_limit");
+                  setMessages((prev) =>
+                    prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                  );
+                } else {
+                  setUpgradeReason("rate_limit");
+                  const waitMatch = errorStr.match(/wait (\d+) seconds/i);
+                  const waitTime = waitMatch ? waitMatch[1] : "a moment";
+                  const content = isPerMinuteRate
+                    ? `Rate limited — please wait ${waitTime} seconds and try again.`
+                    : "Rate limited — try again in a moment or switch to a different model.";
+                  setMessages((prev) =>
+                    prev.map((m) => m.id === msgId ? { ...m, content } : m)
+                  );
+                }
               }
             } else if (errorStr.includes("model_not_allowed")) {
               setUpgradeReason("model_not_allowed");
@@ -1969,8 +2015,11 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         } else if (line.includes("429") || line.includes("rate") || line.includes("daily_limit")) {
           const msgId = piMessageIdRef.current;
           if (msgId) {
+            const content = isScreenpipeCloudProvider
+              ? "Rate limited — try again in a moment or switch to a different model."
+              : "Request failed (429) — check your provider configuration.";
             setMessages((prev) =>
-              prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment or switch to a different model." } : m)
+              prev.map((m) => m.id === msgId ? { ...m, content } : m)
             );
           }
         } else if (line.includes("content must be a string") || line.includes("does not support images") || line.includes("image_url is not supported")) {

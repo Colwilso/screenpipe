@@ -951,13 +951,24 @@ impl PipeManager {
                     ),
                 }
             } else {
-                (
-                    config.model.clone(),
-                    config.provider.clone(),
-                    None,
-                    None,
-                    None,
-                )
+                // No explicit preset -- use the app's default AI preset so pipes
+                // inherit the user's configured provider (bedrock, ollama, etc.)
+                match resolve_preset(&self.pipes_dir, "default") {
+                    Some(resolved) => {
+                        info!(
+                            "pipe '{}': no preset specified, using default → model={}, provider={:?}",
+                            name, resolved.model, resolved.provider
+                        );
+                        (
+                            resolved.model,
+                            resolved.provider,
+                            resolved.url,
+                            resolved.api_key,
+                            resolved.prompt,
+                        )
+                    }
+                    None => (config.model.clone(), config.provider.clone(), None, None, None),
+                }
             };
 
         // Create DB execution row
@@ -1323,13 +1334,24 @@ impl PipeManager {
                     }
                 }
             } else {
-                (
-                    config.model.clone(),
-                    config.provider.clone(),
-                    None,
-                    None,
-                    None,
-                )
+                // No explicit preset -- use the app's default AI preset so pipes
+                // inherit the user's configured provider (bedrock, ollama, etc.)
+                match resolve_preset(&self.pipes_dir, "default") {
+                    Some(resolved) => {
+                        info!(
+                            "pipe '{}': no preset specified, using default → model={}, provider={:?}",
+                            name, resolved.model, resolved.provider
+                        );
+                        (
+                            resolved.model,
+                            resolved.provider,
+                            resolved.url,
+                            resolved.api_key,
+                            resolved.prompt,
+                        )
+                    }
+                    None => (config.model.clone(), config.provider.clone(), None, None, None),
+                }
             };
 
         // Create DB execution row
@@ -1996,13 +2018,30 @@ impl PipeManager {
                             ),
                         }
                     } else {
-                        (
-                            config.model.clone(),
-                            config.provider.clone(),
-                            None,
-                            None,
-                            None,
-                        )
+                        // No explicit preset -- use the app's default AI preset so pipes
+                        // inherit the user's configured provider (bedrock, ollama, etc.)
+                        match resolve_preset(&pipes_dir, "default") {
+                            Some(resolved) => {
+                                info!(
+                                    "scheduler: pipe '{}' no preset specified, using default → model={}, provider={:?}",
+                                    name, resolved.model, resolved.provider
+                                );
+                                (
+                                    resolved.model,
+                                    resolved.provider,
+                                    resolved.url,
+                                    resolved.api_key,
+                                    resolved.prompt,
+                                )
+                            }
+                            None => (
+                                config.model.clone(),
+                                config.provider.clone(),
+                                None,
+                                None,
+                                None,
+                            ),
+                        }
                     };
 
                     // Pre-configure pi with the pipe's provider
