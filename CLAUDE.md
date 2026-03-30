@@ -55,22 +55,21 @@ cd packages/screenpipe-js/browser-sdk && bun run build # @screenpipe/browser
 cd packages/screenpipe-js/cli && bun run build         # @screenpipe/dev CLI
 ```
 
-### Running the engine standalone
+### Running screenpipe
 
-The Tauri desktop app (`bun tauri dev`) auto-starts the engine internally, but this is unreliable in dev mode. For manual standalone starts, use the npm-installed CLI (`screenpipe@0.3.180` at `/opt/homebrew/bin/screenpipe`):
+**Always use the Tauri dev build**, not the npm CLI:
 
 ```bash
-# Standard start (background, logs to file)
-screenpipe record --port 3030 --disable-telemetry --use-system-default-audio > /tmp/screenpipe-engine.log 2>&1 &
+# Kill any stale engine on port 3030 first
+lsof -ti :3030 | xargs kill 2>/dev/null
 
-# Verify
-curl -s http://localhost:3030/health
-
-# Alternate port (useful when Tauri app owns 3030)
-screenpipe record --port 3035 --disable-telemetry --use-system-default-audio
+# Start the app (engine + UI + Pi)
+cd apps/screenpipe-app-tauri && bun tauri dev
 ```
 
-Note: There is no cargo-built engine binary. The workspace root `cargo build` does not produce a standalone `screenpipe` or `screenpipe-engine` binary -- the Tauri app embeds the engine crates as library dependencies. The npm CLI is the only standalone engine available.
+The Tauri app embeds the engine as a library dependency. Local changes to `screenpipe-core` (pipes, presets, agents) only take effect in the Tauri build. The npm CLI (`/opt/homebrew/bin/screenpipe`) is a published package with none of our local patches.
+
+**Never start the npm engine on port 3030.** If it's already running when `bun tauri dev` launches, the embedded server silently fails to bind and pipes run through the unpatched npm binary. Always kill port 3030 before starting the Tauri app.
 
 ## Testing
 ```bash
