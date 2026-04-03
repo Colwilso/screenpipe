@@ -570,6 +570,7 @@ impl SettingsStore {
                 "opencode",
                 "pi",
                 "anthropic",
+                "bedrock",
             ];
             if let Some(presets) = obj.get_mut("aiPresets") {
                 if let Some(arr) = presets.as_array_mut() {
