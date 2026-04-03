@@ -1146,6 +1146,39 @@ const AISection = ({
         />
       )}
 
+      {settingsPreset?.provider === "bedrock" && (
+        <>
+          <div className="w-full">
+            <Label htmlFor="awsProfile">AWS Profile</Label>
+            <p className="text-xs text-muted-foreground mb-2">
+              AWS CLI profile name (from ~/.aws/config). Leave empty to use default profile.
+            </p>
+            <Input
+              id="awsProfile"
+              type="text"
+              value={(settingsPreset as any)?.awsProfile || ""}
+              onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
+              placeholder="default"
+              className="w-full"
+            />
+          </div>
+
+          <div className="w-full">
+            <Label htmlFor="awsRegion">AWS Region</Label>
+            <p className="text-xs text-muted-foreground mb-2">
+              AWS region for Bedrock (e.g., us-east-1, us-west-2).
+            </p>
+            <Input
+              id="awsRegion"
+              type="text"
+              value={(settingsPreset as any)?.awsRegion || ""}
+              onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
+              placeholder="us-east-1"
+              className="w-full"
+            />
+          </div>
+        </>
+      )}
 
       {(settingsPreset?.provider === "anthropic" || settingsPreset?.provider === "custom" || (isApiKeyRequired &&
         settingsPreset?.provider === "openai")) && (
