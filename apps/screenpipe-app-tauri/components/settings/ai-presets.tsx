@@ -1129,6 +1129,7 @@ const AISection = ({
         required={true}
         spellCheck={false}
         autoCorrect="off"
+        autoCapitalize="off"
         disabled={!!preset && !isDuplicating && preset.id !== undefined}
         helperText="Only letters, numbers, spaces, hyphens, and underscores allowed"
       />
@@ -1143,6 +1144,9 @@ const AISection = ({
           placeholder="Enter custom AI URL"
           required={true}
           helperText="Enter the base URL for your custom AI provider"
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
         />
       )}
 
@@ -1160,6 +1164,9 @@ const AISection = ({
               onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
               placeholder="default"
               className="w-full"
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
             />
           </div>
 
@@ -1175,6 +1182,9 @@ const AISection = ({
               onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
               placeholder="us-east-1"
               className="w-full"
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
             />
           </div>
         </>
