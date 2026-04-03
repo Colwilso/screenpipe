@@ -502,7 +502,7 @@ const AISection = ({
   const [isLoadingModels, setIsLoadingModels] = useState(false);
 
   const runDiagnostics = useCallback(async () => {
-    if (settingsPreset?.provider === "screenpipe-cloud") return;
+    if (settingsPreset?.provider === "screenpipe-cloud" || settingsPreset?.provider === "bedrock") return;
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
