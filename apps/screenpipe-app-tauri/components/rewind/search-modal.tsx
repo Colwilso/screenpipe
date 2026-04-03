@@ -6,6 +6,7 @@ import { useKeywordSearchStore, SearchMatch, UiEventResult } from "@/lib/hooks/u
 import { useSearchHighlight } from "@/lib/hooks/use-search-highlight";
 import { useSearchFocus } from "./hooks/use-search-focus";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { useDebounce } from "@/lib/hooks/use-debounce";
 import { format, isToday, isYesterday } from "date-fns";
 import { cn } from "@/lib/utils";
@@ -39,8 +40,10 @@ interface TaggedFrame {
 interface SearchModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onNavigateToTimestamp: (timestamp: string) => void;
+  onNavigateToTimestamp: (timestamp: string, frameId?: number, searchTerms?: string[], searchResultsJson?: string, searchQuery?: string) => void;
   embedded?: boolean;
+  /** When true, this is rendered in its own Tauri window (no backdrop, always open) */
+  standalone?: boolean;
 }
 
 // stopwords to filter out from suggestions — keep this minimal so real
@@ -254,10 +257,12 @@ const FrameThumbnail = ({ frameId, alt }: { frameId: number; alt: string }) => {
           src={src}
           alt={alt}
           className={cn(
-            "w-full h-full object-cover transition-opacity",
+            "w-full h-full object-cover transition-opacity select-none",
             isLoading ? "opacity-0" : "opacity-100"
           )}
           loading="lazy"
+          draggable={false}
+          data-lm-disable="true"
           onLoad={() => setIsLoading(false)}
           onError={() => {
             if (retryCount.current < 3) {
@@ -285,7 +290,47 @@ function formatRelativeTime(timestamp: string): string {
   return format(date, "MMM d") + " " + time;
 }
 
-export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded = false }: SearchModalProps) {
+/** Compact keyboard/clipboard result item — shows 1 line by default, expands on click */
+function UiEventItem({ evt, onNavigate }: { evt: UiEventResult; onNavigate: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const EvtIcon = evt.event_type === "clipboard" ? ClipboardCopy
+    : evt.event_type === "app_switch" ? AppWindow
+    : Keyboard;
+
+  return (
+    <div
+      className="cursor-pointer border border-border rounded p-2 hover:border-foreground/50 transition-colors"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div
+          className="flex items-start gap-2 min-w-0 flex-1"
+          onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+        >
+          <EvtIcon className="w-3.5 h-3.5 text-muted-foreground mt-0.5 flex-shrink-0" />
+          <div className="min-w-0">
+            <p className={cn("text-xs text-foreground", !expanded && "line-clamp-1")}>
+              {evt.text_content}
+            </p>
+            {(evt.app_name || evt.window_title) && (
+              <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
+                {[evt.app_name, evt.window_title].filter(Boolean).join(" — ")}
+              </p>
+            )}
+          </div>
+        </div>
+        <span
+          className="text-[11px] text-muted-foreground font-mono flex-shrink-0 hover:text-foreground hover:underline"
+          onClick={onNavigate}
+          title="Go to timestamp"
+        >
+          {formatRelativeTime(evt.timestamp)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded = false, standalone = false }: SearchModalProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -415,18 +460,30 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
   // Build time range labels from raw rows
   const buildTimeRanges = useCallback((rows: { dateKey: string; timestamp: string; count: number }[]) => {
-    return rows.map(r => {
+    // Re-bucket by local date since SQL DATE() operates on UTC strings.
+    // Multiple UTC dates can map to the same local date, so merge counts.
+    const buckets = new Map<string, { label: string; dateKey: string; timestamp: string; count: number }>();
+    for (const r of rows) {
       const d = new Date(r.timestamp);
-      let label: string;
-      if (isToday(d)) {
-        label = format(d, "h a");
-      } else if (isYesterday(d)) {
-        label = "yesterday " + format(d, "h a");
+      const localDateKey = format(d, "yyyy-MM-dd");
+      const existing = buckets.get(localDateKey);
+      if (existing) {
+        existing.count += r.count;
       } else {
-        label = format(d, "MMM d");
+        let label: string;
+        if (isToday(d)) {
+          label = format(d, "h a");
+        } else if (isYesterday(d)) {
+          label = "yesterday " + format(d, "h a");
+        } else {
+          label = format(d, "MMM d");
+        }
+        buckets.set(localDateKey, { label, dateKey: localDateKey, timestamp: r.timestamp, count: r.count });
       }
-      return { label, dateKey: r.dateKey, timestamp: r.timestamp, count: r.count };
-    }).slice(0, 10);
+    }
+    return [...buckets.values()]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 10);
   }, []);
 
   // Async facet loading — fires a lightweight SQL aggregation query
@@ -458,42 +515,26 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       return resp.ok ? resp.json() : [];
     };
 
-    // App facet (accessibility + OCR)
+    // App facet (single frames_fts query)
     fetchFacet(
-      `SELECT app, SUM(cnt) as cnt FROM (
-         SELECT a.app_name as app, COUNT(*) as cnt
-         FROM accessibility_fts af JOIN accessibility a ON a.id = af.rowid
-         WHERE af.text_content MATCH '${escaped}'
-         AND a.app_name IS NOT NULL AND a.app_name != ''
-         GROUP BY a.app_name
-         UNION ALL
-         SELECT f.app_name as app, COUNT(*) as cnt
-         FROM ocr_text_fts otf JOIN ocr_text o ON o.rowid = otf.rowid
-         JOIN frames f ON o.frame_id = f.id
-         WHERE otf.text MATCH '${escaped}'
-         AND f.app_name IS NOT NULL AND f.app_name != ''
-         GROUP BY f.app_name
-       ) GROUP BY app ORDER BY cnt DESC LIMIT 15`
+      `SELECT app_name as app, COUNT(*) as cnt
+       FROM frames_fts
+       WHERE frames_fts MATCH '${escaped}'
+       AND app_name != ''
+       GROUP BY app_name ORDER BY cnt DESC LIMIT 15`
     ).then((rows: { app: string; cnt: number }[]) => {
       if (!cancelled) setFacetApps(rows.map(r => [r.app, r.cnt]));
     }).catch(() => {}).finally(onFacetDone);
 
-    // Domain facet (accessibility + OCR)
+    // Domain facet (frames_fts joined with frames for browser_url)
+    // Note: FTS5 tables cannot be aliased, must use full table name in MATCH
     fetchFacet(
-      `SELECT url, SUM(cnt) as cnt FROM (
-         SELECT a.browser_url as url, COUNT(*) as cnt
-         FROM accessibility_fts af JOIN accessibility a ON a.id = af.rowid
-         WHERE af.text_content MATCH '${escaped}'
-         AND a.browser_url IS NOT NULL AND a.browser_url != ''
-         GROUP BY a.browser_url
-         UNION ALL
-         SELECT f.browser_url as url, COUNT(*) as cnt
-         FROM ocr_text_fts otf JOIN ocr_text o ON o.rowid = otf.rowid
-         JOIN frames f ON o.frame_id = f.id
-         WHERE otf.text MATCH '${escaped}'
-         AND f.browser_url IS NOT NULL AND f.browser_url != ''
-         GROUP BY f.browser_url
-       ) GROUP BY url ORDER BY cnt DESC LIMIT 200`
+      `SELECT f.browser_url as url, COUNT(*) as cnt
+       FROM frames_fts
+       JOIN frames f ON f.id = frames_fts.id
+       WHERE frames_fts MATCH '${escaped}'
+       AND f.browser_url IS NOT NULL AND f.browser_url != ''
+       GROUP BY f.browser_url ORDER BY cnt DESC LIMIT 200`
     ).then((rows: { url: string; cnt: number }[]) => {
       if (cancelled) return;
       // Aggregate by domain
@@ -507,20 +548,14 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       setFacetDomains([...domainMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8));
     }).catch(() => {}).finally(onFacetDone);
 
-    // Time facet — bucket by date (accessibility + OCR)
+    // Time facet — bucket by date (frames_fts)
     fetchFacet(
-      `SELECT d, MIN(ts) as ts, SUM(cnt) as cnt FROM (
-         SELECT DATE(a.timestamp) as d, MIN(a.timestamp) as ts, COUNT(*) as cnt
-         FROM accessibility_fts af JOIN accessibility a ON a.id = af.rowid
-         WHERE af.text_content MATCH '${escaped}'
-         GROUP BY DATE(a.timestamp)
-         UNION ALL
-         SELECT DATE(f.timestamp) as d, MIN(f.timestamp) as ts, COUNT(*) as cnt
-         FROM ocr_text_fts otf JOIN ocr_text o ON o.rowid = otf.rowid
-         JOIN frames f ON o.frame_id = f.id
-         WHERE otf.text MATCH '${escaped}'
-         GROUP BY DATE(f.timestamp)
-       ) GROUP BY d ORDER BY d DESC LIMIT 30`
+      `SELECT DATE(f.timestamp) as d, MIN(f.timestamp) as ts, COUNT(*) as cnt
+       FROM frames_fts
+       JOIN frames f ON f.id = frames_fts.id
+       WHERE frames_fts MATCH '${escaped}'
+       GROUP BY DATE(f.timestamp)
+       ORDER BY d DESC LIMIT 30`
     ).then((rows: { d: string; ts: string; cnt: number }[]) => {
       if (cancelled) return;
       setFacetTimeRanges(buildTimeRanges(rows.map(r => ({ dateKey: r.d, timestamp: r.ts, count: r.cnt }))));
@@ -554,16 +589,6 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       .slice(0, 10);
   }, [speakerTranscriptions]);
 
-  // Use facet data for filter chips (falls back to result-derived if facets not loaded yet)
-  const resultAppCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const r of searchResults) {
-      counts.set(r.app_name, (counts.get(r.app_name) || 0) + 1);
-    }
-    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  }, [searchResults]);
-
-  const appCounts = facetApps.length > 0 ? facetApps : resultAppCounts;
   const domainCounts = facetDomains;
   const timeRanges = facetTimeRanges;
 
@@ -591,8 +616,28 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
   const matchesTimeFilter = useCallback((timestamp: string) => {
     if (!timeFilter) return true;
-    return timestamp.startsWith(timeFilter);
+    // Compare in local time — timeFilter is a local date like "2026-02-28"
+    const d = new Date(timestamp);
+    const localDate = format(d, "yyyy-MM-dd");
+    return localDate === timeFilter;
   }, [timeFilter]);
+
+  // Derive app chips from time-filtered results so they stay consistent
+  // when a date chip is active. Uses actual search result app_names to
+  // guarantee the client-side filter (r.app_name === appFilter) matches.
+  // Use facet data (aggregated over ALL matches) when available,
+  // fall back to client-side counts from loaded results when facets haven't loaded yet
+  const appCounts = useMemo(() => {
+    if (facetApps.length > 0 && !timeFilter) return facetApps;
+    const source = timeFilter
+      ? searchResults.filter(r => matchesTimeFilter(r.timestamp))
+      : searchResults;
+    const counts = new Map<string, number>();
+    for (const r of source) {
+      counts.set(r.app_name, (counts.get(r.app_name) || 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }, [facetApps, searchResults, timeFilter, matchesTimeFilter]);
 
   const filteredResults = useMemo(() => {
     let results = searchResults;
@@ -926,12 +971,19 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     searchKeywords(debouncedQuery, opts).finally(() => setIsLoadingMore(false));
   }, [isLoadingMore, hasMoreOcr, debouncedQuery, ocrOffset, searchKeywords, timeFilter]);
 
-  // Track if we got fewer results than page size (= no more pages)
+  // Track if we got fewer results than page size (= no more pages).
+  // The server may filter results after fetching (e.g. app_name filter),
+  // so we only stop when we get zero new results — not just fewer than PAGE_SIZE.
+  const prevResultsLengthRef = useRef(0);
   useEffect(() => {
-    if (searchResults.length > 0 && searchResults.length < (ocrOffset + OCR_PAGE_SIZE)) {
+    const prevLen = prevResultsLengthRef.current;
+    const curLen = searchResults.length;
+    prevResultsLengthRef.current = curLen;
+    // After a load-more, if no new results were added, we've exhausted all pages
+    if (ocrOffset > 0 && curLen === prevLen && !isSearching) {
       setHasMoreOcr(false);
     }
-  }, [searchResults.length, ocrOffset]);
+  }, [searchResults.length, ocrOffset, isSearching]);
 
   // Load more speaker transcriptions
   const loadMoreTranscriptions = useCallback(async () => {
@@ -993,9 +1045,10 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     // Track which result was selected so timeline arrow keys can cycle from here
     const idx = searchResults.findIndex((r) => r.frame_id === result.frame_id);
     if (idx >= 0) setCurrentResultIndex(idx);
-    onNavigateToTimestamp(result.timestamp);
+    const resultsJson = JSON.stringify(searchResults);
+    onNavigateToTimestamp(result.timestamp, result.frame_id, queryTokens, resultsJson, query);
     onClose();
-  }, [onNavigateToTimestamp, onClose, queryTokens, setHighlight, searchResults, setCurrentResultIndex]);
+  }, [onNavigateToTimestamp, onClose, queryTokens, setHighlight, searchResults, query, setCurrentResultIndex]);
 
   // Keyboard navigation — uses refs for data arrays to avoid re-mounting when results change
   useEffect(() => {
@@ -1088,13 +1141,27 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     };
   }, [isOpen, selectedSpeaker, onClose, onNavigateToTimestamp, handleSelectResult, handleSendToAI, handleBackFromSpeaker]);
 
-  // Scroll selected item into view
+  // Scroll selected item into view (only on arrow-key navigation, not on new page load)
+  const prevSelectedIndex = useRef(selectedIndex);
   useEffect(() => {
-    if (gridRef.current && filteredResults.length > 0) {
+    if (prevSelectedIndex.current !== selectedIndex && gridRef.current && filteredResults.length > 0) {
       const selectedEl = gridRef.current.querySelector(`[data-index="${selectedIndex}"]`);
       selectedEl?.scrollIntoView({ block: "nearest" });
     }
+    prevSelectedIndex.current = selectedIndex;
   }, [selectedIndex, filteredResults.length]);
+
+  // Standalone: resize Tauri window based on content state.
+  // DOM measurement fails because the small window viewport constrains layout.
+  const hasAnyResults = searchResults.length > 0 || speakerResults.length > 0 || tagResults.length > 0 || uiEventResults.length > 0;
+  const hasVisibleContent = hasAnyResults || (debouncedQuery && debouncedQuery.trim().length >= 2) || isSearching || isSearchingSpeakers || isSearchingTags || isSearchingUiEvents;
+  // input ~52px; footer ~28px; results up to ~380px
+  const standaloneTargetH = hasVisibleContent ? 580 : 80;
+
+  useEffect(() => {
+    if (!standalone || !isOpen) return;
+    invoke("resize_search_window", { width: 680, height: standaloneTargetH }).catch(() => {});
+  }, [standalone, isOpen, standaloneTargetH]);
 
   if (!isOpen) return null;
 
@@ -1312,7 +1379,8 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 <div
                   key={frame.frame_id}
                   onClick={() => {
-                    onNavigateToTimestamp(frame.timestamp);
+                    const resultsJson = JSON.stringify(searchResults);
+                    onNavigateToTimestamp(frame.timestamp, frame.frame_id, queryTokens, resultsJson, query);
                     if (!embedded) onClose();
                   }}
                   className="cursor-pointer rounded overflow-hidden border border-border hover:border-foreground/50 transition-all duration-150"
@@ -1463,6 +1531,57 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             </div>
           )}
 
+          {/* Screen results skeleton — keyword search still in flight but UI events already loaded */}
+          {isSearching && searchResults.length === 0 && contentFilter !== "input" && uiEventResults.length > 0 && (
+            <div className="mb-4">
+              <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
+                <Monitor className="w-3 h-3" />
+                screen
+              </p>
+              <div className="grid grid-cols-3 gap-3">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
+                    <div className="aspect-video" />
+                    <div className="p-2 space-y-1">
+                      <div className="h-3 bg-muted-foreground/20 rounded w-16" />
+                      <div className="h-2 bg-muted-foreground/20 rounded w-24" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* UI event results — shown above screen results so infinite scroll doesn't push them away */}
+          {uiEventResults.length > 0 && contentFilter !== "screen" && (
+            <div className={cn(contentFilter === "all" && "mb-4")}>
+              <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
+                <Keyboard className="w-3 h-3" />
+                keyboard & clipboard
+              </p>
+              <div className="flex flex-col gap-2">
+                {(contentFilter === "all" ? uiEventResults.slice(0, 5) : uiEventResults).map((evt) => (
+                  <UiEventItem
+                    key={evt.id}
+                    evt={evt}
+                    onNavigate={() => {
+                      onNavigateToTimestamp(evt.timestamp);
+                      if (!embedded) onClose();
+                    }}
+                  />
+                ))}
+              </div>
+              {contentFilter === "all" && uiEventResults.length > 5 && (
+                <button
+                  onClick={() => setContentFilter("input")}
+                  className="mt-2 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                >
+                  show all {uiEventResults.length} results
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Screen results grid */}
           {searchResults.length > 0 && contentFilter !== "input" && (
             <>
@@ -1490,7 +1609,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                   {appCounts.map(([app, count]) => (
                     <button
                       key={app}
-                      onClick={() => { setAppFilter(appFilter === app ? null : app); setSelectedIndex(0); }}
+                      onClick={() => { const newApp = appFilter === app ? null : app; setAppFilter(newApp); if (newApp) setDomainFilter(null); setSelectedIndex(0); }}
                       className={cn(
                         "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
                         appFilter === app
@@ -1511,8 +1630,9 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 </div>
               )}
 
-              {/* Domain filter chips */}
-              {domainCounts.length > 1 && (
+              {/* Domain filter chips — hide when a non-browser app is selected
+                  (non-browser apps don't have URLs so domain chips are irrelevant) */}
+              {domainCounts.length > 1 && (!appFilter || filteredResults.some(r => r.url)) && (
                 <div className="flex gap-1.5 mb-2 overflow-x-auto scrollbar-hide pb-0.5">
                   <button
                     onClick={() => { setDomainFilter(null); setSelectedIndex(0); }}
@@ -1663,7 +1783,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               </div>
 
               {/* Load more indicator */}
-              {(isLoadingMore || (hasMoreOcr && filteredResults.length >= OCR_PAGE_SIZE)) && (
+              {(isLoadingMore || (hasMoreOcr && filteredResults.length > 0)) && (
                 <div className="flex justify-center py-4">
                   {isLoadingMore ? (
                     <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
@@ -1675,59 +1795,6 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             </>
           )}
 
-          {/* UI event results */}
-          {uiEventResults.length > 0 && contentFilter !== "screen" && (
-            <div className={cn(contentFilter === "all" && searchResults.length > 0 && "mt-6")}>
-              <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
-                <Keyboard className="w-3 h-3" />
-                keyboard & clipboard
-              </p>
-              <div className="flex flex-col gap-2">
-                {(contentFilter === "all" ? uiEventResults.slice(0, 5) : uiEventResults).map((evt) => {
-                  const EvtIcon = evt.event_type === "clipboard" ? ClipboardCopy
-                    : evt.event_type === "app_switch" ? AppWindow
-                    : Keyboard;
-                  return (
-                    <div
-                      key={evt.id}
-                      onClick={() => {
-                        onNavigateToTimestamp(evt.timestamp);
-                        if (!embedded) onClose();
-                      }}
-                      className="cursor-pointer border border-border rounded p-3 hover:border-foreground/50 transition-colors"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-start gap-2 min-w-0">
-                          <EvtIcon className="w-3.5 h-3.5 text-muted-foreground mt-0.5 flex-shrink-0" />
-                          <div className="min-w-0">
-                            <p className="text-xs text-foreground line-clamp-2">
-                              {evt.text_content}
-                            </p>
-                            {(evt.app_name || evt.window_title) && (
-                              <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
-                                {[evt.app_name, evt.window_title].filter(Boolean).join(" — ")}
-                              </p>
-                            )}
-                          </div>
-                        </div>
-                        <span className="text-[11px] text-muted-foreground font-mono flex-shrink-0">
-                          {formatRelativeTime(evt.timestamp)}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-              {contentFilter === "all" && uiEventResults.length > 5 && (
-                <button
-                  onClick={() => setContentFilter("input")}
-                  className="mt-2 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                >
-                  show all {uiEventResults.length} results
-                </button>
-              )}
-            </div>
-          )}
 
           {/* Suggestions when no query */}
           {!debouncedQuery && !isSearching && (
@@ -1767,12 +1834,21 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     </>
   );
 
-  if (embedded) {
+  if (standalone || embedded) {
+    const hasContent = hasResults || (debouncedQuery && debouncedQuery.trim().length >= 2) || isSearching || isSearchingSpeakers || isSearchingTags || isSearchingUiEvents;
     return (
-      <div className="flex flex-col h-full bg-card">
-        {/* Search Input */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
-          <Search className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+      <div className={cn(
+        "flex flex-col bg-card/95 backdrop-blur-xl",
+        standalone ? "rounded-xl border border-border/50 shadow-2xl overflow-hidden" : "h-full",
+      )}>
+        {/* Search Input — Raycast-style large input */}
+        <div className={cn(
+          "flex items-center gap-3 px-5 border-b border-border/50",
+          standalone ? "py-3.5" : "py-3 px-4",
+        )}
+        data-tauri-drag-region={standalone ? true : undefined}
+        >
+          <Search className="w-4.5 h-4.5 text-muted-foreground flex-shrink-0" />
           <input
             ref={inputRef}
             type="text"
@@ -1787,8 +1863,11 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 setHasMoreTranscriptions(true);
               }
             }}
-            placeholder="Search your memory... (# tags, @ people)"
-            className="flex-1 bg-transparent text-foreground placeholder:text-muted-foreground text-sm outline-none"
+            placeholder="search your memory... (# tags, @ people)"
+            className={cn(
+              "flex-1 bg-transparent text-foreground placeholder:text-muted-foreground/60 outline-none",
+              standalone ? "text-base" : "text-sm",
+            )}
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
@@ -1800,30 +1879,38 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               onClick={() => setQuery("")}
               className="p-1 hover:bg-muted rounded"
             >
-              <X className="w-3 h-3 text-muted-foreground" />
+              <X className="w-3.5 h-3.5 text-muted-foreground" />
             </button>
           )}
         </div>
 
-        {/* Results area — fills remaining space */}
-        <div
-          ref={gridRef}
-          className="flex-1 min-h-0 overflow-y-auto p-4 overscroll-contain touch-pan-y"
-          onWheel={(e) => {
-            e.stopPropagation();
-            const target = e.currentTarget;
-            const isAtTop = target.scrollTop === 0 && e.deltaY < 0;
-            const isAtBottom = target.scrollTop + target.clientHeight >= target.scrollHeight && e.deltaY > 0;
-            if (isAtTop || isAtBottom) e.preventDefault();
-          }}
-          onTouchMove={(e) => e.stopPropagation()}
-          onScroll={handleScroll}
-        >
-          {renderResults()}
-        </div>
+        {/* Results area — only shown when there's content */}
+        {hasContent && (
+          <div
+            ref={gridRef}
+            className={cn(
+              "flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y",
+              standalone ? "p-3 max-h-[500px] scrollbar-hide" : "p-4",
+            )}
+            onWheel={(e) => {
+              e.stopPropagation();
+              const target = e.currentTarget;
+              const isAtTop = target.scrollTop === 0 && e.deltaY < 0;
+              const isAtBottom = target.scrollTop + target.clientHeight >= target.scrollHeight && e.deltaY > 0;
+              if (isAtTop || isAtBottom) e.preventDefault();
+            }}
+            onTouchMove={(e) => e.stopPropagation()}
+            onScroll={handleScroll}
+          >
+            {renderResults()}
+          </div>
+        )}
 
-        {/* Footer */}
-        <div className="px-4 py-2 border-t border-border bg-muted/30 flex items-center justify-between text-[10px] text-muted-foreground font-mono">
+        {/* Footer — compact keyboard hints */}
+        <div className={cn(
+          "px-4 py-1.5 border-t border-border/50 flex items-center justify-between text-[10px] text-muted-foreground/70 font-mono",
+          standalone ? "bg-muted/20" : "bg-muted/30 py-2",
+        )}>
           <div className="flex items-center gap-4">
             {selectedSpeaker ? (
               <>
@@ -1836,13 +1923,13 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 <span>←→↑↓ navigate</span>
                 <span>⏎ go to timeline</span>
                 <span className="flex items-center gap-1">
-                  <MessageSquare className="w-3 h-3" />
+                  <MessageSquare className="w-2.5 h-2.5" />
                   ⌘⏎ ask AI
                 </span>
               </>
             )}
           </div>
-          <span>esc {selectedSpeaker ? "back" : "close"}</span>
+          <span>esc close</span>
         </div>
       </div>
     );
@@ -1853,20 +1940,14 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       role="dialog"
       aria-modal="true"
       className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh] isolate"
-      onWheel={(e) => {
-        e.stopPropagation();
-        e.preventDefault();
-      }}
+      onWheel={(e) => e.stopPropagation()}
       onTouchMove={(e) => e.stopPropagation()}
     >
       {/* Backdrop - captures all pointer events to prevent interaction with timeline */}
       <div
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
         onClick={onClose}
-        onWheel={(e) => {
-          e.stopPropagation();
-          e.preventDefault();
-        }}
+        onWheel={(e) => e.stopPropagation()}
         onTouchMove={(e) => e.stopPropagation()}
       />
 

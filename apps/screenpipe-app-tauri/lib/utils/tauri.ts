@@ -71,8 +71,36 @@ async checkArcAutomationPermission() : Promise<boolean> {
 async requestArcAutomationPermission() : Promise<boolean> {
     return await TAURI_INVOKE("request_arc_automation_permission");
 },
+/**
+ * Returns the names of installed Chromium browsers that need Automation permission
+ */
+async getInstalledBrowsers() : Promise<string[]> {
+    return await TAURI_INVOKE("get_installed_browsers");
+},
+/**
+ * Check if Automation permission is granted for all installed Chromium browsers.
+ * Returns true only if ALL installed browsers have automation granted.
+ */
+async checkBrowsersAutomationPermission() : Promise<boolean> {
+    return await TAURI_INVOKE("check_browsers_automation_permission");
+},
+/**
+ * Request Automation permission for installed Chromium browsers that are already running.
+ * Never force-launches browsers — only prompts for ones the user already has open.
+ * Opens System Settings > Automation as fallback for browsers not running.
+ */
+async requestBrowsersAutomationPermission() : Promise<boolean> {
+    return await TAURI_INVOKE("request_browsers_automation_permission");
+},
 async getEnv(name: string) : Promise<string> {
     return await TAURI_INVOKE("get_env", { name });
+},
+/**
+ * Returns which E2E seeds are requested (env SCREENPIPE_E2E_SEED, comma-separated).
+ * Rust uses "onboarding" in setup to complete onboarding at startup.
+ */
+async getE2eSeedFlags() : Promise<string[]> {
+    return await TAURI_INVOKE("get_e2e_seed_flags");
 },
 /**
  * Check vault lock state from filesystem (no server needed).
@@ -164,9 +192,47 @@ async getAudioDevices() : Promise<Result<AudioDeviceInfo[], string>> {
 async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
 },
+/**
+ * Read the enterprise license key from `enterprise.json`.
+ * Checks in order:
+ * 1. Next to executable (pushed via Intune/MDM to Program Files / .app bundle)
+ * 2. `~/.screenpipe/enterprise.json` (entered manually by employee via in-app prompt)
+ * Returns None if no file is found or is invalid.
+ */
+async getEnterpriseLicenseKey() : Promise<string | null> {
+    return await TAURI_INVOKE("get_enterprise_license_key");
+},
+/**
+ * Save the enterprise license key to `~/.screenpipe/enterprise.json`.
+ * Used by the in-app prompt when enterprise.json is not deployed via MDM.
+ */
+async saveEnterpriseLicenseKey(licenseKey: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_enterprise_license_key", { licenseKey }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getDiskUsage(forceRefresh: boolean | null, dataDir: string | null) : Promise<Result<JsonValue, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_disk_usage", { forceRefresh, dataDir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listCacheFiles() : Promise<Result<CacheFile[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_cache_files") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteCacheFiles(paths: string[]) : Promise<Result<bigint, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_cache_files", { paths }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -240,6 +306,30 @@ async ensureWebviewFocus() : Promise<Result<null, string>> {
 async closeWindow(window: ShowRewindWindow) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("close_window", { window }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Resize the Search NSPanel. Regular Tauri setSize doesn't work on NSPanels.
+ */
+async resizeSearchWindow(width: number, height: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("resize_search_window", { width, height }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Navigate from Search to a timestamp on the Main timeline.
+ * Shows Main, emits the navigation event from the app handle (not a webview),
+ * then closes the Search window.
+ */
+async searchNavigateToTimeline(timestamp: string, frameId: bigint | null, searchTerms: string[] | null, searchResultsJson: string | null, searchQuery: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("search_navigate_to_timeline", { timestamp, frameId, searchTerms, searchResultsJson, searchQuery }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -501,6 +591,19 @@ async removeSyncDevice(deviceId: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Delete all locally-stored data that was synced from a specific remote device.
+ * This calls the local screenpipe server's /data/delete-device endpoint.
+ * Refuses to delete data for the current device as a safety guard.
+ */
+async deleteDeviceLocalData(machineId: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_device_local_data", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Initialize sync with password.
  * This initializes both the local SyncManager (for device queries) and
  * the server's SyncService (for actual data sync).
@@ -591,7 +694,9 @@ async piInstall() : Promise<Result<null, string>> {
 }
 },
 /**
- * Send a prompt to Pi, optionally with images
+ * Send a prompt to Pi, optionally with images.
+ * The command is serialized through the queue — it will wait for any prior
+ * command (new_session, abort) to fully complete before being written to stdin.
  */
 async piPrompt(sessionId: string | null, message: string, images: PiImageContent[] | null) : Promise<Result<null, string>> {
     try {
@@ -602,7 +707,8 @@ async piPrompt(sessionId: string | null, message: string, images: PiImageContent
 }
 },
 /**
- * Abort current Pi operation
+ * Abort current Pi operation. Priority command — cancels all pending commands
+ * in the queue and sends abort directly. Waits for the SDK's done event.
  */
 async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -613,7 +719,9 @@ async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
 }
 },
 /**
- * Start a new Pi session (clears conversation history)
+ * Start a new Pi session (clears conversation history).
+ * Serialized through the queue — waits for any in-flight work to complete,
+ * then sends new_session and waits for the SDK's done event before returning.
  */
 async piNewSession(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -683,124 +791,22 @@ async chatgptOauthModels() : Promise<Result<string[], string>> {
 }
 },
 /**
- * Check Reminders authorization + scheduler status (no popup).
+ * Get current pipe suggestions settings.
  */
-async remindersStatus() : Promise<Result<RemindersStatus, string>> {
+async pipeSuggestionsGetSettings() : Promise<Result<PipeSuggestionsSettings, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_status") };
+    return { status: "ok", data: await TAURI_INVOKE("pipe_suggestions_get_settings") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Request Reminders permission (shows one-time macOS popup).
- * Returns "granted", "denied", or an error message.
+ * Update pipe suggestions settings and restart the scheduler.
  */
-async remindersAuthorize() : Promise<Result<string, string>> {
+async pipeSuggestionsUpdateSettings(enabled: boolean, frequencyHours: number) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_authorize") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * List existing reminders in the "Screenpipe" list.
- */
-async remindersList() : Promise<Result<ReminderItem[], string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_list") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Create a single reminder.
- */
-async remindersCreate(title: string, notes: string | null, due: string | null) : Promise<Result<ReminderItem, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_create", { title, notes, due }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Scan recent activity and create reminders from action items.
- * Optional custom_prompt appended to the AI instructions.
- */
-async remindersScan(customPrompt: string | null, audioOnly: boolean | null) : Promise<Result<ScanResult, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_scan", { customPrompt, audioOnly }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Start the background scheduler (30-min interval). Persists across page navigation.
- * Saves enabled=true to persistent store so it auto-starts on app relaunch.
- */
-async remindersStartScheduler() : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_start_scheduler") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Stop the background scheduler. Saves enabled=false to persistent store.
- */
-async remindersStopScheduler() : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_stop_scheduler") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Get the saved custom prompt.
- */
-async remindersGetCustomPrompt() : Promise<Result<string, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_get_custom_prompt") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Save a custom prompt.
- */
-async remindersSetCustomPrompt(prompt: string) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_set_custom_prompt", { prompt }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Get the audio_only setting.
- */
-async remindersGetAudioOnly() : Promise<Result<boolean, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_get_audio_only") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Set the audio_only setting.
- */
-async remindersSetAudioOnly(audioOnly: boolean) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_set_audio_only", { audioOnly }) };
+    return { status: "ok", data: await TAURI_INVOKE("pipe_suggestions_update_settings", { enabled, frequencyHours }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -945,10 +951,11 @@ async getHardwareCapability() : Promise<HardwareCapability> {
 
 /** user-defined types **/
 
-export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number; awsProfile?: string | null; awsRegion?: string | null }
-export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic" | "bedrock"
+export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
+export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
 export type BrowserLogEntry = { level: string; message: string }
+export type CacheFile = { path: string; label: string; size_bytes: bigint }
 export type CachedSuggestions = { suggestions: Suggestion[]; generatedAt: string; mode: string; aiGenerated: boolean; tags: string[] }
 export type CalendarEventItem = { id: string; title: string; 
 /**
@@ -966,12 +973,17 @@ startDisplay: string;
 /**
  * Pre-formatted local time, e.g. "5:00 PM" — for display.
  */
-endDisplay: string; attendees: string[]; location: string | null; calendarName: string; isAllDay: boolean }
+endDisplay: string; attendees: string[]; location: string | null; calendarName: string; isAllDay: boolean; 
+/**
+ * Source identifier: "native" for OS calendar, "ics" for ICS feeds.
+ * Used by meeting detector to merge events from multiple publishers.
+ */
+source?: string }
 export type CalendarStatus = { available: boolean; authorized: boolean; authorizationStatus: string; calendarCount: number }
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
-export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; isWeakForLargeModel: boolean; recommendedEngine: string; reason: string }
+export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; recommendedEngine: string; reason: string }
 export type IcsCalendarEntry = { name: string; url: string; enabled: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue }
 export type LogFile = { name: string; path: string; modified_at: bigint }
@@ -1016,54 +1028,235 @@ apiKey: string | null;
  */
 maxTokens?: number; 
 /**
- * AWS profile name for Bedrock provider
+ * Optional system prompt from AI preset (appended to Pi's built-in system prompt)
  */
-awsProfile: string | null; 
+systemPrompt?: string | null }
+export type PipeSuggestionsSettings = { enabled: boolean; frequencyHours: number }
 /**
- * AWS region for Bedrock provider
+ * A single schedule rule: a day-of-week + time range + what to record.
  */
-awsRegion: string | null }
-export type ReminderItem = { identifier: string; title: string; notes: string | null; completed: boolean }
-export type RemindersStatus = { available: boolean; authorized: boolean; authorizationStatus: string; schedulerRunning: boolean; reminderCount: number }
-export type ScanResult = { remindersCreated: bigint; items: ReminderItem[]; contextChars: bigint; error: string | null }
+export type ScheduleRule = { 
+/**
+ * Day of week: 0 = Monday, 6 = Sunday
+ */
+dayOfWeek: number; 
+/**
+ * Start time in "HH:MM" (24h format, local time)
+ */
+startTime: string; 
+/**
+ * End time in "HH:MM" (24h format, local time)
+ */
+endTime: string; 
+/**
+ * What to record: "all", "audio_only", "screen_only"
+ */
+recordMode: string }
 export type SettingsStore = 
 /**
- * Catch-all for fields added by the frontend (e.g. chatHistory, deviceId)
+ * All recording/capture config lives here. Flattened so the JSON shape
+ * is unchanged — `disableAudio`, `port`, `fps`, etc. stay at the top level.
+ */
+({ 
+/**
+ * Disable all audio capture and transcription.
+ */
+disableAudio: boolean; 
+/**
+ * Audio transcription engine identifier.
+ * Values: "whisper-large-v3-turbo", "whisper-large-v3-turbo-quantized",
+ * "deepgram", "screenpipe-cloud", etc.
+ */
+audioTranscriptionEngine: string; 
+/**
+ * Transcription mode: "realtime" or "batch".
+ * Previously stored in SettingsStore.extra["transcriptionMode"].
+ */
+transcriptionMode: string; 
+/**
+ * Audio device names/IDs to capture from.
+ */
+audioDevices: string[]; 
+/**
+ * Automatically follow the system default audio devices.
+ */
+useSystemDefaultAudio: boolean; 
+/**
+ * Duration of each audio chunk in seconds before transcription.
+ * Stored as i32 to match existing store.bin schema (cast to u64 by engine).
+ */
+audioChunkDuration: number; 
+/**
+ * Deepgram API key for cloud transcription.
+ * Empty string or "default" means not configured.
+ * Kept as String (not Option) to match existing store.bin schema.
+ */
+deepgramApiKey: string; 
+/**
+ * VAD sensitivity level: "low", "medium", "high".
+ */
+vadSensitivity: string; 
+/**
+ * Filter music-dominant audio before transcription using spectral analysis.
+ */
+filterMusic: boolean; 
+/**
+ * Maximum batch duration in seconds for batch transcription.
+ * None = use engine-aware defaults (Deepgram=5000s, OpenAI=3000s, Whisper=600s).
+ * Also controls the max deferral cap during active meetings.
+ */
+batchMaxDurationSecs?: bigint | null; 
+/**
+ * Custom vocabulary for transcription biasing and word replacement.
+ * Previously stored in SettingsStore.extra["vocabularyWords"].
+ */
+vocabularyWords?: VocabEntry[]; 
+/**
+ * Disable all screen capture.
+ */
+disableVision: boolean; 
+/**
+ * Specific monitor IDs to capture.
+ */
+monitorIds: string[]; 
+/**
+ * Capture from all connected monitors.
+ */
+useAllMonitors: boolean; 
+/**
+ * Video quality preset: "low", "balanced", "high", "max".
+ */
+videoQuality: string; 
+/**
+ * Window titles to exclude from capture.
+ */
+ignoredWindows: string[]; 
+/**
+ * Window titles to exclusively capture (empty = capture all).
+ */
+includedWindows: string[]; 
+/**
+ * URLs to exclude from capture.
+ */
+ignoredUrls?: string[]; 
+/**
+ * Automatically detect and skip incognito / private browsing windows.
+ */
+ignoreIncognitoWindows: boolean; 
+/**
+ * Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
+ */
+pauseOnDrmContent?: boolean; 
+/**
+ * Languages for transcription (ISO 639-1 codes).
+ */
+languages: string[]; 
+/**
+ * Redact personally identifiable information from transcriptions.
+ */
+usePiiRemoval: boolean; 
+/**
+ * Screenpipe cloud user ID. Empty string means not logged in.
+ * Kept as String (not Option) to match existing store.bin schema.
+ */
+userId: string; 
+/**
+ * Display name for speaker identification.
+ * Fallback chain: this field → cloud auth name → cloud auth email.
+ * Previously stored in SettingsStore.extra["userName"].
+ */
+userName?: string | null; 
+/**
+ * OpenAI-compatible transcription endpoint URL.
+ * Previously stored in SettingsStore.extra["openaiCompatibleEndpoint"].
+ */
+openaiCompatibleEndpoint?: string | null; 
+/**
+ * OpenAI-compatible transcription API key.
+ * Previously stored in SettingsStore.extra["openaiCompatibleApiKey"].
+ */
+openaiCompatibleApiKey?: string | null; 
+/**
+ * OpenAI-compatible transcription model name.
+ * Previously stored in SettingsStore.extra["openaiCompatibleModel"].
+ */
+openaiCompatibleModel?: string | null; 
+/**
+ * Custom HTTP headers for OpenAI-compatible transcription requests.
+ * JSON object, e.g. {"X-Custom-Header": "value"}.
+ */
+openaiCompatibleHeaders?: { [key in string]: string } | null; 
+/**
+ * Send raw WAV audio instead of MP3 to OpenAI-compatible endpoint.
+ * Some ASR providers prefer uncompressed audio for better accuracy.
+ */
+openaiCompatibleRawAudio?: boolean; 
+/**
+ * HTTP server port for the screenpipe API.
+ */
+port: number; 
+/**
+ * Power mode preference: "auto", "performance", "battery_saver".
+ * Previously stored in SettingsStore.extra["powerMode"].
+ */
+powerMode?: string | null; 
+/**
+ * Use Chinese mirror for Hugging Face model downloads.
+ */
+useChineseMirror: boolean; 
+/**
+ * Enable anonymous analytics (PostHog).
+ */
+analyticsEnabled: boolean; 
+/**
+ * Persistent analytics ID (UUID, stable across sessions).
+ */
+analyticsId: string; 
+/**
+ * Legacy: input capture is always enabled. Kept for serde compat with
+ * existing store.bin files; deserialized but ignored.
+ * @deprecated input capture is always enabled; will be removed
+ */
+enableInputCapture?: boolean; 
+/**
+ * Legacy: accessibility capture is always enabled. Kept for serde compat
+ * with existing store.bin files; deserialized but ignored.
+ * @deprecated accessibility capture is always enabled; will be removed
+ */
+enableAccessibility?: boolean; 
+/**
+ * Enable AI workflow event detection (cloud feature, requires subscription).
+ * When enabled, classifies desktop activity and triggers event-based pipes.
+ */
+enableWorkflowEvents?: boolean; 
+/**
+ * Detected hardware tier ("high", "mid", "low").
+ * Set once on first launch; `None` for existing installs (treated as High).
+ */
+deviceTier?: string | null; 
+/**
+ * Enable work-hours schedule (when false, records 24/7 as usual)
+ */
+scheduleEnabled?: boolean; 
+/**
+ * Per-day schedule rules (only used when schedule_enabled is true)
+ */
+scheduleRules?: ScheduleRule[] }) & 
+/**
+ * Catch-all for fields added by the frontend (e.g. chatHistory)
  * that the Rust struct doesn't know about. Without this, `save()` would
  * serialize only known fields and silently wipe frontend-only data.
  */
-({ [key in string]: null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue } }) & { aiPresets: AIPreset[]; deepgramApiKey: string; isLoading: boolean; userId: string; 
-/**
- * Persistent analytics ID used for PostHog tracking (both frontend and backend)
- */
-analyticsId: string; devMode: boolean; audioTranscriptionEngine: string; ocrEngine: string; monitorIds: string[]; audioDevices: string[]; 
-/**
- * When true, automatically follow system default audio devices
- */
-useSystemDefaultAudio?: boolean; usePiiRemoval: boolean; 
-/**
- * Filter music-dominant audio before transcription using spectral analysis
- */
-filterMusic?: boolean; port: number; dataDir: string; disableAudio: boolean; ignoredWindows: string[]; includedWindows: string[]; ignoredUrls?: string[]; fps: number; vadSensitivity: string; analyticsEnabled: boolean; audioChunkDuration: number; useChineseMirror: boolean; languages: string[]; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; lockVaultShortcut?: string; realtimeAudioTranscriptionEngine: string; disableVision: boolean; 
+({ [key in string]: null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue } }) & { aiPresets: AIPreset[]; isLoading: boolean; devMode: boolean; ocrEngine: string; dataDir: string; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; lockVaultShortcut?: string; 
 /**
  * When true, screen capture continues but OCR text extraction is skipped.
  * Reduces CPU usage significantly while still recording video.
  */
-disableOcr?: boolean; useAllMonitors: boolean; adaptiveFps?: boolean; showShortcutOverlay?: boolean; 
+disableOcr?: boolean; showShortcutOverlay?: boolean; 
 /**
  * Unique device ID for AI usage tracking (generated on first launch)
  */
 deviceId?: string; 
-/**
- * Enable input event capture (keyboard, mouse, clipboard).
- * Requires input monitoring permission on macOS.
- */
-enableInputCapture?: boolean; 
-/**
- * Enable accessibility text capture (AX tree walker).
- * Requires accessibility permission on macOS.
- */
-enableAccessibility?: boolean; 
 /**
  * Auto-install updates and restart when a new version is available.
  * When disabled, users must click "update now" in the tray menu.
@@ -1080,16 +1273,23 @@ overlayMode?: string;
  */
 showOverlayInScreenRecording?: boolean; 
 /**
- * Video quality preset controlling storage vs quality tradeoff.
- * Affects H.265 CRF during recording and JPEG quality during frame extraction.
- * Values: "low", "balanced", "high", "max". Default: "balanced".
- */
-videoQuality?: string; 
-/**
  * When true, the chat window stays above all other windows (default: true).
  */
-chatAlwaysOnTop?: boolean }
-export type ShowRewindWindow = "Main" | { Settings: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery"
+chatAlwaysOnTop?: boolean; 
+/**
+ * Show restart notifications when audio/vision capture stalls.
+ * Disabled by default for now until the stall detector is more reliable.
+ */
+showRestartNotifications?: boolean; 
+/**
+ * When true, apply macOS vibrancy effect to the sidebar for a translucent look.
+ */
+translucentSidebar?: boolean; 
+/**
+ * UI theme: "light", "dark", or "system".
+ */
+uiTheme?: string }
+export type ShowRewindWindow = "Main" | { Home: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery"
 export type Suggestion = { text: string }
 /**
  * Sync configuration.
@@ -1104,6 +1304,18 @@ export type SyncDeviceInfo = { id: string; deviceId: string; deviceName: string 
  */
 export type SyncStatusResponse = { enabled: boolean; isSyncing: boolean; lastSync: string | null; lastError: string | null; storageUsed: bigint | null; storageLimit: bigint | null; deviceCount: number | null; deviceLimit: number | null; syncTier: string | null; machineId: string }
 export type User = { id: string | null; name: string | null; email: string | null; image: string | null; token: string | null; clerk_id: string | null; api_key: string | null; credits: Credits | null; stripe_connected: boolean | null; stripe_account_status: string | null; github_username: string | null; bio: string | null; website: string | null; contact: string | null; cloud_subscribed: boolean | null; credits_balance: number | null }
+/**
+ * Custom vocabulary entry for transcription biasing and word replacement.
+ */
+export type VocabEntry = { 
+/**
+ * The word or phrase to bias toward during transcription.
+ */
+word: string; 
+/**
+ * Optional replacement — if set, the transcribed `word` is replaced with this.
+ */
+replace_with?: string | null }
 
 /** tauri-specta globals **/
 

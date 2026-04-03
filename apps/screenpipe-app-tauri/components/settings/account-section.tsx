@@ -55,7 +55,7 @@ export function AccountSection() {
                     stripe_connected: true,
                   },
                 });
-                loadUser(settings.user.token!, true);
+                loadUser(settings.user.token!);
               }
               toast({
                 title: "stripe connected!",
@@ -177,16 +177,11 @@ export function AccountSection() {
     <div className="space-y-6">
       {/* Header + login status */}
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Account
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            {settings.user?.token
-              ? `logged in as ${settings.user.email}`
-              : "not logged in"}
-          </p>
-        </div>
+        <p className="text-sm text-muted-foreground">
+          {settings.user?.token
+            ? `logged in as ${settings.user.email}`
+            : "not logged in"}
+        </p>
         <div className="flex gap-2">
           {settings.user?.token ? (
             <>
@@ -254,7 +249,7 @@ export function AccountSection() {
               <span>✓</span> cloud transcription — higher quality
             </div>
             <div className="flex items-center gap-2">
-              <span>✓</span> higher AI query limits + credits
+              <span>✓</span> 100x more AI queries
             </div>
             <div className="flex items-center gap-2">
               <span>✓</span> priority support
@@ -379,7 +374,7 @@ export function AccountSection() {
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                  higher AI query limits + credits
+                  100x more AI queries
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
@@ -471,7 +466,7 @@ export function AccountSection() {
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                  higher AI query limits + credits
+                  100x more AI queries
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />

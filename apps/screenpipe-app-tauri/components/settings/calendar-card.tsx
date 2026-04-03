@@ -91,9 +91,7 @@ export function CalendarCard() {
 
       setAuthorized(status.authorized);
       setCalendarCount(status.calendarCount);
-      if (status.authorizationStatus === "Denied") {
-        setAuthDenied(true);
-      }
+      setAuthDenied(status.authorizationStatus === "Denied");
     } catch {}
   }, []);
 
@@ -198,8 +196,34 @@ export function CalendarCard() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={authorizeCalendar}
-                  disabled={isAuthorizing || authDenied}
+                  onClick={authDenied ? async () => {
+                    // Open System Settings to Calendar privacy pane
+                    // Try multiple URL schemes for different macOS versions
+                    try {
+                      const { Command } = await import("@tauri-apps/plugin-shell");
+                      await Command.create("open", [
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
+                      ]).execute();
+                    } catch {
+                      try {
+                        const { Command } = await import("@tauri-apps/plugin-shell");
+                        await Command.create("open", [
+                          "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Calendars",
+                        ]).execute();
+                      } catch {
+                        // Last resort: open general Privacy settings
+                        try {
+                          const { Command } = await import("@tauri-apps/plugin-shell");
+                          await Command.create("open", [
+                            "x-apple.systempreferences:com.apple.preference.security?Privacy",
+                          ]).execute();
+                        } catch {
+                          // ignore
+                        }
+                      }
+                    }
+                  } : authorizeCalendar}
+                  disabled={isAuthorizing}
                   className="text-xs"
                 >
                   {isAuthorizing ? (
@@ -209,17 +233,17 @@ export function CalendarCard() {
                   ) : (
                     <Calendar className="h-3 w-3 mr-1.5" />
                   )}
-                  {authDenied ? "Access denied" : "Connect Calendar"}
+                  {authDenied ? "Open Calendar Settings" : "Connect Calendar"}
                 </Button>
 
                 {authDenied && (
                   <p className="text-xs text-muted-foreground">
-                    Open{" "}
+                    Calendar access was denied. Click the button above to open System Settings,
+                    enable screenpipe under{" "}
                     <span className="font-medium">
-                      System Settings &rarr; Privacy &amp; Security &rarr;
-                      Calendars
-                    </span>{" "}
-                    and enable screenpipe, then restart the app.
+                      Privacy &amp; Security &rarr; Calendars
+                    </span>
+                    , then restart the app.
                   </p>
                 )}
               </div>

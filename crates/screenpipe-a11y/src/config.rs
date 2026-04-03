@@ -142,12 +142,13 @@ impl Default for UiCaptureConfig {
                 "Credential Manager".to_string(),
             ],
             excluded_window_patterns: Vec::new(),
-            excluded_window_pattern_strings: vec![
-                r"(?i).*password.*".to_string(),
-                r"(?i).*private.*".to_string(),
-                r"(?i).*incognito.*".to_string(),
-                r"(?i).*secret.*".to_string(),
-            ],
+            // Incognito / private browsing detection is handled by the
+            // `crate::incognito` module with comprehensive localized matching
+            // and platform-native APIs (macOS AppleScript).
+            // Bare "password"/"secret" patterns removed — too many false
+            // positives on normal windows (e.g. password manager settings,
+            // "Secret Santa Planning", AWS Secrets Manager, etc.).
+            excluded_window_pattern_strings: vec![],
 
             // Retention
             retention_days: 30,
@@ -298,8 +299,9 @@ mod tests {
         config.compile_patterns();
 
         assert!(!config.should_capture_window("Enter Password - Chrome"));
-        assert!(!config.should_capture_window("Private Browsing - Safari"));
-        assert!(!config.should_capture_window("Incognito - Chrome"));
+        assert!(!config.should_capture_window("Secret Notes - App"));
+        // Note: "Private Browsing" and "Incognito" are now handled by
+        // crate::incognito module, not by config excluded_window_patterns.
         assert!(config.should_capture_window("GitHub - Chrome"));
     }
 

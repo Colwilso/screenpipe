@@ -14,6 +14,33 @@ static EMBEDDING_MODEL_PATH: Mutex<Option<PathBuf>> = Mutex::const_new(None);
 static SEGMENTATION_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 static EMBEDDING_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
+/// Invalidate a cached model, forcing re-download on next call to get_or_download_model.
+/// Use this when a cached model file is corrupt (e.g. protobuf parsing failed).
+pub async fn invalidate_cached_model(model_type: &PyannoteModel) -> Result<()> {
+    let (model_path_lock, _) = match model_type {
+        PyannoteModel::Segmentation => (&SEGMENTATION_MODEL_PATH, &SEGMENTATION_DOWNLOADING),
+        PyannoteModel::Embedding => (&EMBEDDING_MODEL_PATH, &EMBEDDING_DOWNLOADING),
+    };
+
+    let filename = match model_type {
+        PyannoteModel::Segmentation => "segmentation-3.0.onnx",
+        PyannoteModel::Embedding => "wespeaker_en_voxceleb_CAM++.onnx",
+    };
+
+    let cache_dir = get_cache_dir()?;
+    let path = cache_dir.join(filename);
+
+    if path.exists() {
+        warn!("removing corrupt model file: {:?}", path);
+        tokio::fs::remove_file(&path).await?;
+    }
+
+    let mut cached = model_path_lock.lock().await;
+    *cached = None;
+
+    Ok(())
+}
+
 pub async fn get_or_download_model(model_type: PyannoteModel) -> Result<PathBuf> {
     let (model_path_lock, downloading_flag) = match model_type {
         PyannoteModel::Segmentation => (&SEGMENTATION_MODEL_PATH, &SEGMENTATION_DOWNLOADING),
@@ -52,39 +79,51 @@ pub async fn get_or_download_model(model_type: PyannoteModel) -> Result<PathBuf>
         return Ok(path);
     }
 
-    // Need to download — use atomic flag to prevent duplicate downloads
+    // Download with retries — use atomic flag to prevent concurrent downloads
     if downloading_flag
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        info!("initiating {} model download...", filename);
-        let model_type_clone = model_type;
-        let flag = downloading_flag;
-        tokio::spawn(async move {
-            match download_model(model_type_clone).await {
-                Ok(_) => {}
+        const MAX_RETRIES: u32 = 3;
+        let mut last_err = None;
+        for attempt in 1..=MAX_RETRIES {
+            info!("{} model download attempt {}/{}", filename, attempt, MAX_RETRIES);
+            match download_model(&model_type).await {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
                 Err(e) => {
-                    warn!("error downloading {} model: {}", filename, e);
-                    // Reset flag so a retry is possible
-                    flag.store(false, Ordering::SeqCst);
+                    warn!("{} model download attempt {} failed: {}", filename, attempt, e);
+                    last_err = Some(e);
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2u64.pow(attempt))).await;
+                    }
                 }
             }
-        });
+        }
+        downloading_flag.store(false, Ordering::SeqCst);
+        if let Some(e) = last_err {
+            return Err(anyhow::anyhow!("{} model download failed after {} retries: {}", filename, MAX_RETRIES, e));
+        }
+    } else {
+        // Another task is downloading — wait for the file to appear
+        let timeout = tokio::time::Duration::from_secs(120);
+        let start = tokio::time::Instant::now();
+        while !path.exists() {
+            if start.elapsed() > timeout {
+                return Err(anyhow::anyhow!(
+                    "timed out waiting for {} model download after {:?}",
+                    filename,
+                    timeout
+                ));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
     }
 
-    // Wait for the file to appear, with a timeout
-    let timeout = tokio::time::Duration::from_secs(120);
-    let start = tokio::time::Instant::now();
-    while !path.exists() {
-        if start.elapsed() > timeout {
-            downloading_flag.store(false, Ordering::SeqCst);
-            return Err(anyhow::anyhow!(
-                "timed out waiting for {} model download after {:?}",
-                filename,
-                timeout
-            ));
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    if !path.exists() {
+        return Err(anyhow::anyhow!("{} model file missing after download", filename));
     }
 
     let mut cached = model_path_lock.lock().await;
@@ -97,7 +136,7 @@ pub enum PyannoteModel {
     Embedding,
 }
 
-async fn download_model(model_type: PyannoteModel) -> Result<()> {
+async fn download_model(model_type: &PyannoteModel) -> Result<()> {
     let (url, filename) = match model_type {
         PyannoteModel::Segmentation => (
             "https://github.com/screenpipe/screenpipe/raw/refs/heads/main/crates/screenpipe-audio/models/pyannote/segmentation-3.0.onnx",
@@ -111,7 +150,17 @@ async fn download_model(model_type: PyannoteModel) -> Result<()> {
 
     info!("downloading {} model from {}", filename, url);
     let response = reqwest::get(url).await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "download failed: HTTP {} for {}",
+            response.status(),
+            url
+        ));
+    }
     let model_data = response.bytes().await?;
+    if model_data.is_empty() {
+        return Err(anyhow::anyhow!("download returned empty body for {}", filename));
+    }
 
     let cache_dir = get_cache_dir()?;
     tokio::fs::create_dir_all(&cache_dir).await?;

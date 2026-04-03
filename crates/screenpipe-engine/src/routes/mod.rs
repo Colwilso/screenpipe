@@ -4,12 +4,15 @@
 
 pub mod activity_summary;
 pub mod audio;
+pub mod browser;
 pub mod content;
 pub mod data;
 pub mod elements;
 pub mod frames;
 pub mod health;
 pub mod meetings;
+pub mod memories;
+pub mod pipe_store;
 pub mod power;
 pub mod retranscribe;
 pub mod search;

@@ -5,6 +5,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { homeDir, join } from "@tauri-apps/api/path";
 import { Button } from "../ui/button";
 import {
   DEFAULT_PROMPT,
@@ -24,6 +25,8 @@ import {
   RefreshCw,
   Settings2,
   Trash2,
+  Copy,
+  Star,
   XIcon,
   CheckCircle2,
   AlertCircle,
@@ -32,7 +35,25 @@ import {
   XCircle,
   ChevronDown,
   ChevronUp,
+  GripVertical,
 } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  rectSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Textarea } from "../ui/textarea";
 import {
   Tooltip,
@@ -52,7 +73,8 @@ import {
 import { Badge } from "../ui/badge";
 import { toast } from "../ui/use-toast";
 import { Card, CardContent } from "../ui/card";
-import { AIProviderType } from "@screenpipe/browser";
+import { AIProviderType } from "@/lib/hooks/use-settings";
+import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -107,7 +129,7 @@ const INITIAL_DIAGNOSTICS: DiagnosticResults = {
 };
 
 export interface AIProviderCardProps {
-  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "bedrock" | "custom" | "embedded" | "pi";
+  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "screenpipe-cloud";
   title: string;
   description: string;
   imageSrc: string;
@@ -129,6 +151,16 @@ export interface AIModel {
   id: string;
   name: string;
   provider: string;
+  description?: string;
+  tags?: string[];
+  free?: boolean;
+  context_window?: number;
+  best_for?: string[];
+  speed?: string;
+  intelligence?: string;
+  cost_tier?: 'free' | 'low' | 'medium' | 'high' | 'very_high';
+  recommended_for?: string[];
+  warning?: string;
 }
 
 export const AIProviderCard = ({
@@ -146,7 +178,7 @@ export const AIProviderCard = ({
     <Card
       onClick={onClick}
       className={cn(
-        "flex py-4 px-4 rounded-lg hover:bg-accent transition-colors h-[145px] w-full cursor-pointer",
+        "flex py-3 px-4 rounded-lg hover:bg-accent transition-colors h-[110px] w-full cursor-pointer",
         selected ? "border-black/60 border-[1.5px]" : "",
         disabled && "opacity-50 cursor-not-allowed",
       )}
@@ -187,6 +219,7 @@ const AISection = ({
   piAvailable?: boolean;
 }) => {
   const { settings, updateSettings } = useSettings();
+  const isEnterprise = useIsEnterpriseBuild();
   const [settingsPreset, setSettingsPreset] = useState<
     Partial<AIPreset> | undefined
   >(preset);
@@ -200,16 +233,22 @@ const AISection = ({
   const [chatgptLoggedIn, setChatgptLoggedIn] = useState(false);
   const [chatgptLoading, setChatgptLoading] = useState(false);
 
+  // Filter presets the same way the UI does so hidden presets don't block creation
+  const visiblePresets = useMemo(
+    () => settings.aiPresets.filter((p) => !isEnterprise || p.provider !== "screenpipe-cloud"),
+    [settings.aiPresets, isEnterprise]
+  );
+
   // Optimized validation with debouncing
   const debouncedValidatePreset = useMemo(
     () => debounce((presetData: Partial<AIPreset>) => {
       const errors: Record<string, string> = {};
-      
+
       // Validate name
       if (presetData.id) {
         const nameValidation = validatePresetName(
-          presetData.id, 
-          settings.aiPresets, 
+          presetData.id,
+          visiblePresets,
           preset?.id
         );
         if (!nameValidation.isValid && nameValidation.error) {
@@ -255,6 +294,7 @@ const AISection = ({
       });
     }
   }, [settingsPreset?.provider]);
+
 
   const isFormValid = useMemo(() => {
     return Object.keys(validationErrors).length === 0 && 
@@ -337,8 +377,14 @@ const AISection = ({
           defaultPreset: false,
         } as AIPreset;
 
+        // Remove any hidden preset with the same name (e.g. filtered Pi preset
+        // in enterprise builds) so it doesn't ghost-block future operations
+        const cleanedPresets = settings.aiPresets.filter(
+          (p) => p.id.toLowerCase() !== newPreset.id.toLowerCase()
+        );
+
         await updateSettings({
-          aiPresets: [...settings.aiPresets, newPreset],
+          aiPresets: [...cleanedPresets, newPreset],
         });
 
         toast({
@@ -369,6 +415,42 @@ const AISection = ({
     updateSettingsPreset({ apiKey: value });
   }, [updateSettingsPreset]);
 
+  // Auto-set max output tokens based on model name
+  const getDefaultMaxTokens = useCallback((model: string): number | null => {
+    const m = model.toLowerCase();
+    // Claude models
+    if (m.includes("opus")) return 64000;
+    if (m.includes("sonnet-4") || m.includes("sonnet-3.7")) return 64000;
+    if (m.includes("haiku")) return 8192;
+    // OpenAI models
+    if (m.includes("gpt-5")) return 128000;
+    if (m.includes("o3") || m.includes("o4") || m.includes("o1")) return 100000;
+    if (m.includes("gpt-4.1")) return 32768;
+    if (m.includes("gpt-oss")) return 8192;
+    // Google models
+    if (m.includes("gemini-3") || m.includes("gemini-2.5-pro")) return 65536;
+    if (m.includes("gemini")) return 8192;
+    // DeepSeek
+    if (m.includes("deepseek")) return 8192;
+    // Qwen
+    if (m.includes("qwen")) return 8192;
+    // Mistral
+    if (m.includes("mistral")) return 4096;
+    // Local/OSS models
+    if (m.includes("llama")) return 4096;
+    if (m.includes("phi")) return 16384;
+    return null; // unknown model, don't change
+  }, []);
+
+  useEffect(() => {
+    const model = settingsPreset?.model;
+    if (!model) return;
+    const tokens = getDefaultMaxTokens(model);
+    if (tokens && (settingsPreset as any)?.maxTokens !== tokens) {
+      updateSettingsPreset({ maxTokens: tokens } as any);
+    }
+  }, [settingsPreset?.model]);
+
   const handleCustomPromptChange = useCallback((value: string, isValid: boolean) => {
     updateSettingsPreset({ prompt: value });
   }, [updateSettingsPreset]);
@@ -396,16 +478,16 @@ const AISection = ({
         newModel = "gpt-5.4";
         break;
       case "anthropic":
+        newUrl = "";
+        newModel = "claude-sonnet-4-6";
+        break;
+      case "anthropic":
         newUrl = "https://api.anthropic.com";
-        newModel = "claude-sonnet-4-5-20250514";
+        newModel = "claude-sonnet-4-6";
         break;
-      case "bedrock":
-        newUrl = ""; // Bedrock uses AWS SDK, not HTTP
-        newModel = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
-        break;
-      case "pi":
+      case "screenpipe-cloud":
         newUrl = ""; // Pi uses RPC mode, not HTTP
-        newModel = "claude-haiku-4-5";
+        newModel = "auto";
         break;
     }
 
@@ -420,12 +502,13 @@ const AISection = ({
   const [isLoadingModels, setIsLoadingModels] = useState(false);
 
   const runDiagnostics = useCallback(async () => {
-    if (settingsPreset?.provider === "pi" || settingsPreset?.provider === "bedrock") return;
+    if (settingsPreset?.provider === "screenpipe-cloud") return;
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
     const abort = new AbortController();
     diagnosticsAbortRef.current = abort;
+    const isChatGpt = settingsPreset?.provider === "openai-chatgpt";
 
     setTestStatus("testing");
     setTestResults(INITIAL_DIAGNOSTICS);
@@ -478,6 +561,7 @@ const AISection = ({
     } else if (isAnthropic && settingsPreset?.apiKey) {
       headers["x-api-key"] = settingsPreset.apiKey;
       headers["anthropic-version"] = "2023-06-01";
+      headers["anthropic-dangerous-direct-browser-access"] = "true";
     } else if (settingsPreset?.apiKey) {
       headers["Authorization"] = `Bearer ${settingsPreset.apiKey}`;
     }
@@ -488,103 +572,110 @@ const AISection = ({
       endpoint: { status: "running", message: "Connecting..." },
     }));
 
-    let modelsResponse: Response;
-    // Use tauriFetch for Anthropic to bypass CORS restrictions
-    const modelsFetchFn = isAnthropic ? tauriFetch : fetch;
-    try {
-      modelsResponse = await modelsFetchFn(modelsUrl, {
-        headers,
-        signal: abort.signal,
-      });
-    } catch (err: any) {
-      if (abort.signal.aborted) return;
-      const hint =
-        settingsPreset?.provider === "native-ollama"
-          ? "Is Ollama running? Try: `ollama serve`"
-          : settingsPreset?.provider === "custom"
-          ? "Verify the URL is correct and the server is running"
-          : isAnthropic
-          ? "Check your Anthropic API key and network connection"
-          : "Check your network connection";
-      skipRemaining("endpoint", `Connection failed: ${hint}`);
-      return;
-    }
-
-    if (abort.signal.aborted) return;
-
-    // Step 1 pass
-    setTestResults((prev) => ({
-      ...prev,
-      endpoint: { status: "pass", message: isChatGpt ? "Reachable (OAuth)" : `GET ${modelsResponse.status}` },
-      auth: { status: "running", message: "Checking..." },
-    }));
-
-    // Step 2: Auth check
-    // ChatGPT OAuth tokens lack model.read scope so /v1/models returns 403 — skip to chat test
-    if (settingsPreset?.provider === "openai-chatgpt" && (modelsResponse.status === 403 || modelsResponse.status === 401)) {
+    // Anthropic: skip /v1/models (may not be available for all keys) and go straight to chat test
+    let modelsResponse: Response | null = null;
+    if (isAnthropic) {
       setTestResults((prev) => ({
         ...prev,
-        auth: { status: "pass", message: "OAuth token present" },
-        models: { status: "pass", message: "Using known models (API scope limited)" },
+        endpoint: { status: "pass", message: "api.anthropic.com" },
+        auth: { status: "pass", message: "Will verify with chat test" },
+        models: { status: "pass", message: "Using known models" },
         chat: { status: "running", message: "Sending test message..." },
       }));
-    } else if (modelsResponse.status === 401 || modelsResponse.status === 403) {
-      const hint =
-        settingsPreset?.provider === "openai"
-          ? "Check your API key at platform.openai.com"
-          : "Check your API key is valid and has credits";
-      skipRemaining("auth", `${modelsResponse.status} Unauthorized. ${hint}`);
-      return;
-    } else if (!modelsResponse.ok) {
-      skipRemaining("auth", `Unexpected status ${modelsResponse.status}`);
-      return;
     } else {
-      setTestResults((prev) => ({
-        ...prev,
-        auth: { status: "pass", message: "API key accepted" },
-        models: { status: "running", message: "Loading..." },
-      }));
-    }
-
-    // Step 3: Parse models (skip for openai-chatgpt when /v1/models returned 403)
-    if (modelsResponse.ok) {
-      let modelCount = 0;
+      const modelsFetchFn = fetch;
       try {
-        const data = await modelsResponse.json();
-        if (settingsPreset?.provider === "native-ollama") {
-          const ollamaModels = (data.models || []).map((m: any) => ({
-            id: m.name,
-            name: m.name,
-            provider: "ollama",
-          }));
-          modelCount = ollamaModels.length;
-          setModels(ollamaModels);
-        } else {
-          const apiModels = (data.data || []).map((m: any) => ({
-            id: m.id,
-            name: m.id,
-            provider: settingsPreset?.provider || "custom",
-          }));
-          modelCount = apiModels.length;
-          setModels(apiModels);
-        }
-      } catch {
+        modelsResponse = await modelsFetchFn(modelsUrl, {
+          headers,
+          signal: abort.signal,
+        });
+      } catch (err: any) {
         if (abort.signal.aborted) return;
-        skipRemaining("models", "Failed to parse models response");
+        const hint =
+          settingsPreset?.provider === "native-ollama"
+            ? "Is Ollama running? Try: `ollama serve`"
+            : settingsPreset?.provider === "custom"
+            ? "Verify the URL is correct and the server is running"
+            : "Check your network connection";
+        skipRemaining("endpoint", `Connection failed: ${hint}`);
         return;
       }
 
       if (abort.signal.aborted) return;
 
+      // Step 1 pass
       setTestResults((prev) => ({
         ...prev,
-        models: { status: "pass", message: `${modelCount} model${modelCount !== 1 ? "s" : ""} loaded` },
-        chat: { status: "running", message: "Sending test message..." },
+        endpoint: { status: "pass", message: isChatGpt ? "Reachable (OAuth)" : `GET ${modelsResponse!.status}` },
+        auth: { status: "running", message: "Checking..." },
       }));
+
+      // Step 2: Auth check
+      // ChatGPT OAuth tokens lack model.read scope so /v1/models returns 403 — skip to chat test
+      if (settingsPreset?.provider === "openai-chatgpt" && (modelsResponse!.status === 403 || modelsResponse!.status === 401)) {
+        setTestResults((prev) => ({
+          ...prev,
+          auth: { status: "pass", message: "OAuth token present" },
+          models: { status: "pass", message: "Using known models (API scope limited)" },
+          chat: { status: "running", message: "Sending test message..." },
+        }));
+      } else if (modelsResponse!.status === 401 || modelsResponse!.status === 403) {
+        const hint =
+          settingsPreset?.provider === "openai"
+            ? "Check your API key at platform.openai.com"
+            : "Check your API key is valid and has credits";
+        skipRemaining("auth", `${modelsResponse!.status} Unauthorized. ${hint}`);
+        return;
+      } else if (!modelsResponse!.ok) {
+        skipRemaining("auth", `Unexpected status ${modelsResponse!.status}`);
+        return;
+      } else {
+        setTestResults((prev) => ({
+          ...prev,
+          auth: { status: "pass", message: "API key accepted" },
+          models: { status: "running", message: "Loading..." },
+        }));
+      }
+
+      // Step 3: Parse models (skip for openai-chatgpt when /v1/models returned 403)
+      if (modelsResponse!.ok) {
+        let modelCount = 0;
+        try {
+          const data = await modelsResponse!.json();
+          if (settingsPreset?.provider === "native-ollama") {
+            const ollamaModels = (data.models || []).map((m: any) => ({
+              id: m.name,
+              name: m.name,
+              provider: "ollama",
+            }));
+            modelCount = ollamaModels.length;
+            setModels(ollamaModels);
+          } else {
+            const apiModels = (data.data || []).map((m: any) => ({
+              id: m.id,
+              name: m.id,
+              provider: settingsPreset?.provider || "custom",
+            }));
+            modelCount = apiModels.length;
+            setModels(apiModels);
+          }
+        } catch {
+          if (abort.signal.aborted) return;
+          skipRemaining("models", "Failed to parse models response");
+          return;
+        }
+
+        if (abort.signal.aborted) return;
+
+        setTestResults((prev) => ({
+          ...prev,
+          models: { status: "pass", message: `${modelCount} model${modelCount !== 1 ? "s" : ""} loaded` },
+          chat: { status: "running", message: "Sending test message..." },
+        }));
+      }
     }
 
     // Step 4: Test chat completion (or Codex Responses API for ChatGPT OAuth)
-    const isChatGpt = settingsPreset?.provider === "openai-chatgpt";
     let chatUrl: string;
     if (settingsPreset?.provider === "native-ollama") {
       chatUrl = "http://localhost:11434/v1/chat/completions";
@@ -689,7 +780,7 @@ const AISection = ({
 
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
-    settingsPreset?.provider !== "bedrock" &&
+    settingsPreset?.provider !== "anthropic" &&
     settingsPreset?.url !== "https://api.screenpi.pe/v1" &&
     settingsPreset?.url !== "http://localhost:11434/v1" &&
     settingsPreset?.url !== "embedded";
@@ -774,6 +865,7 @@ const AISection = ({
               headers: {
                 "x-api-key": settingsPreset?.apiKey || "",
                 "anthropic-version": "2023-06-01",
+                "anthropic-dangerous-direct-browser-access": "true",
               },
             });
             if (anthropicResp.ok) {
@@ -788,18 +880,28 @@ const AISection = ({
             } else {
               // Fallback to hardcoded models
               setModels([
-                { id: "claude-opus-4-6-20250828", name: "Claude Opus 4.6", provider: "anthropic" },
-                { id: "claude-sonnet-4-5-20250514", name: "Claude Sonnet 4.5", provider: "anthropic" },
+                { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+                { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
                 { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
               ]);
             }
           } catch {
             setModels([
-              { id: "claude-opus-4-6-20250828", name: "Claude Opus 4.6", provider: "anthropic" },
-              { id: "claude-sonnet-4-5-20250514", name: "Claude Sonnet 4.5", provider: "anthropic" },
+              { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+              { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
               { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
             ]);
           }
+          break;
+        }
+
+        case "anthropic": {
+          // Hardcoded model list — Anthropic API models
+          setModels([
+            { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+            { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
+            { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
+          ]);
           break;
         }
 
@@ -847,33 +949,46 @@ const AISection = ({
           break;
         }
 
-        case "bedrock": {
-          // TODO: dynamically fetch available models from Bedrock using the
-          // selected AWS profile. Would need a Tauri command that shells out to
-          // `aws bedrock list-inference-profiles --profile <awsProfile> --region <awsRegion>`
-          // and parses the result. For now, hardcoded list of common Anthropic models.
-          // Models must match Pi's built-in registry (@mariozechner/pi-ai models.generated.js).
-          // Pi v0.51.1 does not include Sonnet 4.6 or Opus 4.6 -- adding them here will cause
-          // "Model not found" errors. Update this list when Pi is updated.
+        case "screenpipe-cloud": {
+          // Fetch models from gateway so new models appear automatically
+          try {
+            const token = settings.user?.token || "";
+            const piResp = await fetch("https://api.screenpi.pe/v1/models", {
+              headers: token ? { Authorization: `Bearer ${token}` } : {},
+            });
+            if (piResp.ok) {
+              const piData = await piResp.json();
+              const piModels: AIModel[] = (piData.data || []).map((m: any) => ({
+                id: m.id,
+                name: m.name || m.id,
+                provider: "screenpipe",
+                description: m.description,
+                tags: m.tags,
+                free: m.free,
+                context_window: m.context_window,
+                best_for: m.best_for,
+                speed: m.speed,
+                intelligence: m.intelligence,
+              }));
+              if (piModels.length > 0) {
+                setModels(piModels);
+                break;
+              }
+            }
+          } catch {
+            // fallback to hardcoded
+          }
           setModels([
-            { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", name: "Claude Opus 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4", provider: "bedrock" },
-          ]);
-          break;
-        }
-
-        case "pi": {
-          const piModels: AIModel[] = [
+            { id: "auto", name: "Auto (recommended)", provider: "screenpipe" },
             { id: "claude-haiku-4-5", name: "Haiku 4.5 (fast)", provider: "screenpipe" },
             { id: "claude-sonnet-4-5", name: "Sonnet 4.5 (balanced)", provider: "screenpipe" },
             { id: "claude-opus-4-6", name: "Opus 4.6 (powerful, pro)", provider: "screenpipe" },
             { id: "gemini-3-flash", name: "Gemini 3 Flash (fast)", provider: "screenpipe" },
-            { id: "gemini-3-pro", name: "Gemini 3.1 Pro (balanced)", provider: "screenpipe" },
-          ];
-          setModels(piModels);
+            { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro (balanced)", provider: "screenpipe" },
+            { id: "qwen/qwen3.5-flash-02-23", name: "Qwen3.5 Flash (cheapest, 1M ctx)", provider: "screenpipe" },
+            { id: "deepseek/deepseek-chat", name: "DeepSeek V3.2 (fast)", provider: "screenpipe" },
+            { id: "meta-llama/llama-4-scout", name: "Llama 4 Scout", provider: "screenpipe" },
+          ]);
           break;
         }
 
@@ -913,7 +1028,7 @@ const AISection = ({
 
   // Auto-trigger diagnostics when provider + url + apiKey are set (debounced)
   useEffect(() => {
-    if (settingsPreset?.provider === "pi" || settingsPreset?.provider === "bedrock") return;
+    if (settingsPreset?.provider === "screenpipe-cloud") return;
     if (!settingsPreset?.provider) return;
 
     const needsApiKey =
@@ -936,7 +1051,7 @@ const AISection = ({
   }, []);
 
   return (
-    <div className="w-full space-y-6 py-4">
+    <div className="w-full space-y-4 py-3">
       <div className="flex flex-col gap-2">
         <Button
           className="w-max flex gap-2"
@@ -945,7 +1060,7 @@ const AISection = ({
         >
           <ArrowLeft className="w-4 h-4" /> back
         </Button>
-        <h1 className="text-2xl font-bold">
+        <h1 className="text-xl font-semibold">
           {preset ? "Update preset" : "Create preset"}
         </h1>
       </div>
@@ -968,20 +1083,15 @@ const AISection = ({
 
           <AIProviderCard
             type="anthropic"
-            title="Anthropic"
-            description="Use your Anthropic API key for Claude models"
-            imageSrc="/images/anthropic.png"
-            selected={settingsPreset?.provider === "anthropic"}
-            onClick={() => handleAiProviderChange("anthropic")}
-          />
-
-          <AIProviderCard
-            type="bedrock"
-            title="AWS Bedrock"
-            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
-            imageSrc="/images/custom.png"
-            selected={settingsPreset?.provider === "bedrock"}
-            onClick={() => handleAiProviderChange("bedrock")}
+            title="Claude.ai"
+            description="Use your Anthropic API key"
+            imageSrc="/images/claude-ai.svg"
+            selected={(settingsPreset?.provider as string) === "anthropic"}
+            onClick={() => {
+              if ((settingsPreset?.provider as string) !== "anthropic") {
+                handleAiProviderChange("anthropic");
+              }
+            }}
           />
 
           <AIProviderCard
@@ -1002,14 +1112,23 @@ const AISection = ({
             onClick={() => handleAiProviderChange("native-ollama")}
           />
 
+          <AIProviderCard
+            type="bedrock"
+            title="AWS Bedrock"
+            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
+            imageSrc="/images/custom.png"
+            selected={settingsPreset?.provider === "bedrock"}
+            onClick={() => handleAiProviderChange("bedrock")}
+          />
+
           {piAvailable && (
             <AIProviderCard
-              type="pi"
+              type="screenpipe-cloud"
               title="Screenpipe Cloud"
               description="AI coding agent powered by Screenpipe Cloud. Requires login."
               imageSrc="/images/screenpipe.png"
-              selected={settingsPreset?.provider === "pi"}
-              onClick={() => handleAiProviderChange("pi")}
+              selected={settingsPreset?.provider === "screenpipe-cloud"}
+              onClick={() => handleAiProviderChange("screenpipe-cloud")}
               disabled={!settings.user?.token}
               warningText={!settings.user?.token ? "Login required" : undefined}
             />
@@ -1023,9 +1142,11 @@ const AISection = ({
         label="Preset Name"
         value={settingsPreset?.id || ""}
         onChange={(value, isValid) => updateSettingsPreset({ id: value })}
-        validation={(value) => validatePresetName(value, settings.aiPresets, preset?.id)}
+        validation={(value) => validatePresetName(value, visiblePresets, preset?.id)}
         placeholder="Enter preset name"
         required={true}
+        spellCheck={false}
+        autoCorrect="off"
         disabled={!!preset && !isDuplicating && preset.id !== undefined}
         helperText="Only letters, numbers, spaces, hyphens, and underscores allowed"
       />
@@ -1042,6 +1163,7 @@ const AISection = ({
           helperText="Enter the base URL for your custom AI provider"
         />
       )}
+
 
       {(settingsPreset?.provider === "anthropic" || settingsPreset?.provider === "custom" || (isApiKeyRequired &&
         settingsPreset?.provider === "openai")) && (
@@ -1091,39 +1213,6 @@ const AISection = ({
             </div>
           </div>
         )}
-
-      {settingsPreset?.provider === "bedrock" && (
-        <div className="w-full">
-          <div className="flex flex-col gap-4 mb-4 w-full">
-            <Label htmlFor="awsProfile" className="flex items-center gap-1">
-              AWS Profile
-            </Label>
-            <Input
-              id="awsProfile"
-              value={(settingsPreset as any)?.awsProfile || ""}
-              onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
-              placeholder="default"
-            />
-            <p className="text-xs text-muted-foreground">
-              AWS profile name from ~/.aws/config (leave empty for default)
-            </p>
-          </div>
-          <div className="flex flex-col gap-4 mb-4 w-full">
-            <Label htmlFor="awsRegion" className="flex items-center gap-1">
-              AWS Region
-            </Label>
-            <Input
-              id="awsRegion"
-              value={(settingsPreset as any)?.awsRegion || ""}
-              onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
-              placeholder="us-east-1"
-            />
-            <p className="text-xs text-muted-foreground">
-              AWS region for Bedrock API calls
-            </p>
-          </div>
-        </div>
-      )}
 
       {settingsPreset?.provider === "openai-chatgpt" && (
         <div className="w-full">
@@ -1221,53 +1310,138 @@ const AISection = ({
                   <CommandEmpty>
                     Press enter to use &quot;{settingsPreset?.model}&quot;
                   </CommandEmpty>
-                  <CommandGroup heading="Available Models">
-                    {isLoadingModels ? (
+                  {isLoadingModels ? (
+                    <CommandGroup>
                       <CommandItem value="loading" disabled>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                         Loading models...
                       </CommandItem>
-                    ) : (
-                      models?.map((model) => (
-                        <CommandItem
-                          key={model.id}
-                          value={model.id}
-                          onSelect={async () => {
-                            if (model.id === "claude-opus-4-6" && !settings.user?.cloud_subscribed) {
-                              if (!settings.user?.token) {
-                                await commands.openLoginWindow();
-                              } else {
-                                try {
-                                  const res = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.user.token}` },
-                                    body: JSON.stringify({ tier: "pro", billingPeriod: "monthly", userId: settings.user.id, email: settings.user.email }),
-                                  });
-                                  const data = await res.json();
-                                  if (data.url) await openUrl(data.url);
-                                } catch (e) {
-                                  console.error("checkout failed:", e);
+                    </CommandGroup>
+                  ) : (
+                    <>
+                      {models?.some((m) => m.free) && (
+                        <CommandGroup heading="Free">
+                          {models.filter((m) => m.free).map((model) => (
+                            <CommandItem
+                              key={model.id}
+                              value={model.id}
+                              onSelect={() => updateSettingsPreset({ model: model.id })}
+                            >
+                              <div className="flex flex-col gap-0.5 w-full">
+                                <div className="flex items-center justify-between">
+                                  <span className="font-medium">{model.name}</span>
+                                  <Badge variant="outline" className="ml-2 text-[10px] bg-green-500/10 text-green-600 border-green-500/30">free</Badge>
+                                </div>
+                                {model.description && (
+                                  <span className="text-xs text-muted-foreground">{model.description}{model.context_window ? ` · ${Math.round(model.context_window / 1000)}K ctx` : ""}</span>
+                                )}
+                              </div>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      )}
+                      <CommandGroup heading={models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
+                        {models?.filter((m) => !m.free).map((model) => {
+                          const costLabel = model.cost_tier === 'low' ? '$' : model.cost_tier === 'medium' ? '$$' : model.cost_tier === 'high' ? '$$$' : model.cost_tier === 'very_high' ? '$$$$' : '';
+                          return (
+                          <CommandItem
+                            key={model.id}
+                            value={model.id}
+                            onSelect={async () => {
+                              if (model.id === "claude-opus-4-6" && !settings.user?.cloud_subscribed) {
+                                if (!settings.user?.token) {
+                                  await commands.openLoginWindow();
+                                } else {
+                                  try {
+                                    const res = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.user.token}` },
+                                      body: JSON.stringify({ tier: "pro", billingPeriod: "monthly", userId: settings.user.id, email: settings.user.email }),
+                                    });
+                                    const data = await res.json();
+                                    if (data.url) await openUrl(data.url);
+                                  } catch (e) {
+                                    console.error("checkout failed:", e);
+                                  }
                                 }
+                                return;
                               }
-                              return;
-                            }
-                            updateSettingsPreset({ model: model.id });
-                          }}
-                        >
-                          <div className="flex items-center justify-between w-full">
-                            <span>{model.name}</span>
-                            <Badge variant="outline" className="ml-2">
-                              {model.provider}
-                            </Badge>
-                          </div>
-                        </CommandItem>
-                      ))
-                    )}
-                  </CommandGroup>
+                              updateSettingsPreset({ model: model.id });
+                            }}
+                          >
+                            <div className="flex flex-col gap-0.5 w-full">
+                              <div className="flex items-center justify-between">
+                                <span className="font-medium">{model.name}</span>
+                                <div className="flex items-center gap-1 ml-2">
+                                  {costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
+                                  {model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
+                                </div>
+                              </div>
+                              <span className="text-xs text-muted-foreground">
+                                {model.description}{model.context_window ? ` · ${Math.round(model.context_window / 1000)}K ctx` : ""}
+                              </span>
+                              {model.recommended_for && model.recommended_for.length > 0 && (
+                                <div className="flex items-center gap-1 mt-0.5">
+                                  {model.recommended_for.map((use) => (
+                                    <span key={use} className="text-[9px] rounded bg-muted px-1 py-0.5 text-muted-foreground">{use}</span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </CommandItem>
+                          );
+                        })}
+                      </CommandGroup>
+                    </>
+                  )}
                 </CommandList>
               </Command>
             </PopoverContent>
           </Popover>
+          {(() => {
+            const selectedModel = models?.find((m) => m.id === settingsPreset?.model);
+            if (selectedModel?.warning) {
+              return (
+                <div className="flex items-start gap-2 rounded-md border p-3 text-xs text-muted-foreground">
+                  <span className="shrink-0 text-sm">!</span>
+                  <div className="space-y-1">
+                    <p>{selectedModel.warning}</p>
+                    {models?.filter((m) => m.recommended_for?.includes('pipes') && m.id !== selectedModel.id).slice(0, 2).length > 0 && (
+                      <p className="text-muted-foreground">
+                        recommended for pipes:{" "}
+                        {models.filter((m) => m.recommended_for?.includes('pipes') && m.id !== selectedModel.id).slice(0, 3).map((m) => (
+                          <button
+                            key={m.id}
+                            type="button"
+                            className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 mr-1 font-medium hover:bg-accent cursor-pointer"
+                            onClick={() => updateSettingsPreset({ model: m.id })}
+                          >
+                            {m.name} {m.free ? "(free)" : ""}
+                          </button>
+                        ))}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              );
+            }
+            return null;
+          })()}
+          {settingsPreset?.provider === "native-ollama" && (
+            <div className="text-xs text-muted-foreground space-y-1">
+              <p>
+                <span className="font-medium">recommended:</span>{" "}
+                <code className="bg-secondary/50 px-1 rounded">qwen3.5:9b</code>{" "}
+                <code className="bg-secondary/50 px-1 rounded">glm-4.7:9b</code>{" "}
+                <code className="bg-secondary/50 px-1 rounded">qwen3.5:4b</code>{" "}
+                (all support tool calling)
+              </p>
+              <p>
+                GPU strongly recommended. without a dedicated GPU, local models will be very slow and pipes may time out.
+                for best results consider screenpipe cloud or groq as custom provider.
+              </p>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1290,13 +1464,13 @@ const AISection = ({
         helperText="This prompt will be used to guide the AI's responses"
       />
 
-      {settingsPreset?.provider !== "pi" && settingsPreset?.provider !== "bedrock" && (
+      {settingsPreset?.provider !== "screenpipe-cloud" && (
         <div className="w-full">
           <Label htmlFor="maxTokens" className="text-sm font-medium">
             Max Output Tokens
           </Label>
           <p className="text-xs text-muted-foreground mb-2">
-            Maximum tokens the model can generate per response. Lower values work better with providers like Groq.
+            Maximum tokens the model can generate per response.
           </p>
           <Input
             id="maxTokens"
@@ -1308,10 +1482,34 @@ const AISection = ({
             onChange={(e) => updateSettingsPreset({ maxTokens: parseInt(e.target.value) || 4096 } as any)}
             className="w-full"
           />
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {[
+              { label: "8k", value: 8192, hint: "haiku / qwen / deepseek" },
+              { label: "32k", value: 32768, hint: "gpt-4.1" },
+              { label: "64k", value: 64000, hint: "opus / sonnet" },
+              { label: "65k", value: 65536, hint: "gemini 3 pro" },
+              { label: "100k", value: 100000, hint: "o3 / o4" },
+              { label: "128k", value: 128000, hint: "gpt-5" },
+            ].map((preset) => (
+              <button
+                key={preset.value}
+                type="button"
+                className={`px-2 py-1 text-xs rounded-md border transition-colors ${
+                  (settingsPreset as any)?.maxTokens === preset.value
+                    ? "bg-primary text-primary-foreground border-primary"
+                    : "bg-muted/50 hover:bg-muted border-border"
+                }`}
+                onClick={() => updateSettingsPreset({ maxTokens: preset.value } as any)}
+              >
+                {preset.label}
+                <span className="text-[10px] ml-1 opacity-60">{preset.hint}</span>
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
-      {settingsPreset?.provider !== "pi" && settingsPreset?.provider !== "bedrock" && (
+      {settingsPreset?.provider !== "screenpipe-cloud" && (
         <div className="w-full border rounded-lg">
           <button
             type="button"
@@ -1451,12 +1649,118 @@ const AISection = ({
 const providerImageSrc: Record<string, string> = {
   openai: "/images/openai.png",
   "openai-chatgpt": "/images/openai.png",
-  anthropic: "/images/anthropic.png",
-  bedrock: "/images/custom.png",
+  anthropic: "/images/claude-ai.svg",
   "native-ollama": "/images/ollama.png",
   custom: "/images/custom.png",
   pi: "/images/screenpipe.png",
+  screenpipe: "/images/screenpipe.png",
+  "screenpipe-cloud": "/images/screenpipe.png",
 };
+
+// Sortable preset card for drag-and-drop reordering
+function SortablePresetCard({
+  preset,
+  isDefault,
+  hasValidation,
+  onEdit,
+  onDuplicate,
+  onSetDefault,
+  onDelete,
+  isLoading,
+}: {
+  preset: AIPreset;
+  isDefault: boolean;
+  hasValidation: boolean;
+  onEdit: () => void;
+  onDuplicate: () => void;
+  onSetDefault: () => void;
+  onDelete: () => void;
+  isLoading: boolean;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: preset.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 50 : undefined,
+  };
+
+  return (
+    <Card
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "p-3 relative group transition-all hover:shadow-md border-border bg-card cursor-pointer",
+        isDefault && "ring-2 ring-primary/20",
+        isDragging && "shadow-lg"
+      )}
+      onClick={onEdit}
+    >
+      <div className="space-y-2">
+        <div className="flex justify-between items-center">
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <button
+              className="cursor-grab active:cursor-grabbing touch-none text-muted-foreground hover:text-foreground shrink-0"
+              {...attributes}
+              {...listeners}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <GripVertical className="w-4 h-4" />
+            </button>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={providerImageSrc[preset.provider]}
+              alt={`${preset.provider} logo`}
+              className="w-6 h-6 opacity-80 rounded shrink-0"
+            />
+            <h3 className="text-sm font-semibold text-foreground truncate" title={preset.id}>
+              {formatPresetName(preset.id)}
+            </h3>
+            {isDefault && (
+              <Badge variant="default" className="text-[10px] px-1.5 py-0">
+                default
+              </Badge>
+            )}
+            {!hasValidation && (
+              <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+            )}
+          </div>
+          {hasValidation ? (
+            <CheckCircle2 className="h-4 w-4 text-foreground/50 shrink-0" />
+          ) : (
+            <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="font-mono bg-muted px-1.5 py-0.5 rounded truncate max-w-[180px]" title={preset.model || 'Not set'}>
+            {preset.model || 'Not set'}
+          </span>
+        </div>
+        <div className="flex items-center gap-0.5 pt-1.5 border-t border-border">
+          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onDuplicate(); }} disabled={isLoading}>
+            <Copy className="w-3 h-3 mr-1" />duplicate
+          </Button>
+          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onSetDefault(); }} disabled={isLoading || isDefault}>
+            <Star className="w-3 h-3 mr-1" />{isDefault ? "default" : "set default"}
+          </Button>
+          {!isDefault && (
+            <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2 text-destructive hover:text-destructive ml-auto" onClick={(e) => { e.stopPropagation(); onDelete(); }} disabled={isLoading}>
+              <Trash2 className="w-3 h-3" />
+            </Button>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
 
 export const AIPresets = () => {
   const { settings, updateSettings } = useSettings();
@@ -1468,7 +1772,30 @@ export const AIPresets = () => {
     null
   );
   const [isDuplicating, setIsDuplicating] = useState(false);
+  const isEnterprise = useIsEnterpriseBuild();
   const [piAvailable, setPiAvailable] = useState(false);
+
+  // Drag-and-drop sensors with activation distance to avoid conflicts with clicks
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+
+      const presets = settings.aiPresets;
+      const oldIndex = presets.findIndex((p) => p.id === active.id);
+      const newIndex = presets.findIndex((p) => p.id === over.id);
+      if (oldIndex === -1 || newIndex === -1) return;
+
+      const reordered = arrayMove(presets, oldIndex, newIndex);
+      updateSettings({ aiPresets: reordered });
+    },
+    [settings.aiPresets, updateSettings]
+  );
 
   // Check Pi availability (installed at app startup by Rust background thread)
   useEffect(() => {
@@ -1478,11 +1805,13 @@ export const AIPresets = () => {
         setPiAvailable(true);
       }
     };
-    checkPi();
+    if (!isEnterprise) {
+      checkPi();
+    }
     // Re-check periodically in case background install finishes
-    const interval = setInterval(checkPi, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    const interval = isEnterprise ? null : setInterval(checkPi, 5000);
+    return () => { if (interval) clearInterval(interval); };
+  }, [isEnterprise]);
 
   useEffect(() => {
     if (!createPresetsDialog) {
@@ -1504,9 +1833,9 @@ export const AIPresets = () => {
   const removePreset = async (id: string) => {
     setIsLoading(true);
     try {
-      // Prevent deletion of pi-agent preset for Pro subscribers (pi = screenpipe cloud)
+      // Prevent deletion of screenpipe-cloud preset for Pro subscribers
       const presetToRemove = settings.aiPresets.find((preset) => preset.id === id);
-      if (presetToRemove?.provider === "pi" && settings.user?.cloud_subscribed) {
+      if (presetToRemove?.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
         toast({
           title: "Cannot delete cloud preset",
           description: "This preset is included with your Pro subscription",
@@ -1610,9 +1939,18 @@ export const AIPresets = () => {
     const presetToDuplicate = settings.aiPresets.find((p) => p.id === id);
     if (!presetToDuplicate) return;
 
+    // Find a unique name by appending a number
+    const baseName = presetToDuplicate.id.replace(/ \d+$/, "");
+    let counter = 2;
+    let newName = `${baseName} ${counter}`;
+    while (settings.aiPresets.some((p) => p.id.toLowerCase() === newName.toLowerCase())) {
+      counter++;
+      newName = `${baseName} ${counter}`;
+    }
+
     const newPreset = {
       ...presetToDuplicate,
-      id: `${presetToDuplicate.id} copy`,
+      id: newName,
       defaultPreset: false,
     };
 
@@ -1624,15 +1962,10 @@ export const AIPresets = () => {
   if (!settings.aiPresets?.length) {
     return (
       <div className="space-y-5">
-        <div className="space-y-1">
-          <h1 className="text-xl font-bold tracking-tight text-foreground">
-            AI Settings
-          </h1>
-          <p className="text-muted-foreground text-sm">
-            Configure AI models and preferences
-          </p>
-        </div>
-        
+        <p className="text-muted-foreground text-sm mb-4">
+          Configure AI models and preferences
+        </p>
+
         <div className="w-full h-[400px] flex flex-col items-center justify-center space-y-4">
           <Settings2 className="w-12 h-12 text-muted-foreground" />
           <h2 className="text-xl font-medium text-muted-foreground">
@@ -1653,15 +1986,10 @@ export const AIPresets = () => {
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <h1 className="text-xl font-bold tracking-tight text-foreground">
-          AI Settings
-        </h1>
-        <p className="text-muted-foreground text-sm">
-          Configure AI models and preferences
-        </p>
-      </div>
-      
+      <p className="text-muted-foreground text-sm mb-4">
+        Configure AI models and preferences
+      </p>
+
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Badge variant="outline" className="px-3 py-1">
@@ -1680,125 +2008,32 @@ export const AIPresets = () => {
         </Button>
       </div>
 
-      <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-6">
-        {settings.aiPresets.map((preset) => {
-          const isDefault = preset.defaultPreset;
-          const hasValidation = preset.provider && preset.model && (preset.url || preset.provider === "bedrock" || preset.provider === "pi");
-          
-          return (
-            <Card
-              key={preset.id}
-              className={cn(
-                "p-6 relative group transition-all hover:shadow-lg border-border bg-card cursor-pointer",
-                isDefault && "ring-2 ring-primary/20"
-              )}
-              onClick={() => {
-                setSelectedPreset(preset);
-                setIsDuplicating(false);
-                setCreatePresentDialog(true);
-              }}
-            >
-              <div className="space-y-4">
-                <div className="flex justify-between items-start">
-                  <div className="space-y-2 flex-1">
-                    <div className="flex items-center gap-2">
-                      <h3 className="text-lg font-semibold text-foreground truncate" title={preset.id}>
-                        {formatPresetName(preset.id)}
-                      </h3>
-                      {isDefault && (
-                        <Badge variant="default" className="text-xs">
-                          default
-                        </Badge>
-                      )}
-                      {!hasValidation && (
-                        <AlertCircle className="h-4 w-4 text-destructive" />
-                      )}
-                    </div>
-                    
-                    <div className="space-y-1 text-sm text-muted-foreground">
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">Provider:</span>
-                        <span className="capitalize">{preset.provider.replace('-', ' ')}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">Model:</span>
-                        <span className="font-mono text-xs bg-muted px-2 py-1 rounded">
-                          {preset.model || 'Not set'}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex items-start gap-2">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={providerImageSrc[preset.provider]}
-                      alt={`${preset.provider} logo`}
-                      className="w-10 h-10 opacity-80 group-hover:opacity-100 transition-opacity rounded"
-                    />
-                    {hasValidation ? (
-                      <CheckCircle2 className="h-5 w-5 text-foreground/70" />
-                    ) : (
-                      <TooltipProvider>
-                        <Tooltip>
-                          <TooltipTrigger>
-                            <AlertCircle className="h-5 w-5 text-destructive" />
-                          </TooltipTrigger>
-                          <TooltipContent>
-                            <p>Configuration incomplete</p>
-                          </TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap gap-1 items-center pt-2 border-t border-border">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        duplicatePreset(preset.id);
-                      }}
-                      disabled={isLoading}
-                      className="text-xs"
-                    >
-                      Duplicate
-                    </Button>
-
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setPresetToSetDefault(preset.id);
-                      }}
-                      disabled={isLoading || isDefault}
-                      className="text-xs"
-                    >
-                      {isDefault ? "Current default" : "Set as default"}
-                    </Button>
-
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setPresetToDelete(preset.id);
-                    }}
-                    disabled={isLoading || isDefault}
-                    className="text-xs text-destructive hover:text-destructive ml-auto"
-                  >
-                    <Trash2 className="w-3 h-3 mr-1" />
-                    Remove
-                  </Button>
-                </div>
-              </div>
-            </Card>
-          );
-        })}
-      </div>
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+        <SortableContext
+          items={settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "screenpipe-cloud").map((p) => p.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-3">
+            {settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "screenpipe-cloud").map((preset) => (
+              <SortablePresetCard
+                key={preset.id}
+                preset={preset}
+                isDefault={preset.defaultPreset}
+                hasValidation={!!(preset.provider && preset.model && (preset.url || preset.provider === "bedrock" || preset.provider === "screenpipe-cloud"))}
+                onEdit={() => {
+                  setSelectedPreset(preset);
+                  setIsDuplicating(false);
+                  setCreatePresentDialog(true);
+                }}
+                onDuplicate={() => duplicatePreset(preset.id)}
+                onSetDefault={() => setPresetToSetDefault(preset.id)}
+                onDelete={() => setPresetToDelete(preset.id)}
+                isLoading={isLoading}
+              />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
 
       <AlertDialog
         open={!!presetToDelete}

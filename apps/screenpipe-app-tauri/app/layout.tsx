@@ -29,6 +29,7 @@ export default function RootLayout({
 }) {
   const pathname = usePathname();
   const isOverlay = pathname === "/shortcut-reminder";
+  const isSearch = pathname === "/search";
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -178,7 +179,7 @@ export default function RootLayout({
   }, []);
 
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning className={isSearch ? "bg-transparent" : ""}>
       <head>
         <script
           dangerouslySetInnerHTML={{
@@ -193,13 +194,28 @@ export default function RootLayout({
                 } catch (e) {
                   document.documentElement.classList.add('light');
                 }
+
+                // Crash recovery: if React fails to render, the page stays blank.
+                // After 8s, if <body> has no visible children, reload once.
+                var RELOAD_KEY = '__sp_crash_reload';
+                setTimeout(function() {
+                  var body = document.body;
+                  if (!body || body.children.length === 0 || body.offsetHeight === 0) {
+                    var last = sessionStorage.getItem(RELOAD_KEY);
+                    // Only auto-reload once per 30s to avoid infinite loops
+                    if (!last || Date.now() - Number(last) > 30000) {
+                      sessionStorage.setItem(RELOAD_KEY, String(Date.now()));
+                      window.location.reload();
+                    }
+                  }
+                }, 8000);
               })();
             `,
           }}
         />
       </head>
       <Providers>
-        <body className={`${inter.className} scrollbar-hide`}>
+        <body className={`${inter.className} scrollbar-hide ${isSearch ? "bg-transparent" : ""}`}>
           {!isOverlay && <DeeplinkHandler />}
           {!isOverlay && <ShortcutTracker />}
           {!isOverlay && <PipeInstallDialog />}

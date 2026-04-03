@@ -15,6 +15,8 @@ import {
   AlertCircle,
   RefreshCw,
   AppWindowMac,
+  WifiOff,
+  Tv,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -158,10 +160,15 @@ export function PrivacySection() {
     });
 
     try {
-      if (!settings.analyticsEnabled) {
+      // Offline mode force-disables PostHog but keeps Sentry for crash reports
+      const analyticsEffective = settings.offlineMode ? false : settings.analyticsEnabled;
+      if (!analyticsEffective) {
         posthog.capture("telemetry", { enabled: false });
         posthog.opt_out_capturing();
-        Sentry.close();
+        // Only close Sentry if analytics disabled manually, NOT for offline mode
+        if (!settings.offlineMode) {
+          Sentry.close();
+        }
       } else {
         const isDebug = process.env.TAURI_ENV_DEBUG === "true";
         if (!isDebug) {
@@ -197,8 +204,20 @@ export function PrivacySection() {
     handleSettingsChange({ usePiiRemoval: checked }, true);
   };
 
+  const handleIncognitoToggle = (checked: boolean) => {
+    handleSettingsChange({ ignoreIncognitoWindows: checked }, true);
+  };
+
+  const handleDrmPauseToggle = (checked: boolean) => {
+    handleSettingsChange({ pauseOnDrmContent: checked }, true);
+  };
+
   const handleAnalyticsToggle = (checked: boolean) => {
     handleSettingsChange({ analyticsEnabled: checked }, true);
+  };
+
+  const handleOfflineModeToggle = (checked: boolean) => {
+    handleSettingsChange({ offlineMode: checked }, true);
   };
 
   const handlePushFilterToTeam = async (
@@ -344,11 +363,11 @@ export function PrivacySection() {
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold tracking-tight text-foreground">
-            Privacy
-          </h1>
+      <p className="text-muted-foreground text-sm mb-4">
+        Content filtering, PII redaction, and telemetry
+      </p>
+
+      <div className="flex items-center justify-end">
           {hasUnsavedChanges && (
             <Button
               onClick={handleUpdate}
@@ -364,10 +383,41 @@ export function PrivacySection() {
               Apply & Restart
             </Button>
           )}
-        </div>
-        <p className="text-muted-foreground text-sm">
-          Content filtering, PII redaction, and telemetry
-        </p>
+      </div>
+
+      {/* Offline Mode */}
+      <div className="space-y-2">
+        <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">
+          Network
+        </h2>
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <WifiOff className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    Offline mode
+                    <HelpTooltip text="Prevents pipes from accessing the internet. Forces local AI models (Ollama), disables web search, blocks external API calls, and turns off usage analytics. Crash reports (Sentry) and auto-updates still work. Local network (localhost, LAN) remains accessible." />
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Pipes can only use local AI and local network
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="offlineMode"
+                checked={Boolean(settings.offlineMode)}
+                onCheckedChange={handleOfflineModeToggle}
+              />
+            </div>
+            {settings.offlineMode && (
+              <div className="mt-2 ml-[26px] text-xs text-muted-foreground space-y-1">
+                <p>Cloud AI providers, web search, and external connections are disabled.</p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       {/* PII Removal */}
@@ -400,7 +450,57 @@ export function PrivacySection() {
         </Card>
       </div>
 
+      {/* Incognito Detection */}
+      <Card className="border-border bg-card">
+        <CardContent className="px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2.5">
+              <EyeOff className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  ignore incognito windows
+                  <HelpTooltip text="automatically detects and skips private/incognito browser windows in 20+ languages. on macos, uses native browser APIs for chromium browsers (chrome, edge, brave, arc)." />
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  skip all private browsing sessions
+                </p>
+              </div>
+            </div>
+            <Switch
+              id="ignoreIncognitoWindows"
+              checked={Boolean(settings.ignoreIncognitoWindows ?? true)}
+              onCheckedChange={handleIncognitoToggle}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
       {/* Window Filtering */}
+      {/* DRM Streaming Pause */}
+      <Card>
+        <CardContent className="px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2.5">
+              <Tv className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  pause for streaming apps
+                  <HelpTooltip text="pauses all screen capture when netflix, disney+, hulu, prime video, and other DRM streaming apps are focused. this prevents black screens caused by DRM copy protection detecting screen recording. capture resumes automatically when you switch to a non-browser app." />
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  avoid DRM black screens on netflix, disney+, etc.
+                </p>
+              </div>
+            </div>
+            <Switch
+              id="pauseOnDrmContent"
+              checked={Boolean(settings.pauseOnDrmContent ?? false)}
+              onCheckedChange={handleDrmPauseToggle}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
       <div className="space-y-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">
           Content filters
@@ -945,14 +1045,15 @@ export function PrivacySection() {
                     Analytics
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    Anonymous usage data
+                    {settings.offlineMode ? "Disabled by offline mode" : "Anonymous usage data"}
                   </p>
                 </div>
               </div>
               <Switch
                 id="analyticsEnabled"
-                checked={settings.analyticsEnabled}
+                checked={settings.offlineMode ? false : settings.analyticsEnabled}
                 onCheckedChange={handleAnalyticsToggle}
+                disabled={Boolean(settings.offlineMode)}
               />
             </div>
           </CardContent>

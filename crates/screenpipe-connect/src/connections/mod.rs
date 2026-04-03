@@ -7,18 +7,33 @@
 //! Each integration defines its fields and a test function.
 //! Pi receives credentials directly in its context and makes API calls itself.
 
+pub mod airtable;
+pub mod brex;
 pub mod discord;
 pub mod email;
+pub mod github_issues;
+pub mod hubspot;
+pub mod intercom;
+pub mod jira;
+pub mod limitless;
 pub mod linear;
+pub mod logseq;
 pub mod make;
 pub mod n8n;
 pub mod notion;
+pub mod ntfy;
 pub mod obsidian;
 pub mod perplexity;
+pub mod pipedrive;
+pub mod pushover;
+pub mod sentry;
 pub mod slack;
+pub mod stripe;
 pub mod teams;
 pub mod telegram;
 pub mod todoist;
+pub mod toggl;
+pub mod vercel;
 pub mod whatsapp;
 pub mod zapier;
 
@@ -69,11 +84,7 @@ pub trait Integration: Send + Sync {
     fn def(&self) -> &'static IntegrationDef;
 
     /// Verify credentials work. Returns a human-readable success message.
-    async fn test(
-        &self,
-        client: &reqwest::Client,
-        creds: &Map<String, Value>,
-    ) -> Result<String>;
+    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>) -> Result<String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +106,21 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(n8n::N8n),
         Box::new(make::Make),
         Box::new(zapier::Zapier),
+        Box::new(github_issues::GithubIssues),
+        Box::new(jira::Jira),
+        Box::new(hubspot::HubSpot),
+        Box::new(limitless::Limitless),
+        Box::new(airtable::Airtable),
+        Box::new(logseq::Logseq),
+        Box::new(pushover::Pushover),
+        Box::new(ntfy::Ntfy),
+        Box::new(toggl::Toggl),
+        Box::new(brex::Brex),
+        Box::new(stripe::Stripe),
+        Box::new(sentry::Sentry),
+        Box::new(vercel::Vercel),
+        Box::new(pipedrive::Pipedrive),
+        Box::new(intercom::Intercom),
     ]
 }
 
@@ -120,10 +146,7 @@ pub fn load_store(screenpipe_dir: &Path) -> HashMap<String, SavedConnection> {
     }
 }
 
-pub fn save_store(
-    screenpipe_dir: &Path,
-    data: &HashMap<String, SavedConnection>,
-) -> Result<()> {
+pub fn save_store(screenpipe_dir: &Path, data: &HashMap<String, SavedConnection>) -> Result<()> {
     let path = store_path(screenpipe_dir);
     let json = serde_json::to_string_pretty(data)?;
     std::fs::write(&path, json)?;
@@ -194,6 +217,54 @@ impl ConnectionManager {
         integration.test(&self.client, creds).await
     }
 
+    /// Store credentials under `id` or `id:instance`.
+    pub fn connect_instance(
+        &self,
+        id: &str,
+        instance: Option<&str>,
+        creds: Map<String, Value>,
+    ) -> Result<()> {
+        self.find(id)?;
+        let key = make_key(id, instance);
+        let mut store = load_store(&self.screenpipe_dir);
+        store.insert(
+            key,
+            SavedConnection {
+                enabled: true,
+                credentials: creds,
+            },
+        );
+        save_store(&self.screenpipe_dir, &store)
+    }
+
+    /// Return all saved instances for the given integration id.
+    ///
+    /// Matches keys that are exactly `id` (the default instance) or start with
+    /// `id:` (named instances).  Each entry is returned as
+    /// `(instance_name_or_none, connection)`.
+    pub fn get_all_instances(&self, id: &str) -> Result<Vec<(Option<String>, SavedConnection)>> {
+        self.find(id)?;
+        let store = load_store(&self.screenpipe_dir);
+        let prefix = format!("{}:", id);
+        let mut results = Vec::new();
+        for (key, conn) in &store {
+            if key == id {
+                results.push((None, conn.clone()));
+            } else if let Some(inst) = key.strip_prefix(&prefix) {
+                results.push((Some(inst.to_string()), conn.clone()));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Remove a specific instance (or the default) for the given integration.
+    pub fn disconnect_instance(&self, id: &str, instance: Option<&str>) -> Result<()> {
+        let key = make_key(id, instance);
+        let mut store = load_store(&self.screenpipe_dir);
+        store.remove(&key);
+        save_store(&self.screenpipe_dir, &store)
+    }
+
     fn find(&self, id: &str) -> Result<&dyn Integration> {
         self.integrations
             .iter()
@@ -244,6 +315,29 @@ pub fn render_context(screenpipe_dir: &Path, _api_port: u16) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instance helpers
+// ---------------------------------------------------------------------------
+
+/// Split a connection key on the first `:` separator.
+///
+/// `"notion:work"` → `("notion", Some("work"))`
+/// `"notion"`      → `("notion", None)`
+pub fn parse_connection_key(key: &str) -> (&str, Option<&str>) {
+    match key.split_once(':') {
+        Some((id, instance)) => (id, Some(instance)),
+        None => (key, None),
+    }
+}
+
+/// Build the storage key for an integration + optional instance.
+fn make_key(id: &str, instance: Option<&str>) -> String {
+    match instance {
+        Some(inst) => format!("{}:{}", id, inst),
+        None => id.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------

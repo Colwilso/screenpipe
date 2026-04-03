@@ -9,7 +9,9 @@ mod tests {
     use std::sync::Arc;
 
     async fn setup_test_db() -> DatabaseManager {
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
         sqlx::migrate!("./src/migrations")
             .run(&db.pool)
             .await
@@ -135,7 +137,7 @@ mod tests {
 
         assert!(
             !results.is_empty(),
-            "keyword search should still find frame via ocr_text_fts"
+            "keyword search should still find frame via frames_fts"
         );
         assert_eq!(results[0].app_name, "Chrome");
     }

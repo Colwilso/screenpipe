@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod connection;
+pub mod login;
 pub mod mcp;
 pub mod pipe;
 pub mod status;
@@ -40,9 +41,42 @@ pub enum CliAudioTranscriptionEngine {
     OpenAICompatible,
     #[clap(name = "qwen3-asr")]
     Qwen3Asr,
+    #[clap(name = "parakeet")]
+    Parakeet,
     /// Disable transcription (audio capture only, no speech-to-text)
     #[clap(name = "disabled")]
     Disabled,
+}
+
+/// Default audio engine based on hardware tier.
+///
+/// - Low tier (≤8GB): WhisperTiny (parakeet-mlx would OOM)
+/// - Mid/High tier: Parakeet (auto-upgrades to MLX GPU when compiled in)
+fn default_audio_engine() -> CliAudioTranscriptionEngine {
+    let tier = screenpipe_config::detect_tier();
+    if matches!(tier, screenpipe_config::DeviceTier::Low) {
+        CliAudioTranscriptionEngine::WhisperTiny
+    } else {
+        CliAudioTranscriptionEngine::Parakeet
+    }
+}
+
+fn cli_engine_to_str(engine: &CliAudioTranscriptionEngine) -> &'static str {
+    match engine {
+        CliAudioTranscriptionEngine::Deepgram => "deepgram",
+        CliAudioTranscriptionEngine::WhisperTiny => "whisper-tiny",
+        CliAudioTranscriptionEngine::WhisperTinyQuantized => "whisper-tiny-quantized",
+        CliAudioTranscriptionEngine::WhisperLargeV3 => "whisper-large",
+        CliAudioTranscriptionEngine::WhisperLargeV3Quantized => "whisper-large-quantized",
+        CliAudioTranscriptionEngine::WhisperLargeV3Turbo => "whisper-large-v3-turbo",
+        CliAudioTranscriptionEngine::WhisperLargeV3TurboQuantized => {
+            "whisper-large-v3-turbo-quantized"
+        }
+        CliAudioTranscriptionEngine::OpenAICompatible => "openai-compatible",
+        CliAudioTranscriptionEngine::Qwen3Asr => "qwen3-asr",
+        CliAudioTranscriptionEngine::Parakeet => "parakeet",
+        CliAudioTranscriptionEngine::Disabled => "disabled",
+    }
 }
 
 impl From<CliAudioTranscriptionEngine> for CoreAudioTranscriptionEngine {
@@ -69,6 +103,7 @@ impl From<CliAudioTranscriptionEngine> for CoreAudioTranscriptionEngine {
                 CoreAudioTranscriptionEngine::OpenAICompatible
             }
             CliAudioTranscriptionEngine::Qwen3Asr => CoreAudioTranscriptionEngine::Qwen3Asr,
+            CliAudioTranscriptionEngine::Parakeet => CoreAudioTranscriptionEngine::Parakeet,
             CliAudioTranscriptionEngine::Disabled => CoreAudioTranscriptionEngine::Disabled,
         }
     }
@@ -76,10 +111,10 @@ impl From<CliAudioTranscriptionEngine> for CoreAudioTranscriptionEngine {
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum CliTranscriptionMode {
-    /// Transcribe immediately as audio is captured (default)
+    /// Transcribe immediately as audio is captured
     #[clap(name = "realtime")]
     Realtime,
-    /// Accumulate longer audio batches for better transcription quality
+    /// Accumulate longer audio batches for better transcription quality (default)
     #[clap(name = "batch", alias = "smart")]
     Batch,
 }
@@ -180,6 +215,15 @@ pub enum Command {
         #[command(subcommand)]
         subcommand: VaultCommand,
     },
+
+    /// Authenticate with screenpipe cloud
+    Login,
+
+    /// Show current auth status
+    Whoami,
+
+    /// Check system readiness (permissions, ffmpeg, etc.)
+    Doctor,
 }
 
 // =============================================================================
@@ -217,7 +261,7 @@ pub struct RecordArgs {
     pub debug: bool,
 
     /// Audio transcription engine to use
-    #[arg(short = 'a', long, value_enum, default_value_t = CliAudioTranscriptionEngine::WhisperLargeV3TurboQuantized)]
+    #[arg(short = 'a', long, value_enum, default_value_t = default_audio_engine())]
     pub audio_transcription_engine: CliAudioTranscriptionEngine,
 
     /// Monitor IDs to use
@@ -264,8 +308,8 @@ pub struct RecordArgs {
     #[arg(long, hide = true)]
     pub auto_destruct_pid: Option<u32>,
 
-    /// Audio transcription scheduling mode: realtime (default) or batch (longer chunks for quality)
-    #[arg(long, value_enum, default_value_t = CliTranscriptionMode::Realtime)]
+    /// Audio transcription scheduling mode: batch (default, longer chunks for quality) or realtime
+    #[arg(long, value_enum, default_value_t = CliTranscriptionMode::Batch)]
     pub transcription_mode: CliTranscriptionMode,
 
     /// Disable telemetry
@@ -321,45 +365,101 @@ impl RecordArgs {
         }
     }
 
-    /// Convert RecordArgs into a unified RecordingConfig.
-    pub fn into_recording_config(
-        self,
-        data_dir: PathBuf,
-    ) -> crate::recording_config::RecordingConfig {
-        let languages = self.unique_languages().unwrap_or_default();
-        crate::recording_config::RecordingConfig {
-            audio_chunk_duration: self.audio_chunk_duration,
+    /// Build a `RecordingSettings` from CLI arguments.
+    pub fn to_recording_settings(&self) -> screenpipe_config::RecordingSettings {
+        let engine_str = cli_engine_to_str(&self.audio_transcription_engine);
+        let mode_str = match self.transcription_mode {
+            CliTranscriptionMode::Realtime => "realtime",
+            CliTranscriptionMode::Batch => "batch",
+        };
+
+        screenpipe_config::RecordingSettings {
+            audio_chunk_duration: self.audio_chunk_duration as i32,
             port: self.port,
-            data_dir,
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
             filter_music: self.filter_music,
+            #[allow(deprecated)]
             enable_input_capture: true,
+            #[allow(deprecated)]
             enable_accessibility: true,
-            audio_transcription_engine: self.audio_transcription_engine.into(),
-            transcription_mode: self.transcription_mode.into(),
-            audio_devices: self.audio_device,
+            audio_transcription_engine: engine_str.to_string(),
+            transcription_mode: mode_str.to_string(),
+            audio_devices: self.audio_device.clone(),
             use_system_default_audio: self.use_system_default_audio,
             monitor_ids: self.monitor_id.iter().map(|id| id.to_string()).collect(),
             use_all_monitors: self.use_all_monitors,
-            ignored_windows: self.ignored_windows,
-            included_windows: self.included_windows,
-            ignored_urls: self.ignored_urls,
-            languages,
-            deepgram_api_key: self.deepgram_api_key,
-            user_id: None,
-            user_name: None,
-            // OpenAI Compatible transcription
-            openai_compatible_endpoint: None,
-            openai_compatible_api_key: None,
-            openai_compatible_model: None,
-            video_quality: self.video_quality,
-            use_chinese_mirror: false,
+            ignored_windows: self.ignored_windows.clone(),
+            included_windows: self.included_windows.clone(),
+            ignored_urls: self.ignored_urls.clone(),
+            languages: self
+                .language
+                .iter()
+                .map(|l| l.as_lang_code().to_string())
+                .collect(),
+            deepgram_api_key: self.deepgram_api_key.clone().unwrap_or_default(),
+            video_quality: self.video_quality.clone(),
             analytics_enabled: !self.disable_telemetry,
-            analytics_id: String::new(),
-            vocabulary: vec![],
+            ignore_incognito_windows: true,
+            ..screenpipe_config::RecordingSettings::default()
         }
+    }
+
+    /// Convert RecordArgs into a unified RecordingConfig via RecordingSettings.
+    ///
+    /// If no `device_tier` is set in the config file, detects hardware and applies
+    /// tier-appropriate defaults (first-launch behavior for CLI users).
+    pub fn into_recording_config(
+        self,
+        data_dir: PathBuf,
+    ) -> crate::recording_config::RecordingConfig {
+        let mut settings = self.to_recording_settings();
+
+        // First-launch tier detection for CLI users
+        if settings.device_tier.is_none() {
+            let config_path = data_dir.join("config.toml");
+            let existing = screenpipe_config::load_toml(&config_path).ok();
+            let has_tier = existing
+                .as_ref()
+                .map(|s| s.device_tier.is_some())
+                .unwrap_or(false);
+
+            if has_tier {
+                // Existing config with tier — just use it
+                if let Some(existing) = existing {
+                    settings.device_tier = existing.device_tier;
+                }
+            } else {
+                let tier = screenpipe_config::detect_tier();
+                eprintln!("detected hardware tier: {:?}", tier);
+                // Only apply capture defaults (video_quality, power_mode) for truly fresh installs.
+                // Existing config without tier = upgrade — just set the tier for DB/channel tuning.
+                let is_fresh = !config_path.exists();
+                if is_fresh {
+                    screenpipe_config::apply_tier_defaults(&mut settings, tier);
+                }
+                settings.device_tier = Some(tier.as_str().to_string());
+            }
+        }
+
+        // Safety guard: downgrade engine if unsafe for this platform
+        // (Low tier = OOM, macOS < 26 = parakeet-mlx segfault)
+        let tier = settings
+            .device_tier
+            .as_deref()
+            .and_then(screenpipe_config::DeviceTier::from_str_loose)
+            .unwrap_or_else(screenpipe_config::detect_tier);
+        if screenpipe_config::is_engine_unsafe(&settings.audio_transcription_engine, tier) {
+            let safe = screenpipe_config::best_engine_for_platform(tier);
+            eprintln!(
+                "warning: {} is not supported on this platform, using {} instead",
+                settings.audio_transcription_engine, safe
+            );
+            settings.audio_transcription_engine = safe.to_string();
+        }
+
+        crate::recording_config::RecordingConfig::from_settings(&settings, data_dir, None)
     }
 }
 
@@ -412,6 +512,26 @@ pub enum PipeCommand {
     Models {
         #[command(subcommand)]
         subcommand: ModelCommand,
+    },
+    /// Publish a local pipe to the registry
+    Publish {
+        /// Pipe name (directory name under ~/.screenpipe/pipes/)
+        name: String,
+    },
+    /// Search the pipe registry
+    Search {
+        /// Search query
+        query: String,
+    },
+    /// Show pipe detail from the registry
+    Info {
+        /// Pipe slug (registry identifier)
+        slug: String,
+    },
+    /// Check publish/review status of a pipe you own
+    Status {
+        /// Pipe slug (registry identifier)
+        slug: String,
     },
 }
 

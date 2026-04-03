@@ -326,15 +326,15 @@ fn detect_mode(apps: &[AppActivity], windows: &[WindowActivity]) -> &'static str
         }
     }
 
-    // Check browser windows for communication/meeting sites
+    // Check browser windows for meeting sites only (e.g. meet.google.com in URL bar).
+    // Communication sites (slack, discord) in browser titles are too noisy —
+    // searching "slack alternatives" shouldn't classify the user as "communication" mode.
+    // Only native communication apps (from classify_app) count for that mode.
     for w in windows {
         if !BROWSER_APPS.iter().any(|b| *b == w.app_name.to_lowercase()) {
             continue;
         }
         let lower = w.window_name.to_lowercase();
-        if COMMUNICATION_SITES.iter().any(|s| lower.contains(s)) {
-            *scores.entry("communication").or_insert(0) += w.cnt;
-        }
         if MEETING_SITES.iter().any(|s| lower.contains(s)) {
             *scores.entry("meeting").or_insert(0) += w.cnt;
         }
@@ -562,15 +562,22 @@ fn video_editing_suggestions(top_apps: &[String]) -> Vec<Suggestion> {
 }
 
 fn idle_suggestions(top_apps: &[String], windows: &[WindowActivity]) -> Vec<Suggestion> {
-    let mut suggestions = vec![
-        Suggestion {
-            text: "what did I work on in the last hour?".into(),
-        },
-    ];
+    let mut suggestions = vec![Suggestion {
+        text: "what did I work on in the last hour?".into(),
+    }];
 
     // Add app-specific suggestion from top active app
-    let skip = ["finder", "screenpipe", "screenpipe-app", "loginwindow", "systemuiserver"];
-    if let Some(app) = top_apps.iter().find(|a| !skip.contains(&a.to_lowercase().as_str())) {
+    let skip = [
+        "finder",
+        "screenpipe",
+        "screenpipe-app",
+        "loginwindow",
+        "systemuiserver",
+    ];
+    if let Some(app) = top_apps
+        .iter()
+        .find(|a| !skip.contains(&a.to_lowercase().as_str()))
+    {
         suggestions.push(Suggestion {
             text: format!("what was I doing in {}?", app),
         });
@@ -611,12 +618,35 @@ fn idle_suggestions(top_apps: &[String], windows: &[WindowActivity]) -> Vec<Sugg
     suggestions
 }
 
+/// Known app/service names that should only appear in suggestions if the user
+/// actually has activity data for them. Prevents "summarize my slack
+/// conversations" when the user doesn't use Slack.
+const KNOWN_SERVICE_NAMES: &[&str] = &[
+    "slack",
+    "discord",
+    "teams",
+    "zoom",
+    "notion",
+    "obsidian",
+    "telegram",
+    "whatsapp",
+    "linear",
+    "jira",
+    "figma",
+    "github",
+    "gitlab",
+    "premiere",
+    "final cut",
+    "davinci",
+    "capcut",
+];
+
 fn template_suggestions(
     mode: &str,
     top_apps: &[String],
     windows: &[WindowActivity],
 ) -> Vec<Suggestion> {
-    match mode {
+    let mut suggestions = match mode {
         "coding" => coding_suggestions(top_apps),
         "browsing" => browsing_suggestions(windows),
         "meeting" => meeting_suggestions(),
@@ -624,7 +654,52 @@ fn template_suggestions(
         "communication" => communication_suggestions(windows),
         "video_editing" => video_editing_suggestions(top_apps),
         _ => idle_suggestions(top_apps, windows),
+    };
+
+    // Filter out suggestions that reference apps/services the user hasn't used.
+    // Build a lowercase set of all app names and window titles from actual data.
+    let user_context: String = top_apps
+        .iter()
+        .map(|a| a.to_lowercase())
+        .chain(windows.iter().map(|w| w.app_name.to_lowercase()))
+        .chain(windows.iter().map(|w| w.window_name.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    suggestions.retain(|s| {
+        let text = s.text.to_lowercase();
+        // If the suggestion mentions a known service name, only keep it if
+        // that service actually appears in the user's recent activity.
+        for service in KNOWN_SERVICE_NAMES {
+            if text.contains(service) && !user_context.contains(service) {
+                return false;
+            }
+        }
+        true
+    });
+
+    // Backfill if filtering removed too many suggestions
+    if suggestions.len() < 4 {
+        let fillers = [
+            "summarize my activity from the last hour",
+            "which apps did I use most today",
+            "show my recent screen activity",
+            "what was I working on",
+        ];
+        for filler in fillers {
+            if suggestions.len() >= 4 {
+                break;
+            }
+            if !suggestions.iter().any(|s| s.text == filler) {
+                suggestions.push(Suggestion {
+                    text: filler.into(),
+                });
+            }
+        }
     }
+
+    suggestions.truncate(4);
+    suggestions
 }
 
 // ─── Suggestion generation ──────────────────────────────────────────────────
@@ -897,19 +972,19 @@ async fn build_activity_context(apps: &[AppActivity], windows: &[WindowActivity]
 // System prompt — returns both suggestions and tags in one AI call (zero extra cost)
 const AI_SYSTEM_PROMPT: &str = r#"Analyze this screenpipe user's activity (records screen/audio 24/7). Return a JSON object with "suggestions" and "tags".
 
-Format: {"suggestions":["suggestion1","suggestion2","suggestion3","suggestion4"],"tags":["tag1","tag2","tag3"]}
+Format: {"suggestions":["suggestion one here","suggestion two here","suggestion three here","suggestion four here"],"tags":["tag-one","tag-two","tag-three"]}
 
-SUGGESTIONS — 4 natural sentences the user can click to ask about their activity:
-- all lowercase plain english, NO hyphens, NO question marks
-- 5-10 words, start with: summarize, show, list, compare, find, what, how much
-- reference specific apps/people/topics from the data below
-- example style: "summarize my slack conversations from today"
+SUGGESTIONS — 4 natural English sentences with spaces between words:
+- MUST use normal spaces between words, like "summarize my coding session in vscode"
+- NEVER use hyphens between words. WRONG: "summarize-coding-activity". RIGHT: "summarize coding activity"
+- all lowercase, no question marks, 5-12 words
+- start with: summarize, show, list, compare, find, what, how much
+- ONLY reference apps and topics from the activity data below. Never mention apps the user hasn't used.
 
-TAGS — 3-8 short hyphenated labels for search/filtering:
-- lowercase with hyphens, no spaces: "coding", "rust", "debugging-auth", "meeting-with-sarah"
-- include: activity type, specific apps, topics, people, projects
+TAGS — 3-8 short hyphenated labels (tags ARE hyphenated, suggestions are NOT):
+- "coding", "rust", "debugging-auth", "meeting-with-sarah"
 
-Output ONLY the JSON on a SINGLE LINE. Do NOT copy examples — use actual data.
+Output ONLY the JSON on a SINGLE LINE.
 "#;
 
 /// Result from a single AI call that returns both suggestions and tags.
@@ -983,8 +1058,16 @@ fn parse_ai_response(content: &str) -> Option<AiResult> {
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|v| {
-                            v.as_str().map(|s| Suggestion {
-                                text: s.to_string(),
+                            v.as_str().map(|s| {
+                                // Fix AI returning hyphenated suggestions like
+                                // "summarize-coding-activity" instead of normal sentences.
+                                // If most words are hyphen-joined (no spaces), replace hyphens with spaces.
+                                let text = if !s.contains(' ') && s.contains('-') {
+                                    s.replace('-', " ")
+                                } else {
+                                    s.to_string()
+                                };
+                                Suggestion { text }
                             })
                         })
                         .take(4)
@@ -1011,16 +1094,19 @@ fn parse_ai_response(content: &str) -> Option<AiResult> {
     // Fallback: try parsing as a plain JSON array of strings (old format)
     if let Some(start) = content.find('[') {
         if let Some(end) = content.rfind(']') {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&content[start..=end]) {
-                if !arr.is_empty() {
-                    return Some(AiResult {
-                        suggestions: arr
-                            .into_iter()
-                            .take(4)
-                            .map(|text| Suggestion { text })
-                            .collect(),
-                        tags: vec![],
-                    });
+            if start <= end && content.is_char_boundary(start) && content.is_char_boundary(end + 1)
+            {
+                if let Ok(arr) = serde_json::from_str::<Vec<String>>(&content[start..=end]) {
+                    if !arr.is_empty() {
+                        return Some(AiResult {
+                            suggestions: arr
+                                .into_iter()
+                                .take(4)
+                                .map(|text| Suggestion { text })
+                                .collect(),
+                            tags: vec![],
+                        });
+                    }
                 }
             }
         }
@@ -1045,7 +1131,7 @@ fn extract_json_object(content: &str) -> Option<String> {
 
     let start = cleaned.find('{')?;
     let end = cleaned.rfind('}')?;
-    if end >= start {
+    if end >= start && cleaned.is_char_boundary(start) && cleaned.is_char_boundary(end + 1) {
         Some(cleaned[start..=end].to_string())
     } else {
         None
@@ -1259,33 +1345,33 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ai_suggestions_valid_json() {
+    fn test_parse_ai_response_valid_json() {
         let input = r#"["What did I code?", "Show my git commits"]"#;
-        let result = parse_ai_suggestions(input);
+        let result = parse_ai_response(input);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().len(), 2);
+        assert_eq!(result.unwrap().suggestions.len(), 2);
     }
 
     #[test]
-    fn test_parse_ai_suggestions_wrapped_json() {
+    fn test_parse_ai_response_wrapped_json() {
         let input = "Here are your suggestions:\n```json\n[\"question 1\", \"question 2\"]\n```";
-        let result = parse_ai_suggestions(input);
+        let result = parse_ai_response(input);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().len(), 2);
+        assert_eq!(result.unwrap().suggestions.len(), 2);
     }
 
     #[test]
-    fn test_parse_ai_suggestions_garbage() {
+    fn test_parse_ai_response_garbage() {
         let input = "I cannot generate suggestions right now.";
-        let result = parse_ai_suggestions(input);
+        let result = parse_ai_response(input);
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_parse_ai_suggestions_caps_at_4() {
+    fn test_parse_ai_response_caps_at_4() {
         let input = r#"["a", "b", "c", "d", "e", "f"]"#;
-        let result = parse_ai_suggestions(input).unwrap();
-        assert_eq!(result.len(), 4);
+        let result = parse_ai_response(input).unwrap();
+        assert_eq!(result.suggestions.len(), 4);
     }
 
     // ─── Benchmark tests ─────────────────────────────────────────────────────
@@ -1404,7 +1490,7 @@ mod tests {
                 println!(
                     "    [{}] {}...",
                     a.app_name,
-                    &a.snippet[..a.snippet.len().min(80)]
+                    &a.snippet[..a.snippet.floor_char_boundary(a.snippet.len().min(80))]
                 );
             }
         }
@@ -1415,7 +1501,9 @@ mod tests {
                 println!(
                     "    [{}] {}...",
                     speaker,
-                    &a.transcription[..a.transcription.len().min(80)]
+                    &a.transcription[..a
+                        .transcription
+                        .floor_char_boundary(a.transcription.len().min(80))]
                 );
             }
         }
@@ -1483,9 +1571,9 @@ mod tests {
         for run in 0..3 {
             let result = generate_ai_suggestions(mode, &apps, &windows).await;
             match result {
-                Some(suggestions) => {
+                Some(ai_result) => {
                     let mut run_scores = Vec::new();
-                    for s in &suggestions {
+                    for s in &ai_result.suggestions {
                         let (spec, act, nat, brev) =
                             score_suggestion(&s.text, &top_apps, &speakers);
                         let total = weighted_score(spec, act, nat, brev);
@@ -1495,14 +1583,14 @@ mod tests {
                     all_scores.push(avg);
 
                     println!("\n  Run {}: avg={:.2}/3.00", run + 1, avg);
-                    for (i, s) in suggestions.iter().enumerate() {
+                    for (i, s) in ai_result.suggestions.iter().enumerate() {
                         let (spec, act, nat, brev) =
                             score_suggestion(&s.text, &top_apps, &speakers);
                         let total = weighted_score(spec, act, nat, brev);
                         println!("    [{}] \"{}\"\n        spec={:.1} act={:.1} nat={:.1} brev={:.1} → {:.2}",
                             i + 1, s.text, spec, act, nat, brev, total);
                     }
-                    all_suggestions.extend(suggestions);
+                    all_suggestions.extend(ai_result.suggestions);
                 }
                 None => {
                     println!("\n  Run {}: AI returned no results", run + 1);

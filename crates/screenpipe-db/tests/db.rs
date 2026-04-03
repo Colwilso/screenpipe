@@ -17,7 +17,9 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .try_init();
 
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         // Run all migrations with better error handling
         match sqlx::migrate!("./src/migrations").run(&db.pool).await {
@@ -78,6 +80,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -128,6 +132,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -139,6 +145,8 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -207,6 +215,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -218,6 +228,8 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -281,8 +293,8 @@ mod tests {
         .unwrap();
 
         // Verify that frames_fts was populated
-        let fts_data: Option<(i64, String, String, String, bool)> = sqlx::query_as(
-            "SELECT rowid, browser_url, app_name, window_name, focused FROM frames_fts WHERE rowid = ?",
+        let fts_data: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT rowid, browser_url, app_name, window_name FROM frames_fts WHERE rowid = ?",
         )
         .bind(frame_id)
         .fetch_optional(&db.pool)
@@ -326,6 +338,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -337,6 +351,8 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -460,21 +476,20 @@ mod tests {
                 .await
                 .unwrap();
         println!("Raw frames in DB: {:?}", raw_frames);
-        // Check if OCR text is properly indexed in FTS
+        // Check if frames are properly indexed in FTS (ocr_text_fts was dropped)
         let ocr_fts_data: Vec<(i64, String)> =
-            sqlx::query_as("SELECT rowid, text FROM ocr_text_fts")
+            sqlx::query_as("SELECT id, full_text FROM frames_fts")
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();
-        println!("OCR FTS data: {:?}", ocr_fts_data);
+        println!("Frames FTS data (full_text): {:?}", ocr_fts_data);
 
         // check if frames_fts is properly indexed
-        let frame_fts_data: Vec<(i64, String, String, String, bool)> = sqlx::query_as(
-            "SELECT id, browser_url, app_name, window_name, focused FROM frames_fts",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .unwrap();
+        let frame_fts_data: Vec<(i64, String, String, String)> =
+            sqlx::query_as("SELECT id, browser_url, app_name, window_name FROM frames_fts")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
         println!("Frames FTS data: {:?}", frame_fts_data);
 
         let insert_result = db
@@ -538,6 +553,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -563,6 +580,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -578,6 +597,8 @@ mod tests {
                 0,
                 Some(mid_time),
                 Some(end_time),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -615,6 +636,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -629,6 +652,8 @@ mod tests {
                 0,
                 Some(start_time),
                 Some(end_time),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -756,6 +781,8 @@ mod tests {
                 0,
                 Some(mid_time),
                 Some(end_time),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1249,6 +1276,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1277,6 +1306,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1302,6 +1333,8 @@ mod tests {
                 None,
                 None,
                 Some("test_video"),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1387,24 +1420,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Insert accessibility data (replaces legacy ui_monitoring table)
-        sqlx::query(
-            r#"
-            INSERT INTO accessibility (
-                text_content,
-                timestamp,
-                app_name,
-                window_name
-            ) VALUES (?, ?, ?, ?)
-            "#,
-        )
-        .bind("Hello from UI")
-        .bind(Utc::now())
-        .bind("test_app")
-        .bind("test_window")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        // Insert accessibility data
+        db.insert_accessibility_text("test_app", "test_window", "Hello from UI", None)
+            .await
+            .unwrap();
 
         // Test count with All content types
         let count = db
@@ -1518,17 +1537,10 @@ mod tests {
         }
     }
 
-    /// Manually index accessibility rows into FTS for tests.
-    /// The background FTS indexer doesn't run in tests, so we do it inline.
-    async fn index_accessibility_fts(db: &DatabaseManager) {
-        sqlx::query(
-            "INSERT OR IGNORE INTO accessibility_fts(rowid, text_content, app_name, window_name) \
-             SELECT id, text_content, COALESCE(app_name, ''), COALESCE(window_name, '') \
-             FROM accessibility WHERE text_content IS NOT NULL AND text_content != ''",
-        )
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    /// No-op: accessibility and accessibility_fts tables were dropped by migration.
+    /// Kept as a stub so existing call sites don't need to be removed.
+    async fn index_accessibility_fts(_db: &DatabaseManager) {
+        // Tables dropped — nothing to index.
     }
 
     // =========================================================================
@@ -1556,6 +1568,8 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1663,6 +1677,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1677,6 +1693,8 @@ mod tests {
                 0,
                 Some(mid),
                 Some(after),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1732,6 +1750,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1760,6 +1780,8 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1804,6 +1826,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1826,6 +1850,8 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1875,6 +1901,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1907,6 +1935,8 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,

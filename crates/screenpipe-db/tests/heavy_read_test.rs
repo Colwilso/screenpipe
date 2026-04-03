@@ -16,17 +16,18 @@ use tokio::task::JoinSet;
 
 /// Open the real production DB in read-only mode
 async fn open_real_db() -> Arc<DatabaseManager> {
-    let db_path = dirs::home_dir()
-        .unwrap()
-        .join(".screenpipe")
-        .join("db.sqlite");
+    let db_path = screenpipe_core::paths::default_screenpipe_data_dir().join("db.sqlite");
 
     if !db_path.exists() {
         panic!("No DB found at {:?} — skip this test", db_path);
     }
 
     let db_url = format!("sqlite:{}", db_path.display());
-    Arc::new(DatabaseManager::new(&db_url).await.unwrap())
+    Arc::new(
+        DatabaseManager::new(&db_url, Default::default())
+            .await
+            .unwrap(),
+    )
 }
 
 /// Simulate the pipe scenario: fire 4 heavy OCR searches concurrently
@@ -57,6 +58,8 @@ async fn test_concurrent_ocr_searches_dont_starve_pool() {
                     None,
                     None,
                     None, // no max_length — worst case
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -143,6 +146,8 @@ async fn test_search_completes_within_timeout() {
             0,
             Some(one_hour_ago),
             Some(now),
+            None,
+            None,
             None,
             None,
             None,

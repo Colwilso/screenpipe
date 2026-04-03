@@ -21,7 +21,6 @@ import {
   migrateFromStoreBin,
 } from "@/lib/chat-storage";
 
-const PI_CHAT_SESSION = "chat";
 
 // --- Types (mirrored from standalone-chat.tsx) ---
 
@@ -47,6 +46,8 @@ export interface Message {
   images?: string[];
   timestamp: number;
   contentBlocks?: ContentBlock[];
+  model?: string;
+  provider?: string;
 }
 
 // --- Hook options ---
@@ -65,6 +66,7 @@ interface UseChatConversationsOpts {
   piMessageIdRef: MutableRefObject<string | null>;
   piContentBlocksRef: MutableRefObject<ContentBlock[]>;
   piSessionSyncedRef: MutableRefObject<boolean>;
+  piSessionIdRef: MutableRefObject<string>;
   setIsLoading: Dispatch<SetStateAction<boolean>>;
   setIsStreaming: Dispatch<SetStateAction<boolean>>;
   setPastedImages: Dispatch<SetStateAction<string[]>>;
@@ -86,6 +88,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     piMessageIdRef,
     piContentBlocksRef,
     piSessionSyncedRef,
+    piSessionIdRef,
     setIsLoading,
     setIsStreaming,
     setPastedImages,
@@ -166,6 +169,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           timestamp: m.timestamp,
           ...(blocks?.length ? { contentBlocks: blocks } : {}),
           ...(m.images?.length ? { images: m.images } : {}),
+          ...(m.model ? { model: m.model } : {}),
+          ...(m.provider ? { provider: m.provider } : {}),
         };
       }),
       createdAt: existing?.createdAt ?? Date.now(),
@@ -200,12 +205,16 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   };
 
   // ---- Auto-save conversation when a response completes (isLoading transitions from true to false) ----
-  // Skip saving pipe watch conversations — they're transient, not user-initiated chats
+  // Skip saving live pipe watch conversations (transient, streaming from pipe_event).
+  // But DO save pipe execution conversations that the user has loaded and is chatting in
+  // (they have a conversationId and user-typed messages without pipe- IDs).
   const prevIsLoadingRef = useRef(false);
   useEffect(() => {
     if (prevIsLoadingRef.current && !isLoading && messages.length > 0) {
-      const isPipeWatch = messages.some((m) => m.id?.startsWith("pipe-"));
-      if (!isPipeWatch) {
+      // Only skip if ALL messages are pipe-generated (live watch).
+      // If the user has typed follow-up messages, some won't have pipe- IDs → save.
+      const allPipe = messages.every((m) => m.id?.startsWith("pipe-"));
+      if (!allPipe) {
         saveConversation(messages);
       }
     }
@@ -243,10 +252,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
 
   // ---- loadConversation ----
   const loadConversation = async (conv: ChatConversation) => {
-    // Abort any ongoing Pi processing before switching
+    // Abort any ongoing Pi processing on the current session before switching
     if (isLoading || isStreaming) {
       try {
-        await commands.piAbort(PI_CHAT_SESSION);
+        await commands.piAbort(piSessionIdRef.current);
       } catch (e) {
         console.warn("[Pi] Failed to abort:", e);
       }
@@ -256,6 +265,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       setIsLoading(false);
       setIsStreaming(false);
     }
+
+    // Switch to this conversation's session — each conversation is its own Pi process
+    piSessionIdRef.current = conv.id;
 
     // Load full conversation from file (conv from list may be metadata-only)
     const { loadConversationFile } = await import("@/lib/chat-storage");
@@ -268,6 +280,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       timestamp: m.timestamp,
       ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
       ...((m as any).images?.length ? { images: (m as any).images } : (m as any).image ? { images: [(m as any).image] } : {}),
+      ...((m as any).model ? { model: (m as any).model } : {}),
+      ...((m as any).provider ? { provider: (m as any).provider } : {}),
     })));
     setConversationId(full.id);
     setShowHistory(false);
@@ -294,16 +308,12 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   };
 
   // ---- startNewConversation ----
+  // Assigns a fresh session ID so the next message starts a brand-new Pi
+  // process. The old session stays alive (backend evicts LRU when > 4).
+  // No kill/restart needed — true multi-session means each conversation
+  // has its own process that persists across conversation switches.
   const startNewConversation = async () => {
-    // If Pi is running and idle (not busy), just reset the session
-    if (piInfo?.running && !isLoading && !isStreaming) {
-      try {
-        await commands.piNewSession(PI_CHAT_SESSION);
-      } catch (e) {
-        console.warn("[Pi] Failed to reset session:", e);
-      }
-    }
-    // Clear frontend state (Pi kill+restart is handled by the caller when busy)
+    // Clear frontend state
     piStreamingTextRef.current = "";
     piMessageIdRef.current = null;
     piContentBlocksRef.current = [];
@@ -315,6 +325,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     if (inputRef.current) inputRef.current.style.height = "auto";
     setShowHistory(false);
     setPastedImages([]);
+
+    // New session ID — Pi will be started fresh when the first message is sent
+    piSessionIdRef.current = crypto.randomUUID();
     piSessionSyncedRef.current = true;
   };
 

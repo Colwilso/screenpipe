@@ -17,7 +17,80 @@ use crate::{
     device::device_manager::DeviceManager,
 };
 
+#[cfg(target_os = "windows")]
+use crate::core::device::default_communications_output_device;
+
+/// Check if a device name is a legacy per-display output device name
+/// (e.g., "Display 1 (output)", "Display 3 (output)") that should be
+/// migrated to the canonical "System Audio (output)" name.
+#[cfg(target_os = "macos")]
+fn is_legacy_display_output(device_name: &str) -> bool {
+    device_name.contains("Display") && device_name.contains("(output)")
+}
+
 use super::{AudioManager, AudioManagerStatus};
+
+/// Exponential backoff for output device recovery.
+///
+/// Transient errors (e.g., ScreenCaptureKit not yet initialized) use a short
+/// ceiling (8s) so recovery is fast when the system is just slow to start.
+///
+/// Permanent errors (e.g., no display device exists) use a long ceiling (120s)
+/// to avoid spamming logs when recovery is impossible until hardware changes.
+struct OutputRecoveryBackoff {
+    attempts: u32,
+    is_permanent: bool,
+    last_attempt: Instant,
+}
+
+impl OutputRecoveryBackoff {
+    const TRANSIENT_MAX_SECS: u64 = 8;
+    const PERMANENT_MAX_SECS: u64 = 120;
+
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            is_permanent: false,
+            // Set to epoch-ish so the first check always fires.
+            // Use checked_sub to avoid panic on Windows when uptime < 3600s
+            // (Instant - Duration panics if result would be before boot time).
+            last_attempt: Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or(Instant::now()),
+        }
+    }
+
+    fn record_failure(&mut self, permanent: bool) {
+        self.attempts += 1;
+        self.is_permanent = permanent;
+    }
+
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.is_permanent = false;
+    }
+
+    fn next_delay_secs(&self) -> u64 {
+        if self.attempts == 0 {
+            return 0;
+        }
+        let cap = if self.is_permanent {
+            Self::PERMANENT_MAX_SECS
+        } else {
+            Self::TRANSIENT_MAX_SECS
+        };
+        // 2^min(attempts, 10) capped at the ceiling
+        let exp = 2u64.saturating_pow(self.attempts.min(10));
+        exp.min(cap)
+    }
+}
+
+/// Returns true if the error from `default_output_device()` indicates a
+/// permanent condition that won't resolve without hardware changes.
+fn is_permanent_output_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("no display audio device found")
+}
 
 lazy_static::lazy_static! {
   pub static ref DEVICE_MONITOR: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
@@ -27,6 +100,9 @@ lazy_static::lazy_static! {
 struct SystemDefaultTracker {
     last_input: Option<String>,
     last_output: Option<String>,
+    /// Windows only: the eCommunications default output (e.g. USB headset for Teams/Zoom)
+    #[cfg(target_os = "windows")]
+    last_communications_output: Option<String>,
 }
 
 impl SystemDefaultTracker {
@@ -34,6 +110,8 @@ impl SystemDefaultTracker {
         Self {
             last_input: None,
             last_output: None,
+            #[cfg(target_os = "windows")]
+            last_communications_output: None,
         }
     }
 
@@ -60,6 +138,21 @@ impl SystemDefaultTracker {
             None
         }
     }
+
+    /// Windows: check if the eCommunications default output changed.
+    /// Returns Some(name) when the communications device differs from the
+    /// multimedia default AND has changed since last check.
+    #[cfg(target_os = "windows")]
+    fn check_communications_output_changed(&mut self) -> Option<String> {
+        let current = default_communications_output_device().map(|d| d.to_string());
+        if current != self.last_communications_output {
+            let changed = current.clone();
+            self.last_communications_output = current;
+            changed
+        } else {
+            None
+        }
+    }
 }
 
 pub async fn start_device_monitor(
@@ -75,7 +168,7 @@ pub async fn start_device_monitor(
         // Track devices that repeatedly fail to start so we don't spam errors
         // every 2 seconds. After a failure, back off for increasing durations.
         let mut failed_devices: HashMap<String, (u32, Instant)> = HashMap::new();
-        let mut no_output_retry_count: u32 = 0;
+        let mut output_recovery_backoff = OutputRecoveryBackoff::new();
         let mut no_input_retry_count: u32 = 0;
 
         // Central handler restart cooldown: max 3 restarts in a 5-minute window
@@ -85,6 +178,19 @@ pub async fn start_device_monitor(
         // Initialize tracker with current defaults
         let _ = default_tracker.check_input_changed();
         let _ = default_tracker.check_output_changed().await;
+        #[cfg(target_os = "windows")]
+        let _ = default_tracker.check_communications_output_changed();
+
+        // One-time flag: on first loop iteration, verify running devices match
+        // system defaults. Handles the case where the app restarts while a USB
+        // headset (e.g. Jabra) is already the system default — since it's not a
+        // "change", check_output_changed() won't fire, and the builder may have
+        // started different devices from saved config.
+        let mut needs_initial_sync = true;
+
+        // One-time migration flag for legacy "Display N (output)" device names
+        #[cfg(target_os = "macos")]
+        let mut legacy_migrated = false;
 
         loop {
             if audio_manager.status().await == AudioManagerStatus::Running {
@@ -94,8 +200,157 @@ pub async fn start_device_monitor(
                 }
                 let enabled_devices = audio_manager.enabled_devices().await;
 
+                // Migrate legacy "Display N (output)" device names to "System Audio (output)".
+                // This handles upgrades from versions that tracked per-display output devices.
+                #[cfg(target_os = "macos")]
+                if !legacy_migrated {
+                    legacy_migrated = true;
+                    let legacy_outputs: Vec<String> = enabled_devices
+                        .iter()
+                        .filter(|name| is_legacy_display_output(name))
+                        .cloned()
+                        .collect();
+                    if !legacy_outputs.is_empty() {
+                        let canonical = format!(
+                            "{} (output)",
+                            crate::core::device::MACOS_OUTPUT_AUDIO_DEVICE_NAME
+                        );
+                        info!(
+                            "[DEVICE_RECOVERY] migrating legacy output devices {:?} → {}",
+                            legacy_outputs, canonical
+                        );
+                        for legacy_name in &legacy_outputs {
+                            let _ = audio_manager.stop_device(legacy_name).await;
+                        }
+                        if let Ok(device) = parse_audio_device(&canonical) {
+                            let _ = audio_manager.start_device(&device).await;
+                        }
+                    }
+                }
+
                 // Handle "Follow System Default" mode
                 if audio_manager.use_system_default_audio().await {
+                    // Initial sync: verify running devices match system defaults.
+                    // This fires once on startup to catch mismatches where the
+                    // builder started devices from saved config that don't match
+                    // the current system default (e.g. USB headset was plugged in
+                    // before launch but saved config has built-in speakers).
+                    if needs_initial_sync {
+                        needs_initial_sync = false;
+
+                        // Sync input device
+                        if let Ok(default_input) = default_input_device() {
+                            let default_input_name = default_input.to_string();
+                            let current = audio_manager.enabled_devices().await;
+                            let has_correct_input = current.contains(&default_input_name);
+
+                            if !has_correct_input {
+                                info!(
+                                    "[DEVICE_RECOVERY] initial sync: default input '{}' not active, switching",
+                                    default_input_name
+                                );
+                                // Stop all current input devices
+                                for device_name in current.iter() {
+                                    if let Ok(device) = parse_audio_device(device_name) {
+                                        if device.device_type == DeviceType::Input {
+                                            let _ = audio_manager.stop_device(device_name).await;
+                                        }
+                                    }
+                                }
+                                // Start the system default input
+                                match audio_manager.start_device(&default_input).await {
+                                    Ok(()) => {
+                                        info!(
+                                            "[DEVICE_RECOVERY] initial sync: started default input: {}",
+                                            default_input_name
+                                        );
+                                        default_tracker.last_input = Some(default_input_name);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] initial sync: failed to start default input {}: {}",
+                                            default_input_name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Sync output device (atomic swap: start new first)
+                        if let Ok(default_output) = default_output_device().await {
+                            let default_output_name = default_output.to_string();
+                            let current = audio_manager.enabled_devices().await;
+                            let has_correct_output = current.contains(&default_output_name);
+
+                            if !has_correct_output {
+                                info!(
+                                    "[DEVICE_RECOVERY] initial sync: default output '{}' not active, switching",
+                                    default_output_name
+                                );
+                                match audio_manager.start_device(&default_output).await {
+                                    Ok(()) => {
+                                        info!(
+                                            "[DEVICE_RECOVERY] initial sync: started default output: {}",
+                                            default_output_name
+                                        );
+                                        // Stop other output devices
+                                        for device_name in current.iter() {
+                                            if *device_name == default_output_name {
+                                                continue;
+                                            }
+                                            if let Ok(device) = parse_audio_device(device_name) {
+                                                if device.device_type == DeviceType::Output {
+                                                    info!(
+                                                        "[DEVICE_RECOVERY] initial sync: stopping non-default output: {}",
+                                                        device_name
+                                                    );
+                                                    let _ = audio_manager
+                                                        .stop_device(device_name)
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                        default_tracker.last_output = Some(default_output_name);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] initial sync: failed to start default output {}: {}",
+                                            default_output_name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Windows: also start the eCommunications output device if it
+                        // differs from the multimedia default. MS Teams/Zoom route call
+                        // audio to this endpoint (often a USB headset) while the
+                        // multimedia default might be a monitor or speakers.
+                        #[cfg(target_os = "windows")]
+                        if let Some(comm_device) = default_communications_output_device() {
+                            let comm_name = comm_device.to_string();
+                            let current = audio_manager.enabled_devices().await;
+                            if !current.contains(&comm_name) {
+                                match audio_manager.start_device(&comm_device).await {
+                                    Ok(()) => {
+                                        info!(
+                                            "[DEVICE_RECOVERY] initial sync: started communications output: {}",
+                                            comm_name
+                                        );
+                                        default_tracker.last_communications_output =
+                                            Some(comm_name);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] initial sync: failed to start communications output {}: {}",
+                                            comm_name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Check if system default input changed
                     if let Some(new_default_input) = default_tracker.check_input_changed() {
                         info!("system default input changed to: {}", new_default_input);
@@ -170,9 +425,16 @@ pub async fn start_device_monitor(
 
                         // Only stop old output devices if the new one started successfully
                         if new_started {
+                            // Don't stop the communications output device during swap
+                            #[cfg(target_os = "windows")]
+                            let comm_name = default_tracker.last_communications_output.clone();
                             for device_name in audio_manager.enabled_devices().await.iter() {
                                 if *device_name == new_default_output {
                                     continue; // don't stop the one we just started
+                                }
+                                #[cfg(target_os = "windows")]
+                                if comm_name.as_deref() == Some(device_name.as_str()) {
+                                    continue; // don't stop the communications device
                                 }
                                 if let Ok(device) = parse_audio_device(device_name) {
                                     if device.device_type == DeviceType::Output {
@@ -181,6 +443,49 @@ pub async fn start_device_monitor(
                                             device_name
                                         );
                                         let _ = audio_manager.stop_device(device_name).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Windows: check if the eCommunications output device changed.
+                    // This captures call audio from Teams/Zoom/etc. that routes to
+                    // the communications endpoint (often a USB headset).
+                    #[cfg(target_os = "windows")]
+                    {
+                        let old_comm = default_tracker.last_communications_output.clone();
+                        if let Some(new_comm_output) =
+                            default_tracker.check_communications_output_changed()
+                        {
+                            info!(
+                                "[DEVICE_RECOVERY] communications output changed to: {}",
+                                new_comm_output
+                            );
+
+                            // Stop the previous communications device if it's not the multimedia default
+                            if let Some(ref old_name) = old_comm {
+                                if default_tracker.last_output.as_deref() != Some(old_name.as_str())
+                                {
+                                    let _ = audio_manager.stop_device(old_name).await;
+                                }
+                            }
+
+                            // Start the new communications device
+                            if let Ok(new_device) = parse_audio_device(&new_comm_output) {
+                                failed_devices.remove(&new_comm_output);
+                                match audio_manager.start_device(&new_device).await {
+                                    Ok(()) => {
+                                        info!(
+                                            "[DEVICE_RECOVERY] started new communications output: {}",
+                                            new_comm_output
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] failed to start communications output {}: {}",
+                                            new_comm_output, e
+                                        );
                                     }
                                 }
                             }
@@ -240,8 +545,6 @@ pub async fn start_device_monitor(
                     // Ensure an output device is actually running.
                     // Handles the case where ScreenCaptureKit wasn't ready at startup
                     // or output device was lost during a device change.
-                    // CRITICAL: No backoff here — missing output audio is unacceptable
-                    // during calls. We retry every 2s (each loop iteration).
                     {
                         let current_enabled = audio_manager.enabled_devices().await;
                         let has_output = current_enabled.iter().any(|name| {
@@ -251,41 +554,61 @@ pub async fn start_device_monitor(
                         });
 
                         if !has_output {
-                            no_output_retry_count += 1;
-                            match default_output_device().await {
-                                Ok(default_output) => {
-                                    let device_name = default_output.to_string();
-                                    // No backoff — always retry immediately when zero output devices
-                                    warn!(
-                                        "[DEVICE_RECOVERY] no output device running (attempt {}), starting default: {}",
-                                        no_output_retry_count, device_name
-                                    );
-                                    match audio_manager.start_device(&default_output).await {
-                                        Ok(()) => {
-                                            failed_devices.remove(&device_name);
-                                            default_tracker.last_output = Some(device_name.clone());
-                                            no_output_retry_count = 0;
-                                            info!(
-                                                "[DEVICE_RECOVERY] output device restored, device={}", device_name
-                                            );
+                            // Apply backoff: skip this cycle if we haven't waited long enough.
+                            // Transient errors (SCK not ready) use short backoff (2-8s).
+                            // Permanent errors (no display) use longer backoff (up to 120s).
+                            let backoff_secs = output_recovery_backoff.next_delay_secs();
+                            let elapsed = output_recovery_backoff.last_attempt.elapsed();
+                            if elapsed < Duration::from_secs(backoff_secs) {
+                                // Still within backoff window — skip this cycle
+                            } else {
+                                output_recovery_backoff.last_attempt = Instant::now();
+                                match default_output_device().await {
+                                    Ok(default_output) => {
+                                        let device_name = default_output.to_string();
+                                        info!(
+                                            "[DEVICE_RECOVERY] no output device running (attempt {}), starting default: {}",
+                                            output_recovery_backoff.attempts, device_name
+                                        );
+                                        match audio_manager.start_device(&default_output).await {
+                                            Ok(()) => {
+                                                failed_devices.remove(&device_name);
+                                                default_tracker.last_output =
+                                                    Some(device_name.clone());
+                                                output_recovery_backoff.reset();
+                                                info!(
+                                                    "[DEVICE_RECOVERY] output device restored, device={}", device_name
+                                                );
+                                            }
+                                            Err(e) => {
+                                                output_recovery_backoff.record_failure(false);
+                                                warn!(
+                                                    "[DEVICE_RECOVERY] failed to start output device {} (attempt {}, next retry in {}s): {}",
+                                                    device_name, output_recovery_backoff.attempts,
+                                                    output_recovery_backoff.next_delay_secs(), e
+                                                );
+                                            }
                                         }
-                                        Err(e) => {
+                                    }
+                                    Err(e) => {
+                                        let is_permanent = is_permanent_output_error(&e);
+                                        output_recovery_backoff.record_failure(is_permanent);
+                                        if output_recovery_backoff.attempts <= 3
+                                            || output_recovery_backoff.attempts % 30 == 0
+                                        {
+                                            // Log first 3 attempts, then every 30th to avoid spam
                                             warn!(
-                                                "[DEVICE_RECOVERY] failed to start output device {} (attempt {}): {}",
-                                                device_name, no_output_retry_count, e
+                                                "[DEVICE_RECOVERY] no output device available (attempt {}, {}, next retry in {}s): {}",
+                                                output_recovery_backoff.attempts,
+                                                if is_permanent { "permanent" } else { "transient" },
+                                                output_recovery_backoff.next_delay_secs(), e
                                             );
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "[DEVICE_RECOVERY] no output device running and default_output_device() failed (attempt {}): {}",
-                                        no_output_retry_count, e
-                                    );
-                                }
                             }
                         } else {
-                            no_output_retry_count = 0;
+                            output_recovery_backoff.reset();
                         }
                     }
                 }
@@ -488,6 +811,95 @@ mod tests {
         cd.record_restart();
         cd.record_restart(); // exhausted
         assert!(cd.record_restart()); // still exhausted
+    }
+
+    // --- OutputRecoveryBackoff tests ---
+
+    #[test]
+    fn test_backoff_initial_state() {
+        let b = OutputRecoveryBackoff::new();
+        assert_eq!(b.attempts, 0);
+        assert!(!b.is_permanent);
+        assert_eq!(b.next_delay_secs(), 0); // no delay on first try
+    }
+
+    #[test]
+    fn test_backoff_transient_capped_at_8s() {
+        let mut b = OutputRecoveryBackoff::new();
+        // Simulate transient failures
+        b.record_failure(false); // attempt 1 → 2^1 = 2s
+        assert_eq!(b.next_delay_secs(), 2);
+        b.record_failure(false); // attempt 2 → 2^2 = 4s
+        assert_eq!(b.next_delay_secs(), 4);
+        b.record_failure(false); // attempt 3 → 2^3 = 8s (cap)
+        assert_eq!(b.next_delay_secs(), 8);
+        b.record_failure(false); // attempt 4 → still 8s (capped)
+        assert_eq!(b.next_delay_secs(), 8);
+    }
+
+    #[test]
+    fn test_backoff_permanent_capped_at_120s() {
+        let mut b = OutputRecoveryBackoff::new();
+        b.record_failure(true); // 2s
+        assert_eq!(b.next_delay_secs(), 2);
+        b.record_failure(true); // 4s
+        assert_eq!(b.next_delay_secs(), 4);
+        b.record_failure(true); // 8s
+        assert_eq!(b.next_delay_secs(), 8);
+        b.record_failure(true); // 16s
+        assert_eq!(b.next_delay_secs(), 16);
+        b.record_failure(true); // 32s
+        assert_eq!(b.next_delay_secs(), 32);
+        b.record_failure(true); // 64s
+        assert_eq!(b.next_delay_secs(), 64);
+        b.record_failure(true); // 120s (capped, not 128)
+        assert_eq!(b.next_delay_secs(), 120);
+        b.record_failure(true); // still 120s
+        assert_eq!(b.next_delay_secs(), 120);
+    }
+
+    #[test]
+    fn test_backoff_reset_clears_state() {
+        let mut b = OutputRecoveryBackoff::new();
+        b.record_failure(true);
+        b.record_failure(true);
+        b.record_failure(true);
+        assert_eq!(b.attempts, 3);
+        assert!(b.is_permanent);
+
+        b.reset();
+        assert_eq!(b.attempts, 0);
+        assert!(!b.is_permanent);
+        assert_eq!(b.next_delay_secs(), 0);
+    }
+
+    #[test]
+    fn test_backoff_transient_then_permanent_escalates() {
+        let mut b = OutputRecoveryBackoff::new();
+        b.record_failure(false); // transient
+        b.record_failure(false); // transient, 4s
+        assert_eq!(b.next_delay_secs(), 4); // capped at transient max
+
+        b.record_failure(true); // now permanent — cap goes to 120s
+        assert_eq!(b.next_delay_secs(), 8); // 2^3 = 8, under 120 cap
+        b.record_failure(true);
+        assert_eq!(b.next_delay_secs(), 16);
+    }
+
+    #[test]
+    fn test_is_permanent_output_error() {
+        let permanent = anyhow::anyhow!(
+            "ScreenCaptureKit available but no display audio device found — \
+             output audio capture requires a display device"
+        );
+        assert!(is_permanent_output_error(&permanent));
+
+        let transient =
+            anyhow::anyhow!("ScreenCaptureKit unavailable for output audio capture: timeout");
+        assert!(!is_permanent_output_error(&transient));
+
+        let other = anyhow::anyhow!("some random error");
+        assert!(!is_permanent_output_error(&other));
     }
 
     #[test]

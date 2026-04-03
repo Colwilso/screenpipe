@@ -9,7 +9,6 @@ import {
 } from "@tauri-apps/plugin-notification";
 
 import { listen } from "@tauri-apps/api/event";
-import { useSettings } from "@/lib/hooks/use-settings";
 import { showNotificationPanel } from "@/lib/hooks/use-notification-panel";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 
@@ -18,11 +17,7 @@ type NotificationRequested = {
   body: string;
 };
 
-const PIPE_SUGGESTION_KEY = "lastPipeSuggestionNotif";
-const STARTUP_DELAY_MS = 30 * 60 * 1000; // 30 minutes after app start
-
 const NotificationHandler: React.FC = () => {
-  const { settings, isSettingsLoaded } = useSettings();
 
   useEffect(() => {
     const checkAndRequestPermission = async () => {
@@ -53,9 +48,20 @@ const NotificationHandler: React.FC = () => {
         console.log(
           `notification requested ${event.payload.title} ${event.payload.body}`
         );
-        sendNotification({
+        // Use in-app notification panel instead of OS notifications
+        showNotificationPanel({
+          id: `legacy-${Date.now()}`,
+          type: "general",
           title: event.payload.title,
           body: event.payload.body,
+          actions: [],
+          autoDismissMs: 20000,
+        }).catch(() => {
+          // Fallback to OS notification if panel fails
+          sendNotification({
+            title: event.payload.title,
+            body: event.payload.body,
+          });
         });
       });
     };
@@ -63,41 +69,158 @@ const NotificationHandler: React.FC = () => {
     checkAndRequestPermission();
   }, []);
 
-  // pipe suggestion notification
+
+  // Save notification history + PostHog tracking when native panel is shown (macOS)
   useEffect(() => {
-    if (!isSettingsLoaded) return;
-
-    const enabled = settings.pipeSuggestionsEnabled !== false; // default true
-    if (!enabled) return;
-
-    const frequencyMs = (settings.pipeSuggestionFrequencyHours || 24) * 60 * 60 * 1000;
-
-    const timer = setTimeout(async () => {
+    const unlisten = listen<string>("native-notification-shown", async (event) => {
       try {
-        const lastShown = localStorage?.getItem(PIPE_SUGGESTION_KEY);
-        if (lastShown && Date.now() - parseInt(lastShown, 10) < frequencyMs) {
+        const data = JSON.parse(event.payload);
+        // PostHog analytics (same as webview panel)
+        const posthog = (await import("posthog-js")).default;
+        posthog.capture("notification_shown", { type: data.type, id: data.id });
+
+        // Save to notification history (same as webview panel, max 100 entries)
+        const localforage = (await import("localforage")).default;
+        const history = await localforage.getItem<any[]>("notification-history") || [];
+        const entry = {
+          id: data.id,
+          type: data.type,
+          title: data.title,
+          body: data.body,
+          pipe_name: data.pipe_name,
+          timestamp: new Date().toISOString(),
+          read: false,
+        };
+        const updated = [entry, ...history].slice(0, 100);
+        await localforage.setItem("notification-history", updated);
+      } catch (e) {
+        console.error("failed to save native notification history:", e);
+      }
+    });
+    return () => { unlisten.then((u) => u()); };
+  }, []);
+
+  // Handle actions from native SwiftUI notification panel (macOS)
+  useEffect(() => {
+    const unlisten = listen<string>("native-notification-action", async (event) => {
+      try {
+        const action = JSON.parse(event.payload);
+        console.log("native notification action:", action);
+
+        // PostHog tracking for dismiss/action (mirrors webview panel)
+        const posthog = (await import("posthog-js")).default;
+        if (action.type === "dismiss" || action.type === "auto_dismiss") {
+          posthog.capture("notification_dismissed", { auto: action.type === "auto_dismiss" });
+          return;
+        }
+        posthog.capture("notification_action", { action: action.action, actionType: action.type });
+
+        if (action.type === "manage") {
+          const { emit } = await import("@tauri-apps/api/event");
+          const { invoke } = await import("@tauri-apps/api/core");
+          // Show window first, then navigate after a brief delay so the
+          // home window's listener is mounted and ready to receive the event
+          try { await invoke("show_window", { window: { Home: { page: null } } }); } catch {}
+          await new Promise((r) => setTimeout(r, 300));
+          await emit("navigate", { url: "/home?section=notifications" });
           return;
         }
 
-        await showNotificationPanel({
-          id: "pipe-suggestion",
-          type: "pipe-suggestion",
-          title: "automate something today",
-          body: "AI can suggest pipes based on what you've been doing — click to explore ideas",
-          actions: [
-            { label: "show me ideas", action: "open_pipe_suggestions", primary: true },
-          ],
-          autoDismissMs: 30000,
-        });
+        if (action.type === "mute" && action.pipe_name) {
+          const localforage = (await import("localforage")).default;
+          const raw = await localforage.getItem<string>("screenpipe-settings");
+          const settings = raw ? JSON.parse(raw) : {};
+          const prefs = settings.notificationPrefs || {
+            captureStalls: true, appUpdates: true,
+            pipeSuggestions: true, pipeNotifications: true, mutedPipes: [],
+          };
+          if (!prefs.mutedPipes.includes(action.pipe_name)) {
+            prefs.mutedPipes.push(action.pipe_name);
+          }
+          settings.notificationPrefs = prefs;
+          await localforage.setItem("screenpipe-settings", JSON.stringify(settings));
+          return;
+        }
 
-        localStorage?.setItem(PIPE_SUGGESTION_KEY, Date.now().toString());
-      } catch {
-        // ignore
+        // Forward pipe/api/deeplink actions
+        if (action.type === "pipe" && action.pipe) {
+          if (action.open_in_chat) {
+            const contextStr = action.context ? JSON.stringify(action.context, null, 2) : "";
+            await showChatWithPrefill({
+              context: `run pipe "${action.pipe}" with this context:\n${contextStr}`,
+              prompt: `run the ${action.pipe} pipe${action.context ? " with the provided context" : ""}`,
+              autoSend: true,
+              source: `notification-native`,
+            });
+          } else {
+            await fetch(`http://localhost:3030/pipes/${action.pipe}/run`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ notification_context: action.context }),
+            });
+          }
+          return;
+        }
+
+        if (action.type === "api" && action.url) {
+          await fetch(`http://localhost:3030${action.url}`, {
+            method: action.method || "POST",
+            headers: { "Content-Type": "application/json" },
+            body: action.body ? JSON.stringify(action.body) : undefined,
+          });
+          return;
+        }
+
+        if (action.type === "deeplink" && action.url) {
+          if (action.url.startsWith("screenpipe://")) {
+            const { emit } = await import("@tauri-apps/api/event");
+            await emit("deep-link-received", action.url);
+          } else {
+            const { open } = await import("@tauri-apps/plugin-shell");
+            await open(action.url);
+          }
+          return;
+        }
+
+        // Legacy string actions
+        const { invoke } = await import("@tauri-apps/api/core");
+        if (action.action === "open_timeline") {
+          await invoke("show_window", { window: "Main" });
+        } else if (action.action === "open_chat") {
+          await invoke("show_window", { window: "Chat" });
+        } else if (action.action === "open_pipe_suggestions") {
+          await showChatWithPrefill({
+            context: PIPE_SUGGESTION_PROMPT,
+            prompt: "what pipes should i create based on my recent activity?",
+            autoSend: true,
+            source: "pipe-suggestion-notification",
+          });
+        } else if (action.action === "restart_recording") {
+          try {
+            try { await invoke("stop_screenpipe"); } catch {}
+            await new Promise((r) => setTimeout(r, 2000));
+            await invoke("spawn_screenpipe");
+            // Poll health endpoint to confirm restart
+            for (let i = 0; i < 15; i++) {
+              await new Promise((r) => setTimeout(r, 1000));
+              try {
+                const res = await fetch("http://localhost:3030/health");
+                if (res.ok) break;
+              } catch {}
+            }
+          } catch (e) {
+            console.error("restart_recording failed:", e);
+          }
+        }
+      } catch (e) {
+        console.error("failed to handle native notification action:", e);
       }
-    }, STARTUP_DELAY_MS);
+    });
 
-    return () => clearTimeout(timer);
-  }, [isSettingsLoaded, settings.pipeSuggestionsEnabled, settings.pipeSuggestionFrequencyHours]);
+    return () => {
+      unlisten.then((u) => u());
+    };
+  }, []);
 
   // listen for pipe suggestion action from notification panel
   useEffect(() => {

@@ -4,6 +4,7 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { apiCache } from "@/lib/cache";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,9 +12,11 @@ import { Label } from "@/components/ui/label";
 import { Download, ExternalLink, Check, Loader2, Copy, Terminal, LogIn, LogOut, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { commands } from "@/lib/utils/tauri";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { Command } from "@tauri-apps/plugin-shell";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { message } from "@tauri-apps/plugin-dialog";
 import { writeFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
@@ -24,6 +27,8 @@ import { CalendarCard } from "./calendar-card";
 import { GoogleCalendarCard } from "./google-calendar-card";
 import { IcsCalendarCard } from "./ics-calendar-card";
 import { OpenClawCard } from "./openclaw-card";
+import { BrowserUrlCard } from "./browser-url-card";
+import { VoiceMemosCard } from "./voice-memos-card";
 
 // ---------------------------------------------------------------------------
 // Utility functions (unchanged)
@@ -163,7 +168,8 @@ function CursorLogo({ className }: { className?: string }) {
   );
 }
 
-function IntegrationIcon({ icon }: { icon: string }) {
+
+export function IntegrationIcon({ icon }: { icon: string }) {
   const icons: Record<string, React.ReactNode> = {
     claude: <ClaudeLogo />,
     cursor: <CursorLogo className="w-5 h-5 rounded" />,
@@ -207,6 +213,7 @@ function IntegrationIcon({ icon }: { icon: string }) {
       </svg>
     ),
     anythingllm: <img src="/images/anythingllm.png" alt="AnythingLLM" className="w-5 h-5 rounded" />,
+    msty: <img src="/images/msty.webp" alt="Msty" className="w-5 h-5 rounded" />,
     ollama: <img src="/images/ollama.png" alt="Ollama" className="w-5 h-5 rounded" />,
     lmstudio: <img src="/images/lmstudio.png" alt="LM Studio" className="w-5 h-5 rounded" />,
     whatsapp: <img src="/images/whatsapp.svg" alt="WhatsApp" className="w-5 h-5" />,
@@ -221,6 +228,53 @@ function IntegrationIcon({ icon }: { icon: string }) {
     n8n: <img src="/images/n8n.png" alt="n8n" className="w-5 h-5 rounded" />,
     make: <img src="/images/make.png" alt="Make" className="w-5 h-5 rounded" />,
     zapier: <img src="/images/zapier.png" alt="Zapier" className="w-5 h-5 rounded" />,
+    github: <img src="/images/github.png" alt="GitHub" className="w-5 h-5 rounded" />,
+    jira: <img src="/images/jira.png" alt="Jira" className="w-5 h-5 rounded" />,
+    hubspot: <img src="/images/hubspot.png" alt="HubSpot" className="w-5 h-5 rounded" />,
+    airtable: <img src="/images/airtable.png" alt="Airtable" className="w-5 h-5 rounded" />,
+    limitless: <img src="/images/limitless.svg" alt="Limitless" className="w-5 h-5" />,
+    logseq: <img src="/images/logseq.png" alt="Logseq" className="w-5 h-5 rounded" />,
+    pushover: <img src="/images/pushover.png" alt="Pushover" className="w-5 h-5 rounded" />,
+    ntfy: <img src="/images/ntfy.png" alt="ntfy" className="w-5 h-5 rounded" />,
+    toggl: <img src="/images/toggl.png" alt="Toggl" className="w-5 h-5 rounded" />,
+    "browser-url": <img src="/images/browser-url.svg" alt="Browser URL" className="w-5 h-5 rounded" />,
+    "browser-extension": (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+      </svg>
+    ),
+    "voice-memos": <img src="/images/voice-memos.svg" alt="Voice Memos" className="w-5 h-5 rounded" />,
+    brex: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#F46A35">
+        <path d="M18.69 2.319a3.868 3.868 0 0 0-3.108 1.547l-.759 1.007a1.658 1.658 0 0 1-1.313.656H0V21.68h5.296a3.87 3.87 0 0 0 3.108-1.547l.759-1.006a1.656 1.656 0 0 1 1.313-.657H24V2.319h-5.31Zm1.108 11.949h-5.66a3.87 3.87 0 0 0-3.108 1.547l-.759 1.007a1.658 1.658 0 0 1-1.313.656H4.202V9.731h5.661a3.868 3.868 0 0 0 3.107-1.547l.759-1.006a1.658 1.658 0 0 1 1.313-.657h4.771l-.015 7.747Z"/>
+      </svg>
+    ),
+    stripe: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#635BFF">
+        <path d="M13.976 9.15c-2.172-.806-3.356-1.426-3.356-2.409 0-.831.683-1.305 1.901-1.305 2.227 0 4.515.858 6.09 1.631l.89-5.494C18.252.975 15.697 0 12.165 0 9.667 0 7.589.654 6.104 1.872 4.56 3.147 3.757 4.992 3.757 7.218c0 4.039 2.467 5.76 6.476 7.219 2.585.92 3.445 1.574 3.445 2.583 0 .98-.84 1.545-2.354 1.545-1.875 0-4.965-.921-6.99-2.109l-.9 5.555C5.175 22.99 8.385 24 11.714 24c2.641 0 4.843-.624 6.328-1.813 1.664-1.305 2.525-3.236 2.525-5.732 0-4.128-2.524-5.851-6.594-7.305h.003z"/>
+      </svg>
+    ),
+    sentry: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#362D59">
+        <path d="M13.91 2.505c-.873-1.448-2.972-1.448-3.844 0L6.904 7.92a15.478 15.478 0 0 1 8.53 12.811h-2.221A13.301 13.301 0 0 0 5.784 9.814l-2.926 5.06a7.65 7.65 0 0 1 4.435 5.848H2.194a.365.365 0 0 1-.298-.534l1.413-2.402a5.16 5.16 0 0 0-1.614-.913L.296 19.275a2.182 2.182 0 0 0 .812 2.999 2.24 2.24 0 0 0 1.086.288h6.983a9.322 9.322 0 0 0-3.845-8.318l1.11-1.922a11.47 11.47 0 0 1 4.95 10.24h5.915a17.242 17.242 0 0 0-7.885-15.28l2.244-3.845a.37.37 0 0 1 .504-.13c.255.14 9.75 16.708 9.928 16.9a.365.365 0 0 1-.327.543h-2.287c.029.612.029 1.223 0 1.831h2.297a2.206 2.206 0 0 0 1.922-3.31z"/>
+      </svg>
+    ),
+    vercel: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="currentColor">
+        <path d="m12 1.608 12 20.784H0Z"/>
+      </svg>
+    ),
+    pipedrive: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#017737">
+        <rect width="24" height="24" rx="4" fill="#017737"/>
+        <text x="12" y="17" textAnchor="middle" fill="#fff" fontSize="16" fontWeight="bold" fontFamily="sans-serif">P</text>
+      </svg>
+    ),
+    intercom: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#1F8DED">
+        <path d="M21 0H3C1.343 0 0 1.343 0 3v18c0 1.658 1.343 3 3 3h18c1.658 0 3-1.342 3-3V3c0-1.657-1.342-3-3-3zm-5.801 4.399c0-.44.36-.8.802-.8.44 0 .8.36.8.8v10.688c0 .442-.36.801-.8.801-.443 0-.802-.359-.802-.801V4.399zM11.2 3.994c0-.44.357-.799.8-.799s.8.359.8.799v11.602c0 .44-.357.8-.8.8s-.8-.36-.8-.8V3.994zm-4 .405c0-.44.359-.8.799-.8.443 0 .802.36.802.8v10.688c0 .442-.36.801-.802.801-.44 0-.799-.359-.799-.801V4.399zM3.199 6c0-.442.36-.8.802-.8.44 0 .799.358.799.8v7.195c0 .441-.359.8-.799.8-.443 0-.802-.36-.802-.8V6zM20.52 18.202c-.123.105-3.086 2.593-8.52 2.593-5.433 0-8.397-2.486-8.521-2.593-.335-.288-.375-.792-.086-1.128.285-.334.79-.375 1.125-.09.047.041 2.693 2.211 7.481 2.211 4.848 0 7.456-2.186 7.479-2.207.334-.289.839-.25 1.128.086.289.336.25.84-.086 1.128zm.281-5.007c0 .441-.36.8-.801.8-.441 0-.801-.36-.801-.8V6c0-.442.361-.8.801-.8.441 0 .801.357.801.8v7.195z"/>
+      </svg>
+    ),
   };
   return (
     <div className="w-10 h-10 bg-muted rounded-xl flex items-center justify-center">
@@ -272,6 +326,7 @@ function Tile({ tile, selected, onClick }: {
 function ClaudePanel({ onConnected }: { onConnected?: () => void }) {
   const [downloadState, setDownloadState] = useState<"idle" | "downloading" | "downloaded">("idle");
   const [versionInfo, setVersionInfo] = useState<McpVersionInfo>({ available: null, installed: null });
+  const [mcpbPath, setMcpbPath] = useState<string>("");
 
   useEffect(() => {
     Promise.all([
@@ -290,11 +345,12 @@ function ClaudePanel({ onConnected }: { onConnected?: () => void }) {
       if (!response.ok) throw new Error("failed to download .mcpb file");
       const data = new Uint8Array(await response.arrayBuffer());
       const tmp = await tempDir();
-      const mcpbPath = await join(tmp, "screenpipe.mcpb");
-      await writeFile(mcpbPath, data);
+      const filePath = await join(tmp, "screenpipe.mcpb");
+      await writeFile(filePath, data);
+      setMcpbPath(filePath);
       const os = platform();
-      if (os === "macos") await Command.create("open", [mcpbPath]).execute();
-      else if (os === "windows") await Command.create("cmd", ["/c", "start", "", mcpbPath]).execute();
+      if (os === "macos") await Command.create("open", [filePath]).execute();
+      else if (os === "windows") await Command.create("cmd", ["/c", "start", "", filePath]).execute();
       setDownloadState("downloaded");
       onConnected?.();
     } catch (error) {
@@ -335,8 +391,21 @@ function ClaudePanel({ onConnected }: { onConnected?: () => void }) {
         </Button>
       </div>
       {downloadState === "downloaded" && (
-        <div className="p-3 bg-muted border border-border rounded-lg">
+        <div className="p-3 bg-muted border border-border rounded-lg space-y-2">
           <p className="text-xs"><strong>connected!</strong> restart claude if it was running. try: &quot;what did I do in the last 5 minutes?&quot;</p>
+          <details className="text-xs text-muted-foreground">
+            <summary className="cursor-pointer hover:text-foreground">didn&apos;t work? troubleshooting steps</summary>
+            <ol className="mt-1.5 ml-4 list-decimal space-y-1">
+              <li>
+                <button className="underline hover:text-foreground" onClick={() => mcpbPath && revealItemInDir(mcpbPath)}>
+                  show the .mcpb file
+                </button>
+                {" "}then drag and drop it into claude desktop&apos;s window
+              </li>
+              <li>or in claude: developer → extensions → install extension → select the file</li>
+              <li>if nothing works, reinstall claude desktop to fix file associations</li>
+            </ol>
+          </details>
         </div>
       )}
     </div>
@@ -455,6 +524,47 @@ function AnythingLLMPanel() {
   );
 }
 
+function MstyPanel() {
+  const [copied, setCopied] = useState(false);
+  const config = JSON.stringify({
+    command: "npx",
+    args: ["-y", "screenpipe-mcp"],
+  }, null, 2);
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(config);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {}
+  }, [config]);
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Give Msty access to your screen &amp; audio history via MCP.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        1. Open Msty and go to <strong>Settings</strong> &gt; <strong>Toolbox</strong>
+      </p>
+      <p className="text-xs text-muted-foreground">
+        2. Click <strong>Add New Tool</strong>, select <strong>STDIO / JSON</strong>, and paste this config:
+      </p>
+      <div className="relative group">
+        <pre className="bg-muted border border-border rounded-lg p-3 pr-10 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{config}</pre>
+        <Button variant="ghost" size="sm" onClick={handleCopy} className="absolute top-2 right-2 h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity">
+          {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3 text-muted-foreground" />}
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        3. Give the tool a name (e.g. <strong>screenpipe</strong>) and click <strong>Add</strong>
+      </p>
+      <Button variant="outline" onClick={() => openUrl("https://msty.app")} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+        <ExternalLink className="h-3 w-3" />open msty
+      </Button>
+    </div>
+  );
+}
+
 function OllamaPanel() {
   const [status, setStatus] = useState<"idle" | "checking" | "connected" | "error">("idle");
   const [models, setModels] = useState<string[]>([]);
@@ -553,6 +663,87 @@ function LMStudioPanel() {
   );
 }
 
+function BrowserExtensionPanel({ connected, onRefresh }: { connected: boolean; onRefresh: () => void }) {
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<string | null>(null);
+
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const r = await fetch("http://localhost:3030/browser/eval", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: "return document.title" }),
+      });
+      const d = await r.json();
+      if (d.success) {
+        setTestResult(`connected — active tab: "${d.result}"`);
+      } else {
+        setTestResult(`error: ${d.error}`);
+      }
+    } catch (e: any) {
+      setTestResult(`failed: ${e.message}`);
+    } finally {
+      setTesting(false);
+      onRefresh();
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h3 className="text-sm font-medium mb-1">browser extension</h3>
+        <p className="text-xs text-muted-foreground">
+          connects your browser to screenpipe so pipes can read data from authenticated pages
+          (ChatGPT history, Claude conversations, dashboards, etc.)
+        </p>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <div className={`w-2 h-2 rounded-full ${connected ? "bg-green-500" : "bg-muted-foreground/30"}`} />
+        <span className="text-sm">{connected ? "connected" : "not connected"}</span>
+      </div>
+
+      {!connected && (
+        <div className="space-y-2">
+          <p className="text-xs text-muted-foreground">
+            install the extension, then it auto-connects when screenpipe is running.
+          </p>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => openUrl("https://chromewebstore.google.com/detail/screenpipe-browser-bridge/bgiepgcbfoiikehdnkfffdkgpdhlijeh")}
+            >
+              chrome web store <ExternalLink className="w-3 h-3 ml-1" />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => openUrl("https://github.com/screenpipe/screenpipe/tree/main/packages/browser-extension")}
+            >
+              manual install <ExternalLink className="w-3 h-3 ml-1" />
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {connected && (
+        <div className="space-y-2">
+          <Button variant="outline" size="sm" onClick={handleTest} disabled={testing}>
+            {testing ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Check className="h-3 w-3 mr-1" />}
+            test connection
+          </Button>
+          {testResult && (
+            <p className="text-xs text-muted-foreground">{testResult}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function WhatsAppPanel() {
   const [status, setStatus] = useState<"idle" | "pairing" | "connected" | "error">("idle");
   const [qr, setQr] = useState<string | null>(null);
@@ -634,6 +825,7 @@ function WhatsAppPanel() {
 
   const handleDisconnect = async () => {
     await fetch("http://localhost:3030/connections/whatsapp/disconnect", { method: "POST" });
+    apiCache.invalidate("connections/list");
     setStatus("idle");
     setQr(null);
     setInfo(null);
@@ -657,7 +849,7 @@ function WhatsAppPanel() {
       {status === "pairing" && qr && (
         <div className="space-y-2">
           <p className="text-xs text-muted-foreground">scan this QR code with your WhatsApp app:</p>
-          <div className="bg-white p-3 rounded-lg inline-block">
+          <div className="bg-white p-3 rounded-lg inline-block border dark:border-border">
             <img
               src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qr)}`}
               alt="WhatsApp QR Code"
@@ -692,6 +884,7 @@ function WhatsAppPanel() {
 
 function ChatGptPanel() {
   const [status, setStatus] = useState<"idle" | "loading" | "logged_in">("idle");
+  const { settings, updateSettings } = useSettings();
   useEffect(() => {
     commands.chatgptOauthStatus().then(res => {
       if (res.status === "ok" && res.data.logged_in) setStatus("logged_in");
@@ -711,7 +904,16 @@ function ChatGptPanel() {
             setStatus("loading");
             try {
               const res = await commands.chatgptOauthLogin();
-              setStatus(res.status === "ok" && res.data ? "logged_in" : "idle");
+              if (res.status === "ok" && res.data) {
+                setStatus("logged_in");
+                // auto-create a ChatGPT preset on first connection
+                await ensureChatGptPreset(
+                  settings.aiPresets || [],
+                  (presets) => updateSettings({ aiPresets: presets })
+                );
+              } else {
+                setStatus("idle");
+              }
             } catch { setStatus("idle"); }
           }} disabled={status === "loading"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
             {status === "loading" ? (<><Loader2 className="h-3 w-3 animate-spin" />connecting...</>) : (<><LogIn className="h-3 w-3" />sign in with ChatGPT</>)}
@@ -726,7 +928,7 @@ function ChatGptPanel() {
 // API integration panel (Telegram, Slack, etc.)
 // ---------------------------------------------------------------------------
 
-interface IntegrationField {
+export interface IntegrationField {
   key: string;
   label: string;
   secret: boolean;
@@ -734,7 +936,7 @@ interface IntegrationField {
   help_url: string;
 }
 
-interface IntegrationInfo {
+export interface IntegrationInfo {
   id: string;
   name: string;
   icon: string;
@@ -744,37 +946,49 @@ interface IntegrationInfo {
   connected: boolean;
 }
 
-function ApiIntegrationPanel({ integration, onRefresh }: {
-  integration: IntegrationInfo;
-  onRefresh: () => void;
+// ---------------------------------------------------------------------------
+// Reusable credential form for a single connection instance
+// ---------------------------------------------------------------------------
+
+export function ConnectionCredentialForm({
+  integrationId,
+  fields,
+  initialCredentials,
+  onSaved,
+  instanceName,
+  onDisconnect,
+  showTryInChat,
+  integrationName,
+  integrationDescription,
+}: {
+  integrationId: string;
+  fields: IntegrationField[];
+  initialCredentials?: Record<string, string>;
+  onSaved?: () => void;
+  instanceName?: string;
+  onDisconnect?: () => void;
+  showTryInChat?: boolean;
+  integrationName?: string;
+  integrationDescription?: string;
 }) {
-  const [creds, setCreds] = useState<Record<string, string>>({});
+  const [creds, setCreds] = useState<Record<string, string>>(initialCredentials || {});
   const [visible, setVisible] = useState<Record<string, boolean>>({});
   const [status, setStatus] = useState<"idle" | "testing" | "saving" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (integration.connected) {
-      fetch(`http://localhost:3030/connections/${integration.id}`)
-        .then(r => r.json())
-        .then(data => {
-          if (data.credentials) {
-            const loaded: Record<string, string> = {};
-            for (const [k, v] of Object.entries(data.credentials)) {
-              if (typeof v === "string") loaded[k] = v;
-            }
-            setCreds(loaded);
-          }
-        })
-        .catch(() => {});
-    }
-  }, [integration.id, integration.connected]);
+    if (initialCredentials) setCreds(initialCredentials);
+  }, [initialCredentials]);
+
+  const endpoint = instanceName
+    ? `http://localhost:3030/connections/${integrationId}/instances/${encodeURIComponent(instanceName)}`
+    : `http://localhost:3030/connections/${integrationId}`;
 
   const handleTest = async () => {
     setStatus("testing");
     setError(null);
     try {
-      const res = await fetch(`http://localhost:3030/connections/${integration.id}/test`, {
+      const res = await fetch(`http://localhost:3030/connections/${integrationId}/test`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ credentials: creds }),
@@ -782,7 +996,7 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || "test failed");
       setStatus("saving");
-      const saveRes = await fetch(`http://localhost:3030/connections/${integration.id}`, {
+      const saveRes = await fetch(endpoint, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ credentials: creds }),
@@ -790,7 +1004,8 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
       const saveData = await saveRes.json();
       if (!saveRes.ok || saveData.error) throw new Error(saveData.error || "save failed");
       setStatus("idle");
-      onRefresh();
+      apiCache.invalidate("connections/list");
+      onSaved?.();
     } catch (e: any) {
       setError(e?.message || "unknown error");
       setStatus("error");
@@ -799,15 +1014,18 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
 
   const handleDisconnect = async () => {
     try {
-      await fetch(`http://localhost:3030/connections/${integration.id}`, { method: "DELETE" });
+      await fetch(endpoint, { method: "DELETE" });
       setCreds({});
-      onRefresh();
+      apiCache.invalidate("connections/list");
+      onDisconnect?.();
     } catch { /* ignore */ }
   };
 
+  const hasCredentials = Object.values(creds).some(v => !!v);
+
   return (
     <div className="space-y-3">
-      {integration.fields.map((field) => (
+      {fields.map((field) => (
         <div key={field.key} className="space-y-1">
           <div className="flex items-center gap-1">
             <Label className="text-xs">{field.label}</Label>
@@ -851,35 +1069,188 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
       ))}
       {error && <p className="text-xs text-destructive">{error}</p>}
       <div className="flex gap-2">
-        <Button onClick={handleTest} disabled={status === "testing" || status === "saving"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+        <Button onClick={handleTest} disabled={status === "testing" || status === "saving"} variant={status === "error" ? "outline" : "default"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
           {status === "testing" ? (<><Loader2 className="h-3 w-3 animate-spin" />testing...</>)
            : status === "saving" ? (<><Loader2 className="h-3 w-3 animate-spin" />saving...</>)
+           : status === "error" ? (<>retry</>)
            : (<><Check className="h-3 w-3" />test &amp; save</>)}
         </Button>
-        {integration.connected && (
-          <>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal"
-              onClick={() => {
-                const credSummary = Object.entries(creds)
-                  .filter(([, v]) => v)
-                  .map(([k, v]) => `${k}: ${v}`)
-                  .join("\n  ");
-                showChatWithPrefill({
-                  context: `the user has the "${integration.name}" connection set up in screenpipe with these credentials:\n  ${credSummary}\n\nthe connection API is available at GET http://localhost:3030/connections/${integration.id}\n\n${integration.description}`,
-                  prompt: `try using my ${integration.name} connection — query it and do a small test interaction to verify it works end to end. after that, suggest creating a pipe that uses this connection.`,
-                  autoSend: true,
-                });
-              }}
-            >
-              <ExternalLink className="h-3 w-3" />try in chat
+        {showTryInChat && hasCredentials && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal"
+            onClick={() => {
+              const credSummary = Object.entries(creds)
+                .filter(([, v]) => v)
+                .map(([k, v]) => `${k}: ${v}`)
+                .join("\n  ");
+              showChatWithPrefill({
+                context: `the user has the "${integrationName}" connection set up in screenpipe with these credentials:\n  ${credSummary}\n\nthe connection API is available at GET http://localhost:3030/connections/${integrationId}\n\n${integrationDescription || ""}`,
+                prompt: `try using my ${integrationName} connection — query it and do a small test interaction to verify it works end to end. after that, suggest creating a pipe that uses this connection.`,
+                autoSend: true,
+              });
+            }}
+          >
+            <ExternalLink className="h-3 w-3" />try in chat
+          </Button>
+        )}
+        {(onDisconnect || hasCredentials) && (
+          <Button onClick={handleDisconnect} variant="ghost" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal text-destructive">
+            <X className="h-3 w-3" />disconnect
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instance API integration panel
+// ---------------------------------------------------------------------------
+
+interface InstanceData {
+  name: string;
+  credentials: Record<string, string>;
+}
+
+function ApiIntegrationPanel({ integration, onRefresh }: {
+  integration: IntegrationInfo;
+  onRefresh: () => void;
+}) {
+  const [instances, setInstances] = useState<InstanceData[]>([]);
+  const [instancesLoaded, setInstancesLoaded] = useState(false);
+  const [addingInstance, setAddingInstance] = useState(false);
+  const [newInstanceName, setNewInstanceName] = useState("");
+  const [defaultCreds, setDefaultCreds] = useState<Record<string, string>>({});
+
+  // Load default credentials
+  useEffect(() => {
+    if (integration.connected) {
+      fetch(`http://localhost:3030/connections/${integration.id}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data.credentials) {
+            const loaded: Record<string, string> = {};
+            for (const [k, v] of Object.entries(data.credentials)) {
+              if (typeof v === "string") loaded[k] = v;
+            }
+            setDefaultCreds(loaded);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [integration.id, integration.connected]);
+
+  // Load instances
+  useEffect(() => {
+    fetch(`http://localhost:3030/connections/${integration.id}/instances`)
+      .then(r => {
+        if (!r.ok) throw new Error("not supported");
+        return r.json();
+      })
+      .then(data => {
+        const list = data.data || data.instances || data || [];
+        if (Array.isArray(list)) {
+          const mapped = list
+            .filter((i: any) => i.instance != null)
+            .map((i: any) => ({ name: i.instance, credentials: i.credentials || {} }));
+          setInstances(mapped);
+        }
+        setInstancesLoaded(true);
+      })
+      .catch(() => {
+        setInstancesLoaded(true);
+      });
+  }, [integration.id]);
+
+  const refreshAll = () => {
+    onRefresh();
+    // Re-fetch instances
+    fetch(`http://localhost:3030/connections/${integration.id}/instances`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data) return;
+        const list = data.data || data.instances || data || [];
+        if (Array.isArray(list)) {
+          const mapped = list
+            .filter((i: any) => i.instance != null)
+            .map((i: any) => ({ name: i.instance, credentials: i.credentials || {} }));
+          setInstances(mapped);
+        }
+      })
+      .catch(() => {});
+  };
+
+  const handleAddInstance = () => {
+    if (!newInstanceName.trim()) return;
+    setInstances(prev => [...prev, { name: newInstanceName.trim(), credentials: {} }]);
+    setNewInstanceName("");
+    setAddingInstance(false);
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Default instance */}
+      <div>
+        <p className="text-xs text-muted-foreground mb-2">default</p>
+        <ConnectionCredentialForm
+          integrationId={integration.id}
+          fields={integration.fields}
+          initialCredentials={defaultCreds}
+          onSaved={refreshAll}
+          onDisconnect={refreshAll}
+          showTryInChat={integration.connected}
+          integrationName={integration.name}
+          integrationDescription={integration.description}
+        />
+      </div>
+
+      {/* Named instances */}
+      {instancesLoaded && instances.map((inst) => (
+        <div key={inst.name} className="border-t border-border pt-3">
+          <p className="text-xs text-muted-foreground mb-2">{inst.name}</p>
+          <ConnectionCredentialForm
+            integrationId={integration.id}
+            fields={integration.fields}
+            initialCredentials={inst.credentials}
+            instanceName={inst.name}
+            onSaved={refreshAll}
+            onDisconnect={() => {
+              setInstances(prev => prev.filter(i => i.name !== inst.name));
+              refreshAll();
+            }}
+            showTryInChat={Object.values(inst.credentials).some(v => !!v)}
+            integrationName={`${integration.name} (${inst.name})`}
+            integrationDescription={integration.description}
+          />
+        </div>
+      ))}
+
+      {/* Add instance */}
+      <div className="border-t border-border pt-3">
+        {addingInstance ? (
+          <div className="flex items-center gap-2">
+            <Input
+              value={newInstanceName}
+              onChange={(e) => setNewInstanceName(e.target.value)}
+              placeholder="instance name (e.g. work, personal)"
+              className="h-7 text-xs flex-1"
+              spellCheck={false}
+              onKeyDown={(e) => { if (e.key === "Enter") handleAddInstance(); }}
+              autoFocus
+            />
+            <Button onClick={handleAddInstance} size="sm" className="h-7 text-xs" disabled={!newInstanceName.trim()}>
+              add
             </Button>
-            <Button onClick={handleDisconnect} variant="ghost" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal text-destructive">
-              <X className="h-3 w-3" />disconnect
+            <Button onClick={() => { setAddingInstance(false); setNewInstanceName(""); }} variant="ghost" size="sm" className="h-7 text-xs">
+              cancel
             </Button>
-          </>
+          </div>
+        ) : (
+          <Button onClick={() => setAddingInstance(true)} variant="outline" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            + add instance
+          </Button>
         )}
       </div>
     </div>
@@ -902,11 +1273,15 @@ export function ConnectionsSection() {
     return null;
   });
   const [integrations, setIntegrations] = useState<IntegrationInfo[]>([]);
+  const [integrationsLoaded, setIntegrationsLoaded] = useState(false);
+
+  const os = platform();
 
   // Hardcoded connection status
   const [claudeInstalled, setClaudeInstalled] = useState(false);
   const [cursorInstalled, setCursorInstalled] = useState(false);
   const [chatgptConnected, setChatgptConnected] = useState(false);
+  const [browserExtConnected, setBrowserExtConnected] = useState(false);
 
   const refreshStatus = useCallback(() => {
     getInstalledMcpVersion().then(v => {
@@ -919,16 +1294,38 @@ export function ConnectionsSection() {
     commands.chatgptOauthStatus().then(res => {
       setChatgptConnected(res.status === "ok" && res.data.logged_in);
     }).catch(() => {});
+    fetch("http://localhost:3030/browser/status")
+      .then(r => r.json())
+      .then(d => setBrowserExtConnected(d.connected === true))
+      .catch(() => setBrowserExtConnected(false));
   }, []);
 
   useEffect(() => { refreshStatus(); }, [selected, refreshStatus]);
 
-  const fetchIntegrations = useCallback(async () => {
-    try {
-      const res = await fetch("http://localhost:3030/connections");
-      const data = await res.json();
-      if (data.data) setIntegrations(data.data);
-    } catch { /* server may not be running */ }
+  const fetchIntegrations = useCallback(async (retries = 3) => {
+    const cacheKey = "connections/list";
+    // Show cached data if fresh (< 30s) — avoids showing stale connection status
+    const cached = apiCache.get<any[]>(cacheKey);
+    if (cached) {
+      setIntegrations(cached);
+      setIntegrationsLoaded(true);
+      return;
+    }
+
+    for (let i = 0; i < retries; i++) {
+      try {
+        const res = await fetch("http://localhost:3030/connections");
+        const data = await res.json();
+        if (data.data) {
+          apiCache.set(cacheKey, data.data, 30_000); // 30s TTL
+          setIntegrations(data.data);
+          setIntegrationsLoaded(true);
+          return;
+        }
+      } catch { /* server may not be running yet */ }
+      if (i < retries - 1) await new Promise(r => setTimeout(r, 2000));
+    }
+    setIntegrationsLoaded(true);
   }, []);
 
   useEffect(() => { fetchIntegrations(); }, [fetchIntegrations]);
@@ -940,6 +1337,11 @@ export function ConnectionsSection() {
       { id: "cursor", name: "Cursor", icon: "cursor", connected: cursorInstalled },
       { id: "claude-code", name: "Claude Code", icon: "claude-code", connected: false },
       { id: "chatgpt", name: "ChatGPT", icon: "chatgpt", connected: chatgptConnected },
+      { id: "browser-extension", name: "Browser Extension", icon: "browser-extension", connected: browserExtConnected },
+      ...(os === "macos" ? [
+        { id: "browser-url", name: "Browser URL Capture", icon: "browser-url", connected: false },
+        { id: "voice-memos", name: "Voice Memos", icon: "voice-memos", connected: false },
+      ] : []),
       { id: "apple-intelligence", name: "Apple Intelligence", icon: "apple-intelligence", connected: false },
       { id: "apple-calendar", name: "Apple Calendar", icon: "apple-calendar", connected: false },
       { id: "google-calendar", name: "Google Calendar", icon: "google-calendar", connected: false },
@@ -949,6 +1351,7 @@ export function ConnectionsSection() {
       { id: "anythingllm", name: "AnythingLLM", icon: "anythingllm", connected: false },
       { id: "ollama", name: "Ollama", icon: "ollama", connected: false },
       { id: "lmstudio", name: "LM Studio", icon: "lmstudio", connected: false },
+      { id: "msty", name: "Msty", icon: "msty", connected: false },
       { id: "obsidian", name: "Obsidian", icon: "obsidian", connected: false },
       { id: "notion", name: "Notion", icon: "notion", connected: false },
       { id: "linear", name: "Linear", icon: "linear", connected: false },
@@ -965,7 +1368,7 @@ export function ConnectionsSection() {
       if (api) h.connected = api.connected;
     }
     return [...hardcoded, ...apiTiles];
-  }, [claudeInstalled, cursorInstalled, chatgptConnected, integrations]);
+  }, [os, claudeInstalled, cursorInstalled, chatgptConnected, browserExtConnected, integrations]);
 
   const filtered = useMemo(() => {
     if (!search.trim()) return allTiles;
@@ -982,6 +1385,9 @@ export function ConnectionsSection() {
       case "cursor": return <CursorPanel />;
       case "claude-code": return <ClaudeCodePanel />;
       case "chatgpt": return <ChatGptPanel />;
+      case "browser-extension": return <BrowserExtensionPanel connected={browserExtConnected} onRefresh={refreshStatus} />;
+      case "browser-url": return <BrowserUrlCard />;
+      case "voice-memos": return <VoiceMemosCard />;
       case "apple-intelligence": return <AppleIntelligenceCard />;
       case "apple-calendar": return <CalendarCard />;
       case "google-calendar": return <GoogleCalendarCard />;
@@ -991,6 +1397,7 @@ export function ConnectionsSection() {
       case "anythingllm": return <AnythingLLMPanel />;
       case "ollama": return <OllamaPanel />;
       case "lmstudio": return <LMStudioPanel />;
+      case "msty": return <MstyPanel />;
       default:
         if (selectedIntegration) {
           return <ApiIntegrationPanel integration={selectedIntegration} onRefresh={fetchIntegrations} />;
@@ -1010,10 +1417,7 @@ export function ConnectionsSection() {
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <h1 className="text-xl font-bold tracking-tight text-foreground">Connections</h1>
-        <p className="text-muted-foreground text-sm">Give AI access to your memory, and connect to the apps you use every day</p>
-      </div>
+      <p className="text-muted-foreground text-sm mb-4">Give AI access to your memory, and connect to the apps you use every day</p>
 
       {/* Search */}
       <div className="relative">
@@ -1028,19 +1432,31 @@ export function ConnectionsSection() {
 
       {/* Grid */}
       <div className="grid grid-cols-3 gap-2">
-        {filtered.map((tile) => (
-          <Tile
-            key={tile.id}
-            tile={tile}
-            selected={selected === tile.id}
-            onClick={() => setSelected(selected === tile.id ? null : tile.id)}
-          />
-        ))}
+        {!integrationsLoaded ? (
+          Array.from({ length: 12 }).map((_, i) => (
+            <div key={i} className="flex items-center gap-2.5 p-2.5 rounded-lg border border-border bg-card animate-pulse">
+              <div className="w-8 h-8 rounded-md bg-muted" />
+              <div className="flex-1 space-y-1.5">
+                <div className="h-3 bg-muted rounded w-20" />
+                <div className="h-2 bg-muted rounded w-12" />
+              </div>
+            </div>
+          ))
+        ) : (
+          filtered.map((tile) => (
+            <Tile
+              key={tile.id}
+              tile={tile}
+              selected={selected === tile.id}
+              onClick={() => setSelected(selected === tile.id ? null : tile.id)}
+            />
+          ))
+        )}
       </div>
 
       {/* Expanded panel */}
       {selected && selectedTile && (() => {
-        const standaloneIds = ["apple-intelligence", "apple-calendar", "google-calendar", "ics-calendar", "openclaw"];
+        const standaloneIds = ["browser-url", "voice-memos", "apple-intelligence", "apple-calendar", "google-calendar", "ics-calendar", "openclaw"];
         if (standaloneIds.includes(selected)) {
           // These components render their own Card
           return <div ref={panelRef}>{renderPanel()}</div>;

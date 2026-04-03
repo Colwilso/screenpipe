@@ -21,8 +21,8 @@ use chrono::{DateTime, Utc};
 use image::codecs::jpeg::JpegEncoder;
 use image::DynamicImage;
 use image::GenericImageView;
-use screenpipe_core::Language;
 use screenpipe_connect::unstructured_ocr::perform_ocr_cloud;
+use screenpipe_core::Language;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -103,7 +103,8 @@ where
     D: Deserializer<'de>,
 {
     let millis: u128 = Deserialize::deserialize(deserializer)?;
-    Ok(Instant::now() - Duration::from_millis(millis as u64))
+    let dur = Duration::from_millis(millis as u64);
+    Ok(Instant::now().checked_sub(dur).unwrap_or(Instant::now()))
 }
 
 pub struct CaptureResult {

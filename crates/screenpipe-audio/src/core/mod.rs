@@ -8,17 +8,15 @@ pub mod engine;
 pub mod pulse;
 mod run_record_and_transcribe;
 pub mod stream;
-use crate::transcription::deepgram::streaming::stream_transcription_deepgram;
 use crate::AudioInput;
 use anyhow::Result;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use screenpipe_core::Language;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use stream::AudioStream;
-use tracing::{debug, error};
+use tracing::debug;
 
 lazy_static! {
     // Global fallback timestamp for backward compatibility
@@ -88,34 +86,6 @@ pub async fn record_and_transcribe(
                 // (e.g., audio hijack → reconnect, or idle output device timeout),
                 // creating noise in logs. The error is expected & handled.
                 debug!("record_and_transcribe error, restarting: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-    Ok(())
-}
-
-pub async fn start_realtime_recording(
-    audio_stream: Arc<AudioStream>,
-    languages: Vec<Language>,
-    is_running: Arc<AtomicBool>,
-    deepgram_api_key: Option<String>,
-) -> Result<()> {
-    while is_running.load(Ordering::Relaxed) {
-        match stream_transcription_deepgram(
-            audio_stream.clone(),
-            languages.clone(),
-            is_running.clone(),
-            deepgram_api_key.clone(),
-        )
-        .await
-        {
-            Ok(_) => break, // Normal shutdown
-            Err(e) => {
-                if is_normal_shutdown(&is_running) {
-                    break;
-                }
-                error!("realtime_stt error, restarting: {}", e);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }

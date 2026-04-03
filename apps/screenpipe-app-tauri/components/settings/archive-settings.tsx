@@ -33,6 +33,8 @@ interface ArchiveStatus {
   pending_count: number;
   is_uploading: boolean;
   chunks_uploaded: number;
+  media_files_uploaded: number;
+  media_files_pending: number;
 }
 
 const RETENTION_OPTIONS = [
@@ -114,7 +116,8 @@ export function ArchiveSettings() {
 
     try {
       if (enabled) {
-        // Initialize archive — encryption key is derived server-side from the token
+        // Initialize archive — encryption keys are derived locally from the
+        // token, completely independent of cloud sync.
         const res = await fetch("http://localhost:3030/archive/init", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -133,16 +136,16 @@ export function ArchiveSettings() {
         await persistArchiveStore(true, retentionDays);
         toast({ title: "Cloud archive enabled" });
       } else {
-        // Disable archive
-        const res = await fetch("http://localhost:3030/archive/configure", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: false }),
-        });
-
-        if (!res.ok) {
-          const data = await res.json();
-          throw new Error(data.error || "failed to disable archive");
+        // Disable archive — always update local settings even if server
+        // is unreachable (the intent is to turn it off).
+        try {
+          await fetch("http://localhost:3030/archive/configure", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: false }),
+          });
+        } catch {
+          // Server unreachable — still disable locally
         }
 
         await updateSettings({ cloudArchiveEnabled: false });
@@ -219,24 +222,19 @@ export function ArchiveSettings() {
   if (!isProUser) {
     return (
       <div className="space-y-6">
-        <div>
-          <div className="flex items-center gap-2">
-            <h1 className="text-xl font-bold tracking-tight text-foreground">
-              Cloud archive
-            </h1>
+        <p className="text-muted-foreground text-sm mb-4">
+          Encrypt and archive old data to the cloud to free disk space.{" "}
+          <button
+            onClick={() => openUrl("https://docs.screenpi.pe/cloud-archive")}
+            className="underline underline-offset-2 hover:text-foreground transition-colors"
+          >
+            Learn more
+          </button>
+        </p>
+        <div className="flex items-center gap-2">
             <Badge variant="secondary" className="text-[10px]">
               pro
             </Badge>
-          </div>
-          <p className="text-sm text-muted-foreground mt-1">
-            Encrypt and archive old data to the cloud to free disk space.{" "}
-            <button
-              onClick={() => openUrl("https://docs.screenpi.pe/cloud-archive")}
-              className="underline underline-offset-2 hover:text-foreground transition-colors"
-            >
-              Learn more
-            </button>
-          </p>
         </div>
 
         <Card>
@@ -258,16 +256,14 @@ export function ArchiveSettings() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <div className="flex items-center gap-2">
-          <h1 className="text-xl font-bold tracking-tight text-foreground">
-            Cloud archive
-          </h1>
+      <div className="flex items-center gap-2">
           <Badge variant="secondary" className="text-[10px]">
             pro
           </Badge>
-        </div>
-        <p className="text-sm text-muted-foreground mt-1">
+      </div>
+
+      {/* Retention selector */}
+      <p className="text-sm text-muted-foreground">
           Encrypt and archive data older than{" "}
           <Select
             value={String(retentionDays)}
@@ -292,7 +288,6 @@ export function ArchiveSettings() {
             Learn more
           </button>
         </p>
-      </div>
 
       {/* Toggle */}
       <div className="flex items-center justify-between">
@@ -322,7 +317,7 @@ export function ArchiveSettings() {
                     {status.is_uploading ? (
                       <span className="flex items-center gap-1.5 text-foreground">
                         <Loader2 className="h-3 w-3 animate-spin" />
-                        uploading ({status.chunks_uploaded} chunks)
+                        uploading ({status.chunks_uploaded} chunks, {status.media_files_uploaded} media files)
                       </span>
                     ) : status.enabled ? (
                       status.pending_count > 0 ? (
@@ -344,6 +339,23 @@ export function ArchiveSettings() {
                     </span>
                     <span className="text-foreground">
                       {status.pending_count.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+
+                {/* Media files */}
+                {(status.media_files_uploaded > 0 || status.media_files_pending > 0) && (
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-muted-foreground">
+                      Media files
+                    </span>
+                    <span className="text-foreground">
+                      {status.media_files_uploaded.toLocaleString()} uploaded
+                      {status.media_files_pending > 0 && (
+                        <span className="text-muted-foreground">
+                          {" "}/ {status.media_files_pending.toLocaleString()} pending
+                        </span>
+                      )}
                     </span>
                   </div>
                 )}

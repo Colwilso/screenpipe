@@ -76,6 +76,7 @@ import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { Badge } from "@/components/ui/badge";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { Switch } from "@/components/ui/switch";
+import { Slider } from "@/components/ui/slider";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { platform } from "@tauri-apps/plugin-os";
@@ -95,6 +96,7 @@ import * as Sentry from "@sentry/react";
 import { defaultOptions } from "tauri-plugin-sentry-api";
 import { useLoginDialog } from "../login-dialog";
 import { BatterySaverSection } from "./battery-saver-section";
+import { ScheduleSettings } from "./schedule-settings";
 import { ValidatedInput } from "../ui/validated-input";
 import {
   validateField,
@@ -636,6 +638,10 @@ export function RecordingSettings() {
     const checkPlatform = async () => {
       const currentPlatform = platform();
       setIsMacOS(currentPlatform === "macos");
+      // Auto-migrate macOS users off qwen3-asr (CPU-only, no Metal support)
+      if (currentPlatform === "macos" && settings.audioTranscriptionEngine === "qwen3-asr") {
+        handleSettingsChange({ audioTranscriptionEngine: "whisper-large-v3-turbo-quantized" }, true);
+      }
     };
     checkPlatform();
   }, []);
@@ -860,7 +866,7 @@ export function RecordingSettings() {
     };
   };
 
-  const handleAudioTranscriptionModelChange = (
+  const handleAudioTranscriptionModelChange = async (
     value: string,
     realtime = false
   ) => {
@@ -872,12 +878,25 @@ export function RecordingSettings() {
 
     // If trying to use cloud but not subscribed
     if (value === "screenpipe-cloud" && !settings.user?.cloud_subscribed) {
-      const clientRefId = `${
-        settings.user?.id
-      }&customer_email=${encodeURIComponent(settings.user?.email ?? "")}`;
-      openUrl(
-        `https://buy.stripe.com/9B63cv1cD1oG2Vjg097ss0G?client_reference_id=${clientRefId}`
-      );
+      try {
+        const response = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${settings.user?.token}`,
+          },
+          body: JSON.stringify({
+            tier: "pro",
+            billingPeriod: "monthly",
+            userId: settings.user?.id,
+            email: settings.user?.email,
+          }),
+        });
+        const data = await response.json();
+        openUrl(data.url || "https://screenpi.pe/billing");
+      } catch {
+        openUrl("https://screenpi.pe/billing");
+      }
       // Revert back to previous value in the Select component
       return;
     }
@@ -1126,11 +1145,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold tracking-tight text-foreground">
-            Recording
-          </h1>
+      <p className="text-muted-foreground text-sm mb-4">
+        Screen and audio recording preferences
+      </p>
+
+      <div className="flex items-center justify-end">
           {hasUnsavedChanges && (
             <Button
               onClick={handleUpdate}
@@ -1146,10 +1165,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               Apply & Restart
             </Button>
           )}
-        </div>
-        <p className="text-muted-foreground text-sm">
-          Screen and audio recording preferences
-        </p>
       </div>
 
       {/* Battery Saver / Power Mode */}
@@ -1158,6 +1173,15 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           <BatterySaverSection />
         </CardContent>
       </Card>
+
+      {/* Recording Schedule */}
+      <ScheduleSettings
+        enabled={settings.scheduleEnabled ?? false}
+        rules={(settings.scheduleRules as any[]) ?? []}
+        onChange={(enabled, rules) => {
+          handleSettingsChange({ scheduleEnabled: enabled, scheduleRules: rules } as any);
+        }}
+      />
 
       {/* Data Directory */}
       <div className="space-y-2">
@@ -1322,7 +1346,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     <SelectItem value="whisper-large-v3-turbo-quantized">Whisper Turbo (fast)</SelectItem>
                     <SelectItem value="whisper-tiny">Whisper Tiny</SelectItem>
                     <SelectItem value="whisper-tiny-quantized">Whisper Tiny (fast)</SelectItem>
-                    <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>
+                    {!isMacOS && <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>}
+                    <SelectItem value="parakeet">Parakeet{isMacOS ? " (experimental)" : ""}</SelectItem>
                   </SelectGroup>
                   <SelectGroup>
                     <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">other</SelectLabel>
@@ -1332,17 +1357,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 </SelectContent>
               </Select>
             </div>
-            {hwCapability?.isWeakForLargeModel && settings.audioTranscriptionEngine.includes("large") && (
-              <div className="mt-2 ml-[26px] p-2 rounded-md bg-yellow-500/10 border border-yellow-500/30">
-                <p className="text-xs text-yellow-600 dark:text-yellow-400">
-                  <AlertCircle className="h-3 w-3 inline mr-1" />
-                  {hwCapability.reason}
-                  {settings.user?.cloud_subscribed
-                    ? " Consider switching to Screenpipe Cloud for better performance."
-                    : ` Consider switching to ${hwCapability.recommendedEngine} to avoid high CPU usage.`}
-                </p>
-              </div>
-            )}
             {settings.audioTranscriptionEngine === "deepgram" && (
               <div className="mt-2 ml-[26px] relative">
                 <ValidatedInput
@@ -1449,6 +1463,42 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   {allOpenAIModels.length === 0 && !openAIModels.includes('!API_Error') && !isLoadingModels && (
                     <p className="text-xs text-muted-foreground">No models listed by the API — type the model name manually.</p>
                   )}
+                </div>
+
+                {/* Raw Audio Toggle */}
+                <label className="flex items-center gap-2 text-xs cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={settings.openaiCompatibleRawAudio || false}
+                    onChange={(e) => handleSettingsChange({ openaiCompatibleRawAudio: e.target.checked }, true)}
+                    className="rounded border-border"
+                  />
+                  <span>send raw WAV audio (instead of MP3)</span>
+                </label>
+
+                {/* Custom Headers */}
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">custom headers (JSON)</label>
+                  <Input
+                    defaultValue={settings.openaiCompatibleHeaders ? JSON.stringify(settings.openaiCompatibleHeaders) : ""}
+                    onBlur={(e) => {
+                      const val = e.target.value.trim();
+                      if (!val) {
+                        handleSettingsChange({ openaiCompatibleHeaders: undefined }, true);
+                        return;
+                      }
+                      try {
+                        const parsed = JSON.parse(val);
+                        if (typeof parsed === "object" && !Array.isArray(parsed)) {
+                          handleSettingsChange({ openaiCompatibleHeaders: parsed }, true);
+                        }
+                      } catch {
+                        // Invalid JSON — don't save
+                      }
+                    }}
+                    placeholder='{"X-Custom-Header": "value"}'
+                    className="h-7 text-xs font-mono"
+                  />
                 </div>
 
                 {/* Connection Test Panel */}
@@ -1565,8 +1615,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </Card>
         )}
 
-        {/* Transcription Mode - audio capture setting, independent of transcription engine */}
-        {!settings.disableAudio && (
+        {/* Transcription Mode - hidden when transcription engine is disabled */}
+        {!settings.disableAudio && settings.audioTranscriptionEngine !== "disabled" && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
               <div className="flex items-center justify-between">
@@ -1588,12 +1638,42 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   }
                 />
               </div>
+              {["smart", "batch"].includes(settings.transcriptionMode ?? "realtime") &&
+                settings.audioTranscriptionEngine === "openai-compatible" && (
+                <div className="mt-2.5 pt-2.5 border-t border-border/50">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                      Max batch duration
+                      <HelpTooltip text="Maximum audio to batch before transcribing. Depends on your endpoint's file size limit. 0 = auto (~50min). Audio is compressed to MP3 before upload." />
+                    </span>
+                    <span className="text-xs font-mono text-foreground">
+                      {(settings.batchMaxDurationSecs ?? 0) === 0
+                        ? "auto"
+                        : `${Math.floor((settings.batchMaxDurationSecs ?? 0) / 60)}min`}
+                    </span>
+                  </div>
+                  <Slider
+                    value={[settings.batchMaxDurationSecs ?? 0]}
+                    onValueChange={([value]) =>
+                      handleSettingsChange({ batchMaxDurationSecs: value ?? 0 } as any, true)
+                    }
+                    min={0}
+                    max={5400}
+                    step={60}
+                    className="w-full"
+                  />
+                  <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
+                    <span>auto</span>
+                    <span>90min</span>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         )}
 
-        {/* Filter Music - audio filtering, independent of transcription engine */}
-        {!settings.disableAudio && (
+        {/* Filter Music - hidden when transcription engine is disabled */}
+        {!settings.disableAudio && settings.audioTranscriptionEngine !== "disabled" && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
               <div className="flex items-center justify-between">
@@ -1921,35 +2001,35 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
         {/* Text extraction — accessibility and input capture are always enabled (defaults in store.rs) */}
 
+        {/* Workflow event detection (cloud) */}
+        {settings.user?.cloud_subscribed && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Zap className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    Workflow events
+                    <span className="text-[10px] font-normal text-muted-foreground bg-muted px-1.5 py-0.5 rounded">cloud</span>
+                  </h3>
+                  <p className="text-xs text-muted-foreground">AI detects your workflow patterns and triggers event-based pipes</p>
+                </div>
+              </div>
+              <Switch
+                checked={settings.enableWorkflowEvents || false}
+                onCheckedChange={(checked) => handleSettingsChange({ enableWorkflowEvents: checked } as any, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
       </div>
 
       {/* System */}
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">System</h2>
-
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Terminal className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">Server port</h3>
-                  <p className="text-xs text-muted-foreground">Requires restart</p>
-                </div>
-              </div>
-              <Input
-                id="port"
-                type="number"
-                value={settings.port}
-                onChange={(e) => {
-                  const portValue = parseInt(e.target.value) || 3030;
-                  handleSettingsChange({ port: portValue }, true);
-                }}
-                className="w-20 h-7 text-xs text-right"
-              />
-            </div>
-          </CardContent>
-        </Card>
 
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">

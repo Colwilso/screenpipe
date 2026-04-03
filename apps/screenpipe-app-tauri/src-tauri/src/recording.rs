@@ -7,17 +7,23 @@ use crate::embedded_server::{start_embedded_server, EmbeddedServerHandle};
 use crate::permissions::do_permissions_check;
 use crate::store::SettingsStore;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, State};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+/// Minimum seconds between consecutive stop→spawn cycles.
+/// Prevents restart spam from cascading permission recovery or settings changes.
+const RESTART_COOLDOWN_SECS: u64 = 30;
 
 /// State holding the embedded server handle
 pub struct RecordingState {
     pub handle: Arc<Mutex<Option<EmbeddedServerHandle>>>,
     /// True while a server start is in progress (prevents race between main.rs boot and frontend)
     pub is_starting: Arc<AtomicBool>,
+    /// Epoch seconds of last successful spawn — enforces cooldown between restarts
+    pub last_spawn_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, specta::Type)]
@@ -148,8 +154,65 @@ pub async fn spawn_screenpipe(
 ) -> Result<(), String> {
     info!("Starting screenpipe server");
 
+    // Enforce cooldown between restarts to prevent cascading restart spam.
+    // Permission recovery and settings changes can trigger rapid stop→spawn cycles
+    // that starve the DB pool and cause data loss.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_spawn = state.last_spawn_epoch.load(Ordering::SeqCst);
+    if last_spawn > 0 && now_epoch.saturating_sub(last_spawn) < RESTART_COOLDOWN_SECS {
+        let remaining = RESTART_COOLDOWN_SECS - now_epoch.saturating_sub(last_spawn);
+        warn!("Restart cooldown active ({remaining}s remaining). Deferring spawn.");
+        // Schedule a deferred restart after cooldown expires so the server
+        // doesn't stay dead if no other caller triggers spawn_screenpipe.
+        let last_spawn_epoch = state.last_spawn_epoch.clone();
+        let is_starting = state.is_starting.clone();
+        let handle = state.handle.clone();
+        let app_handle = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(remaining + 1)).await;
+            info!("Cooldown expired, checking if server needs restart");
+            // Check health first — if server is already running, skip
+            let port = SettingsStore::get(&app_handle)
+                .ok()
+                .flatten()
+                .map(|s| s.recording.port)
+                .unwrap_or(3030);
+            if let Ok(resp) = reqwest::Client::new()
+                .get(format!("http://localhost:{}/health", port))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    info!("Deferred spawn: server already healthy, skipping");
+                    return;
+                }
+            }
+            // Server not running — check if handle exists
+            {
+                let handle_guard = handle.lock().await;
+                if handle_guard.is_some() {
+                    info!(
+                        "Deferred spawn: handle exists but unhealthy, skipping (may be starting)"
+                    );
+                    return;
+                }
+            }
+            // No handle, not healthy — trigger restart via invoke
+            info!("Deferred spawn: server dead, triggering restart");
+            is_starting.store(false, Ordering::SeqCst);
+            // Reset cooldown so the deferred spawn isn't blocked again
+            last_spawn_epoch.store(0, Ordering::SeqCst);
+            let _ = app_handle.emit("request-server-restart", ());
+        });
+        return Ok(());
+    }
+
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    let port = store.port;
+    let port = store.recording.port;
     let health_url = format!("http://localhost:{}/health", port);
 
     // Check if another start is already in progress (race between main.rs boot and frontend)
@@ -254,7 +317,7 @@ pub async fn spawn_screenpipe(
     // Check permissions before starting
     let permissions_check = do_permissions_check(false);
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    let disable_audio = store.disable_audio;
+    let disable_audio = store.recording.disable_audio;
 
     // Screen recording permission is required
     if !permissions_check.screen_recording.permitted() {
@@ -376,6 +439,12 @@ pub async fn spawn_screenpipe(
     match result_rx.await {
         Ok(Ok(())) => {
             info!("Screenpipe server started successfully");
+            // Record spawn time for cooldown enforcement
+            let spawn_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            state.last_spawn_epoch.store(spawn_epoch, Ordering::SeqCst);
             // is_starting stays true — it's cleared when stop_screenpipe() is called
             // This prevents another spawn_screenpipe from racing with the running server
             Ok(())

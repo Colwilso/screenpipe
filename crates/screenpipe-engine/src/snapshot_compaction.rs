@@ -32,7 +32,7 @@ const MIN_AGE_SECS: i64 = 600; // 10 minutes
 const POLL_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 /// Maximum frames per MP4 chunk at normal thermal load.
-const MAX_FRAMES_PER_CHUNK: usize = 500;
+const MAX_FRAMES_PER_CHUNK: usize = 100;
 
 /// Smaller batch size when system is thermally stressed.
 const THROTTLED_FRAMES_PER_CHUNK: usize = 50;
@@ -224,7 +224,22 @@ async fn compact_chunk(
                 break;
             }
         }
-        dims.ok_or_else(|| anyhow::anyhow!("no readable JPEG found in chunk"))?
+        match dims {
+            Some(d) => d,
+            None => {
+                // All JPEGs gone/unreadable — clear stale DB pointers so we don't retry
+                let ids: Vec<i64> = frames.iter().map(|(id, _, _)| *id).collect();
+                debug!(
+                    "snapshot compaction: clearing {} stale snapshot_path entries for {} (files missing)",
+                    ids.len(),
+                    device_name
+                );
+                for batch in ids.chunks(100) {
+                    let _ = db.clear_snapshot_paths_queued(batch.to_vec()).await;
+                }
+                return Ok(None);
+            }
+        }
     };
 
     debug!(
@@ -245,11 +260,21 @@ async fn compact_chunk(
         .take()
         .ok_or_else(|| anyhow::anyhow!("ffmpeg stdin not available"))?;
 
-    let mut encoded_count = 0u32;
-    for (_, snapshot_path, _) in frames {
+    // Track which frames were actually encoded into the video and their
+    // position in the video stream. Frames may be skipped (missing file,
+    // read error) so the video position can differ from the array index.
+    let mut encoded_frames: Vec<(i64, u32)> = Vec::new(); // (frame_id, video_position)
+    let mut video_position = 0u32;
+    for (frame_id, snapshot_path, _) in frames {
         let jpeg_path = Path::new(snapshot_path);
         if !jpeg_path.exists() {
-            warn!("snapshot file missing, skipping: {}", snapshot_path);
+            debug!(
+                "snapshot file missing, clearing DB pointer: {}",
+                snapshot_path
+            );
+            // Route through write queue instead of read pool to avoid
+            // unserialized writes that cause WAL contention and pool exhaustion.
+            let _ = db.clear_snapshot_paths_queued(vec![*frame_id]).await;
             continue;
         }
 
@@ -260,7 +285,8 @@ async fn compact_chunk(
                     error!("failed to write frame to ffmpeg: {}", e);
                     break;
                 }
-                encoded_count += 1;
+                encoded_frames.push((*frame_id, video_position));
+                video_position += 1;
                 // Pace writes to avoid CPU spikes — spread encoding over time
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -273,7 +299,7 @@ async fn compact_chunk(
 
     finish_ffmpeg_process(child, Some(stdin)).await;
 
-    if encoded_count == 0 {
+    if encoded_frames.is_empty() {
         let _ = tokio::fs::remove_file(&mp4_path).await;
         return Ok(None);
     }
@@ -295,19 +321,19 @@ async fn compact_chunk(
         .insert_video_chunk_with_fps(&mp4_path_str, device_name, fps)
         .await?;
 
-    let mut tx = db.begin_immediate_with_retry().await?;
-    for (offset, (frame_id, _, _)) in frames.iter().enumerate() {
-        sqlx::query(
-            "UPDATE frames SET video_chunk_id = ?1, offset_index = ?2, snapshot_path = NULL \
-             WHERE id = ?3 AND snapshot_path IS NOT NULL",
-        )
-        .bind(chunk_id)
-        .bind(offset as i64)
-        .bind(frame_id)
-        .execute(&mut **tx.conn())
-        .await?;
+    // Only update frames that were actually encoded into the video.
+    // Use their real video position as offset_index (not array index).
+    // Process in separate transactions per batch to avoid holding the write
+    // semaphore for too long, which starves audio/frame insertion and causes
+    // PoolTimedOut errors (data loss).
+    for batch in encoded_frames.chunks(100) {
+        let batch_vec: Vec<(i64, u32)> = batch.to_vec();
+        if let Err(e) = db.compact_snapshots_queued(chunk_id, batch_vec).await {
+            warn!("snapshot compaction: queue submit failed for batch: {}", e);
+        }
+        // Yield briefly between batches
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    tx.commit().await?;
 
     // Step 3: Delete source JPEGs (safe — DB already points to MP4)
     let mut deleted = 0u32;
@@ -329,7 +355,7 @@ async fn compact_chunk(
 
     info!(
         "snapshot compaction: {} frames, {:.1}MB → {:.1}MB ({:.1}x), {} JPEGs deleted",
-        encoded_count,
+        encoded_frames.len(),
         jpeg_total_bytes as f64 / 1_048_576.0,
         mp4_size as f64 / 1_048_576.0,
         ratio,
@@ -337,10 +363,10 @@ async fn compact_chunk(
     );
 
     // Return cache update info so hot_frame_cache can be patched
-    let cache_updates: Vec<(i64, String, i64, f64)> = frames
+    // Only include frames that were actually encoded, with correct video positions
+    let cache_updates: Vec<(i64, String, i64, f64)> = encoded_frames
         .iter()
-        .enumerate()
-        .map(|(offset, (frame_id, _, _))| (*frame_id, mp4_path_str.clone(), offset as i64, fps))
+        .map(|(frame_id, pos)| (*frame_id, mp4_path_str.clone(), *pos as i64, fps))
         .collect();
 
     Ok(Some(cache_updates))
@@ -370,7 +396,7 @@ async fn start_ffmpeg_lowpri(
         cmd
     };
     #[cfg(not(unix))]
-    let mut command = tokio::process::Command::new(ffmpeg_path);
+    let mut command = screenpipe_core::ffmpeg_cmd_async(ffmpeg_path);
 
     command
         .args([
@@ -517,7 +543,7 @@ mod tests {
             ThermalState::Serious => (THROTTLED_FRAMES_PER_CHUNK, 30),
             ThermalState::Critical => (THROTTLED_FRAMES_PER_CHUNK, 120),
         };
-        assert_eq!(chunk_size, 500);
+        assert_eq!(chunk_size, 100);
         assert_eq!(delay, 0);
     }
 

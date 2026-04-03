@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    join,
     sync::{Mutex, RwLock},
     task::JoinHandle,
 };
@@ -35,7 +34,6 @@ use crate::{
     metrics::AudioPipelineMetrics,
     segmentation::segmentation_manager::SegmentationManager,
     transcription::{
-        deepgram::streaming::stream_transcription_deepgram,
         engine::TranscriptionEngine,
         handle_new_transcript,
         stt::{process_audio_input, SAMPLE_RATE},
@@ -48,11 +46,26 @@ use crate::{
     AudioInput, TranscriptionResult,
 };
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AudioManagerStatus {
     Running,
     Paused,
     Stopped,
+}
+
+/// Meeting event data for calendar-assisted speaker diarization.
+/// Mirrors the MeetingEvent struct from screenpipe-events for deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MeetingEventData {
+    app: String,
+    timestamp: DateTime<Utc>,
+    #[serde(default)]
+    calendar_title: Option<String>,
+    #[serde(default)]
+    calendar_attendees: Option<Vec<String>>,
 }
 
 type RecordingHandlesMap = DashMap<AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>>;
@@ -102,8 +115,11 @@ impl AudioManager {
             VadEngineEnum::WebRtc => Arc::new(Mutex::new(Box::new(WebRtcVad::new()))),
         };
 
-        let (recording_sender, recording_receiver) = crossbeam::channel::bounded(1000);
-        let (transcription_sender, transcription_receiver) = crossbeam::channel::bounded(1000);
+        let channel_config = &options.channel_config;
+        let (recording_sender, recording_receiver) =
+            crossbeam::channel::bounded(channel_config.recording_capacity);
+        let (transcription_sender, transcription_receiver) =
+            crossbeam::channel::bounded(channel_config.transcription_capacity);
 
         let recording_handles = DashMap::new();
 
@@ -177,6 +193,7 @@ impl AudioManager {
                         let openai_config = opts.openai_compatible_config.clone();
                         let langs = opts.languages.clone();
                         let vocab = opts.vocabulary.clone();
+                        let batch_max_dur = opts.batch_max_duration_secs;
                         drop(opts);
 
                         // Get whisper context from transcription engine
@@ -195,6 +212,7 @@ impl AudioManager {
                             &vocab,
                             Some(seg_mgr.clone()),
                             data_dir,
+                            batch_max_dur,
                         )
                         .await;
                         if count > 0 {
@@ -208,6 +226,18 @@ impl AudioManager {
         }
 
         start_device_monitor(self_arc.clone(), self.device_manager.clone()).await?;
+
+        // Seed known speakers from DB on startup
+        seed_speakers_from_db(&self.db, &self.segmentation_manager).await;
+
+        // Subscribe to meeting events for calendar-assisted speaker diarization
+        {
+            let seg_mgr = self.segmentation_manager.clone();
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                run_meeting_speaker_constraint_loop(seg_mgr, db).await;
+            });
+        }
 
         info!("audio manager started");
 
@@ -336,55 +366,23 @@ impl AudioManager {
         let audio_chunk_duration = options.audio_chunk_duration;
         let recording_sender = self.recording_sender.clone();
         let is_running = self.device_manager.is_running_mut(device).unwrap();
-        let languages = options.languages.clone();
-        let deepgram_api_key = options.deepgram_api_key.clone();
-        let realtime_enabled = options.enable_realtime;
         let device_clone = device.clone();
         let metrics = self.metrics.clone();
 
         let recording_handle = tokio::spawn(async move {
-            let record_and_transcribe_handle = tokio::spawn(record_and_transcribe(
+            let record_result = tokio::spawn(record_and_transcribe(
                 stream.clone(),
                 audio_chunk_duration,
                 recording_sender.clone(),
                 is_running.clone(),
                 metrics,
-            ));
-
-            let realtime_handle = if realtime_enabled {
-                Some(tokio::spawn(stream_transcription_deepgram(
-                    stream,
-                    languages,
-                    is_running,
-                    deepgram_api_key,
-                )))
-            } else {
-                None
-            };
-
-            let (record_result, realtime_result) = if let Some(handle) = realtime_handle {
-                join!(record_and_transcribe_handle, handle)
-            } else {
-                (record_and_transcribe_handle.await, Ok(Ok(())))
-            };
+            ))
+            .await;
 
             // Check for JoinError (task panic/cancel)
-            if record_result.is_err() || realtime_result.is_err() {
-                let mut e = anyhow!("record_device failed");
-
-                if record_result.is_err() {
-                    let record_error = record_result.err().unwrap();
-                    error!("Record and transcribe error: {}", record_error);
-                    e = e.context(record_error)
-                }
-
-                if realtime_result.is_err() {
-                    let realtime_error = realtime_result.err().unwrap();
-                    error!("Realtime recording error: {}", realtime_error);
-                    e = e.context(realtime_error);
-                }
-
-                return Err(e);
+            if let Err(ref e) = record_result {
+                error!("Record and transcribe error: {}", e);
+                return Err(anyhow!("record_device failed: {}", e));
             }
 
             // Check for inner Result errors (record_and_transcribe returned Err)
@@ -394,13 +392,6 @@ impl AudioManager {
                     device_clone, e
                 );
                 return Err(anyhow!("record_device {} failed: {}", device_clone, e));
-            }
-            if let Ok(Err(ref e)) = realtime_result {
-                warn!(
-                    "realtime recording for device {} exited with error: {}",
-                    device_clone, e
-                );
-                return Err(anyhow!("realtime {} failed: {}", device_clone, e));
             }
 
             warn!(
@@ -431,6 +422,7 @@ impl AudioManager {
         let audio_transcription_engine = options.transcription_engine.clone();
         let vocabulary = options.vocabulary.clone();
         let is_batch_mode = options.transcription_mode == TranscriptionMode::Batch;
+        let batch_max_duration_secs = options.batch_max_duration_secs;
         let filter_music = options.filter_music;
         let vad_engine = self.vad_engine.clone();
         let whisper_receiver = self.recording_receiver.clone();
@@ -464,11 +456,19 @@ impl AudioManager {
             // (i.e. the 45s output-speech window expires between deliveries).
             let mut had_deferred_segments = false;
 
-            // Max deferral cap: force reconciliation after this duration even if the
-            // session is still active. Prevents infinite deferral during long calls
-            // or perpetual output-audio sessions (the meeting detector's 45s window
-            // can keep the session alive indefinitely).
-            const MAX_DEFERRAL_SECS: u64 = 600; // 10 minutes
+            // Max deferral cap: hardcoded per engine (user override only for OpenAI-compatible).
+            // This lets meetings accumulate audio up to the engine's optimal capacity.
+            let max_deferral_secs = match *audio_transcription_engine {
+                AudioTranscriptionEngine::OpenAICompatible => batch_max_duration_secs
+                    .unwrap_or_else(|| {
+                        super::reconciliation::default_max_batch_duration_secs(
+                            &audio_transcription_engine,
+                        )
+                    }),
+                _ => super::reconciliation::default_max_batch_duration_secs(
+                    &audio_transcription_engine,
+                ),
+            };
             let mut deferral_started: Option<std::time::Instant> = None;
 
             while let Ok(audio) = whisper_receiver.recv() {
@@ -524,8 +524,33 @@ impl AudioManager {
                         // even if transcription is deferred. No transcription yet — just the chunk.
                         // Use the original capture timestamp so audio appears at the correct
                         // position on the timeline, not when processing happened.
-                        if let Err(e) = db.insert_audio_chunk(&path, capture_dt).await {
-                            error!("failed to insert audio chunk into db: {:?}", e);
+                        // Retry DB insertion with backoff to survive transient pool saturation.
+                        // Without this, audio files are written to disk but orphaned from the DB,
+                        // causing silent data loss on the timeline.
+                        let mut inserted = false;
+                        for retry in 0..3u32 {
+                            match db.insert_audio_chunk(&path, capture_dt).await {
+                                Ok(_) => {
+                                    inserted = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "failed to insert audio chunk into db (attempt {}/3): {:?}",
+                                        retry + 1,
+                                        e
+                                    );
+                                    if retry < 2 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            500 * (retry as u64 + 1),
+                                        ))
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        if !inserted {
+                            error!("audio chunk DB insert failed after 3 retries, data may be missing from timeline: {}", path);
                         }
                         Some(path)
                     }
@@ -548,13 +573,12 @@ impl AudioManager {
                         let session_just_ended =
                             !now_in_session && (was_in_session || had_deferred_segments);
 
-                        // Max deferral cap: force reconciliation if we've been
-                        // deferring longer than MAX_DEFERRAL_SECS, even during an
-                        // active session. Prevents infinite deferral during long
-                        // calls or perpetual output-audio activity.
+                        // Force reconciliation if we've been deferring longer
+                        // than the engine's batch limit. Prevents infinite
+                        // deferral during long calls or perpetual output-audio.
                         let deferral_cap_hit = now_in_session
                             && deferral_started
-                                .is_some_and(|t| t.elapsed().as_secs() >= MAX_DEFERRAL_SECS);
+                                .is_some_and(|t| t.elapsed().as_secs() >= max_deferral_secs);
 
                         if session_just_ended || deferral_cap_hit {
                             // Reconcile: session ended or deferral cap reached
@@ -562,7 +586,7 @@ impl AudioManager {
                             deferral_started = None;
                             if deferral_cap_hit {
                                 info!(
-                                    "batch mode: deferral cap ({MAX_DEFERRAL_SECS}s) reached during active session, force-transcribing"
+                                    "batch mode: deferral cap ({max_deferral_secs}s) reached during active session, force-transcribing"
                                 );
                             } else {
                                 info!(
@@ -583,6 +607,7 @@ impl AudioManager {
                                 &vocabulary,
                                 Some(segmentation_manager.clone()),
                                 data_dir,
+                                batch_max_duration_secs,
                             )
                             .await;
                             for _ in 0..count {
@@ -886,6 +911,83 @@ impl AudioManager {
         debug!("cleaned up stale device {} for restart", device_name);
 
         Ok(())
+    }
+}
+
+/// Seed the embedding manager with named speakers from the DB.
+/// This allows returning voices to be recognized immediately instead of
+/// starting anonymous for the first 30+ seconds.
+async fn seed_speakers_from_db(db: &Arc<DatabaseManager>, seg_mgr: &Arc<SegmentationManager>) {
+    match db.get_named_speakers_with_centroids().await {
+        Ok(speakers) if !speakers.is_empty() => {
+            for (_db_id, name, centroid) in &speakers {
+                let emb = ndarray::Array1::from_vec(centroid.clone());
+                seg_mgr.seed_speaker(emb);
+                debug!("seeded known speaker '{}' into embedding manager", name);
+            }
+            info!(
+                "seeded {} known speakers from DB into embedding manager",
+                speakers.len()
+            );
+        }
+        Ok(_) => {
+            debug!("no named speakers with centroids found in DB to seed");
+        }
+        Err(e) => {
+            warn!("failed to query named speakers for seeding: {}", e);
+        }
+    }
+}
+
+/// Background task that subscribes to meeting_started / meeting_ended events
+/// and adjusts speaker clustering constraints accordingly.
+///
+/// On meeting_started with N attendees:
+///   1. Clear existing speaker clusters (prevent cross-meeting contamination)
+///   2. Re-seed known speakers from DB
+///   3. Set max_speakers to N+1 (extra slot for AirPods loopback)
+///
+/// On meeting_ended:
+///   1. Reset max_speakers to unlimited
+///   2. Re-seed known speakers for non-meeting recognition
+async fn run_meeting_speaker_constraint_loop(
+    seg_mgr: Arc<SegmentationManager>,
+    db: Arc<DatabaseManager>,
+) {
+    use futures::StreamExt;
+
+    let mut meeting_sub =
+        screenpipe_events::subscribe_to_event::<MeetingEventData>("meeting_started");
+    let mut ended_sub = screenpipe_events::subscribe_to_event::<MeetingEventData>("meeting_ended");
+
+    info!("calendar-assisted speaker diarization: listening for meeting events");
+
+    loop {
+        tokio::select! {
+            Some(event) = meeting_sub.next() => {
+                if let Some(attendees) = &event.data.calendar_attendees {
+                    if attendees.len() >= 2 {
+                        let max = attendees.len() + 1; // +1 for AirPods loopback
+                        info!(
+                            "meeting started with {} attendees, constraining to {} speakers",
+                            attendees.len(),
+                            max
+                        );
+                        // Phase 3: Clear + re-seed + constrain
+                        seg_mgr.clear_speakers();
+                        seed_speakers_from_db(&db, &seg_mgr).await;
+                        seg_mgr.set_max_speakers(max);
+                    }
+                }
+                // No calendar attendees → no constraint, current behavior preserved
+            }
+            Some(_event) = ended_sub.next() => {
+                info!("meeting ended, resetting speaker constraints");
+                seg_mgr.reset_max_speakers();
+                // Re-seed for non-meeting recognition
+                seed_speakers_from_db(&db, &seg_mgr).await;
+            }
+        }
     }
 }
 

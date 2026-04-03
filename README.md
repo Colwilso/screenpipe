@@ -9,22 +9,7 @@
 
 
 <p align="center">AI memory for your screen</p>
-<p align="center">AI finally knows what you're doing</p>
-
-
-
-<p align="center">
-   <a href ="https://screenpi.pe">
-      <img src="https://github.com/user-attachments/assets/c88d218e-40a7-405d-b419-eec1553ea287">
-   </a>
-</p>
-
-
-<p align="center">
-   <a href ="https://screenpi.pe">
-      <img src="https://github.com/user-attachments/assets/b482f71d-cccc-4b42-a9b9-bf06a67d401b" alt="logo" width="800">
-   </a>
-</p>
+<p align="center">run agents that work for you in the background based on what you do</p>
 
 
 <p align="center">
@@ -45,6 +30,7 @@
   </a>
 </p>
 
+![image](https://github.com/user-attachments/assets/5b977f48-0355-498f-a3ba-37e5de3b6c62)
 ![image](https://github.com/user-attachments/assets/dec2e07c-b3d5-46dd-9f36-c0c26a82c9fb)
 
 
@@ -61,6 +47,7 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 ```
 
 - **remember everything** - never forget what you saw, heard, or did
+- **run agents that work based on what you do** - pipes are agents triggered by your work activity
 - **search with ai** - find anything using natural language
 - **100% local** - your data never leaves your machine
 - **open source** - inspect, modify, own
@@ -81,6 +68,15 @@ or run the CLI:
 ```bash
 npx screenpipe@latest record
 ```
+
+then 
+
+```bash
+claude mcp add screenpipe -- npx -y screenpipe-mcp
+```
+
+then ask claude `what did i see in the last 5 mins?` or `summarize today conversations` or `create a pipe that updates linear every time i work on task X`
+
 
 ## specs
 
@@ -301,7 +297,7 @@ Each pipe supports YAML frontmatter fields (allow-apps, deny-apps, deny-windows,
 
 ## Company
 
-Built by screenpipe (formerly Mediar). Founded 2024. Based in San Francisco, CA.
+Built by screenpipe (Mediar, Inc.). Founded 2024. Based in San Francisco, CA.
 
 - Founder: Louis Beaumont (@louis030195)
 - Twitter: @screen_pipe

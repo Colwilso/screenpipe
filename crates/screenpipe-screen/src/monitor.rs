@@ -74,6 +74,14 @@ pub struct SafeMonitor {
     cached_sck: Option<SckMonitor>,
     #[cfg(target_os = "macos")]
     cached_xcap: Option<XcapMonitor>,
+    /// Cached index position in XcapMonitor::all() to avoid linear search on every capture.
+    /// Monitor IDs are stable during a session, so we try the cached index first (O(1)).
+    #[cfg(not(target_os = "macos"))]
+    cached_monitor_index: Arc<std::sync::Mutex<Option<usize>>>,
+    /// Persistent WGC capture session to avoid orange border flash from per-frame session lifecycle.
+    /// Lazy-initialized on first capture_image() call.
+    #[cfg(target_os = "windows")]
+    persistent_capture: Arc<std::sync::Mutex<Option<crate::wgc_capture::PersistentCapture>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +196,9 @@ impl SafeMonitor {
         Self {
             monitor_id,
             monitor_data,
+            cached_monitor_index: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            persistent_capture: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -272,32 +283,147 @@ impl SafeMonitor {
         Ok(image)
     }
 
-    // Non-macOS: XcapMonitor contains *mut c_void (not Send), so we can't cache it.
-    // Still use spawn_blocking for thread pool reuse, but enumerate inside the closure.
+    // Non-macOS: Use persistent WGC capture on Windows to avoid orange border flash.
+    // Falls back to per-frame xcap capture if persistent session fails.
     #[cfg(not(target_os = "macos"))]
     pub async fn capture_image(&self) -> Result<DynamicImage> {
         let monitor_id = self.monitor_id;
 
-        let image = tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
-            let monitor = XcapMonitor::all()
-                .map_err(Error::from)?
-                .into_iter()
-                .find(|m| m.id().unwrap_or(0) == monitor_id)
-                .ok_or_else(|| anyhow::anyhow!("Monitor not found"))?;
+        #[cfg(target_os = "windows")]
+        {
+            let persistent = self.persistent_capture.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
+                // Try existing persistent session
+                {
+                    let guard = persistent
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("persistent capture mutex poisoned: {}", e))?;
+                    if let Some(ref capture) = *guard {
+                        match capture.get_latest_image(std::time::Duration::from_millis(200)) {
+                            Ok(img) => return Ok(img),
+                            Err(e) => {
+                                tracing::debug!(
+                                    "persistent capture failed for monitor {}, will reinit: {}",
+                                    monitor_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
 
-            if monitor.width().unwrap_or(0) == 0 || monitor.height().unwrap_or(0) == 0 {
-                return Err(anyhow::anyhow!("Invalid monitor dimensions"));
+                // Drop broken session and try to create a new one
+                {
+                    let mut guard = persistent
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("persistent capture mutex poisoned: {}", e))?;
+                    if let Some(mut old) = guard.take() {
+                        old.stop();
+                    }
+                }
+
+                match crate::wgc_capture::PersistentCapture::new(monitor_id) {
+                    Ok(capture) => {
+                        // First frame — allow longer timeout for WGC to deliver
+                        match capture.get_latest_image(std::time::Duration::from_millis(500)) {
+                            Ok(img) => {
+                                let mut guard = persistent.lock().map_err(|e| {
+                                    anyhow::anyhow!("persistent capture mutex poisoned: {}", e)
+                                })?;
+                                *guard = Some(capture);
+                                return Ok(img);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "persistent capture init got no first frame for monitor {}: {}",
+                                    monitor_id,
+                                    e
+                                );
+                                // capture dropped here, session cleaned up
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to create persistent capture for monitor {}, falling back to per-frame: {}",
+                            monitor_id,
+                            e
+                        );
+                    }
+                }
+
+                // Fallback: per-frame xcap capture (original behavior)
+                Self::per_frame_capture(monitor_id)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("capture task panicked: {}", e))??;
+
+            return Ok(result);
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let cached_idx = self.cached_monitor_index.clone();
+            let image = tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
+                Self::per_frame_capture_with_cache(monitor_id, cached_idx)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("capture task panicked: {}", e))??;
+            Ok(image)
+        }
+    }
+
+    /// Per-frame xcap capture fallback (no index caching).
+    #[cfg(not(target_os = "macos"))]
+    fn per_frame_capture(monitor_id: u32) -> Result<DynamicImage> {
+        let monitors = XcapMonitor::all().map_err(Error::from)?;
+        let monitor = monitors
+            .iter()
+            .find(|m| m.id().unwrap_or(0) == monitor_id)
+            .ok_or_else(|| anyhow::anyhow!("Monitor not found"))?;
+        if monitor.width().unwrap_or(0) == 0 || monitor.height().unwrap_or(0) == 0 {
+            return Err(anyhow::anyhow!("Invalid monitor dimensions"));
+        }
+        monitor
+            .capture_image()
+            .map_err(Error::from)
+            .map(DynamicImage::ImageRgba8)
+    }
+
+    /// Per-frame xcap capture with cached index (Linux path).
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_os = "windows"))]
+    fn per_frame_capture_with_cache(
+        monitor_id: u32,
+        cached_idx: Arc<std::sync::Mutex<Option<usize>>>,
+    ) -> Result<DynamicImage> {
+        let monitors = XcapMonitor::all().map_err(Error::from)?;
+
+        let monitor = {
+            let idx = cached_idx.lock().unwrap();
+            idx.and_then(|i| monitors.get(i))
+                .filter(|m| m.id().unwrap_or(0) == monitor_id)
+        }
+        .or_else(|| {
+            let found = monitors
+                .iter()
+                .enumerate()
+                .find(|(_, m)| m.id().unwrap_or(0) == monitor_id);
+            if let Some((i, _)) = found {
+                *cached_idx.lock().unwrap() = Some(i);
             }
-
-            monitor
-                .capture_image()
-                .map_err(Error::from)
-                .map(DynamicImage::ImageRgba8)
+            found.map(|(_, m)| m)
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("capture task panicked: {}", e))??;
+        .ok_or_else(|| anyhow::anyhow!("Monitor not found"))?;
 
-        Ok(image)
+        if monitor.width().unwrap_or(0) == 0 || monitor.height().unwrap_or(0) == 0 {
+            return Err(anyhow::anyhow!("Invalid monitor dimensions"));
+        }
+
+        monitor
+            .capture_image()
+            .map_err(Error::from)
+            .map(DynamicImage::ImageRgba8)
     }
 
     /// Refresh the cached monitor handle by re-enumerating all monitors.
@@ -364,8 +490,19 @@ impl SafeMonitor {
 
     /// Refresh monitor metadata by re-enumerating all monitors.
     /// On non-macOS we can't cache XcapMonitor (not Send), so this only updates metadata.
+    /// Also stops any persistent WGC session so the next capture_image() re-inits it.
     #[cfg(not(target_os = "macos"))]
     pub async fn refresh(&mut self) -> Result<()> {
+        // Stop persistent capture so next capture_image() lazy-inits a new session
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(mut guard) = self.persistent_capture.lock() {
+                if let Some(mut capture) = guard.take() {
+                    capture.stop();
+                }
+            }
+        }
+
         let monitor_id = self.monitor_id;
 
         let refreshed = tokio::task::spawn_blocking(move || -> Result<MonitorData> {
@@ -390,6 +527,8 @@ impl SafeMonitor {
         .map_err(|e| anyhow::anyhow!("refresh task panicked: {}", e))??;
 
         self.monitor_data = Arc::new(refreshed);
+        // Invalidate cached index — monitor list may have changed
+        *self.cached_monitor_index.lock().unwrap() = None;
         tracing::debug!("Refreshed monitor {} metadata", self.monitor_id);
         Ok(())
     }
@@ -711,6 +850,10 @@ mod tests {
             cached_sck: None,
             #[cfg(target_os = "macos")]
             cached_xcap: None,
+            #[cfg(not(target_os = "macos"))]
+            cached_monitor_index: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            persistent_capture: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

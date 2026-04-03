@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use screenpipe_core::Language;
 use std::sync::Arc;
-#[cfg(feature = "qwen3-asr")]
+#[cfg(any(feature = "qwen3-asr", feature = "parakeet", feature = "parakeet-mlx"))]
 use std::sync::Mutex as StdMutex;
 use tracing::{error, info};
 use whisper_rs::{WhisperContext, WhisperState};
@@ -34,6 +34,16 @@ pub enum TranscriptionEngine {
         model: Arc<StdMutex<audiopipe::Model>>,
         vocabulary: Vec<VocabularyEntry>,
     },
+    #[cfg(feature = "parakeet")]
+    Parakeet {
+        model: Arc<StdMutex<audiopipe::Model>>,
+        vocabulary: Vec<VocabularyEntry>,
+    },
+    #[cfg(feature = "parakeet-mlx")]
+    ParakeetMlx {
+        model: Arc<StdMutex<audiopipe::Model>>,
+        vocabulary: Vec<VocabularyEntry>,
+    },
     Deepgram {
         api_key: String,
         languages: Vec<Language>,
@@ -46,6 +56,8 @@ pub enum TranscriptionEngine {
         client: Arc<Client>,
         languages: Vec<Language>,
         vocabulary: Vec<VocabularyEntry>,
+        headers: Option<std::collections::HashMap<String, String>>,
+        raw_audio: bool,
     },
     Disabled,
 }
@@ -81,6 +93,8 @@ impl TranscriptionEngine {
                     client,
                     languages,
                     vocabulary,
+                    headers: oc_config.headers,
+                    raw_audio: oc_config.raw_audio,
                 })
             }
 
@@ -88,12 +102,12 @@ impl TranscriptionEngine {
                 #[cfg(feature = "qwen3-asr")]
                 {
                     let model = tokio::task::spawn_blocking(|| {
-                        audiopipe::Model::from_pretrained("qwen3-asr-0.6b-ggml")
+                        audiopipe::Model::from_pretrained("qwen3-asr-0.6b-antirez")
                     })
                     .await
                     .map_err(|e| anyhow!("qwen3-asr model loading task panicked: {}", e))?
                     .map_err(|e| anyhow!("failed to load qwen3-asr model: {}", e))?;
-                    info!("qwen3-asr-ggml model loaded successfully");
+                    info!("qwen3-asr (OpenBLAS) model loaded successfully");
                     Ok(Self::Qwen3Asr {
                         model: Arc::new(StdMutex::new(model)),
                         vocabulary,
@@ -103,6 +117,68 @@ impl TranscriptionEngine {
                 {
                     Err(anyhow!(
                         "qwen3-asr engine selected but the 'qwen3-asr' feature is not enabled"
+                    ))
+                }
+            }
+
+            AudioTranscriptionEngine::Parakeet => {
+                // Auto-upgrade to MLX (GPU) when the feature is compiled in
+                #[cfg(feature = "parakeet-mlx")]
+                {
+                    info!("parakeet selected — auto-upgrading to parakeet-mlx (Metal GPU)");
+                    let model = tokio::task::spawn_blocking(|| {
+                        audiopipe::Model::from_pretrained("parakeet-tdt-0.6b-v3-mlx")
+                    })
+                    .await
+                    .map_err(|e| anyhow!("parakeet-mlx model loading task panicked: {}", e))?
+                    .map_err(|e| anyhow!("failed to load parakeet-mlx model: {}", e))?;
+                    info!("parakeet-tdt-0.6b-v3-mlx (GPU) model loaded successfully");
+                    Ok(Self::ParakeetMlx {
+                        model: Arc::new(StdMutex::new(model)),
+                        vocabulary,
+                    })
+                }
+                #[cfg(all(feature = "parakeet", not(feature = "parakeet-mlx")))]
+                {
+                    let model = tokio::task::spawn_blocking(|| {
+                        audiopipe::Model::from_pretrained("parakeet-tdt-0.6b-v3")
+                    })
+                    .await
+                    .map_err(|e| anyhow!("parakeet model loading task panicked: {}", e))?
+                    .map_err(|e| anyhow!("failed to load parakeet model: {}", e))?;
+                    info!("parakeet-tdt-0.6b-v3 (multilingual) model loaded successfully");
+                    Ok(Self::Parakeet {
+                        model: Arc::new(StdMutex::new(model)),
+                        vocabulary,
+                    })
+                }
+                #[cfg(not(any(feature = "parakeet", feature = "parakeet-mlx")))]
+                {
+                    Err(anyhow!(
+                        "parakeet engine selected but neither 'parakeet' nor 'parakeet-mlx' feature is enabled"
+                    ))
+                }
+            }
+
+            AudioTranscriptionEngine::ParakeetMlx => {
+                #[cfg(feature = "parakeet-mlx")]
+                {
+                    let model = tokio::task::spawn_blocking(|| {
+                        audiopipe::Model::from_pretrained("parakeet-tdt-0.6b-v3-mlx")
+                    })
+                    .await
+                    .map_err(|e| anyhow!("parakeet-mlx model loading task panicked: {}", e))?
+                    .map_err(|e| anyhow!("failed to load parakeet-mlx model: {}", e))?;
+                    info!("parakeet-tdt-0.6b-v3-mlx (GPU) model loaded successfully");
+                    Ok(Self::ParakeetMlx {
+                        model: Arc::new(StdMutex::new(model)),
+                        vocabulary,
+                    })
+                }
+                #[cfg(not(feature = "parakeet-mlx"))]
+                {
+                    Err(anyhow!(
+                        "parakeet-mlx engine selected but the 'parakeet-mlx' feature is not enabled"
                     ))
                 }
             }
@@ -123,18 +199,20 @@ impl TranscriptionEngine {
 
                 info!("loading whisper model with GPU acceleration...");
                 let context = tokio::task::spawn_blocking(move || {
-                    WhisperContext::new_with_params(
-                        &quantized_path.to_string_lossy(),
-                        context_param,
-                    )
-                    .map(Arc::new)
+                    WhisperContext::new_with_params(&quantized_path, context_param).map(Arc::new)
                 })
                 .await
                 .map_err(|e| anyhow!("whisper model loading task panicked: {}", e))?
                 .map_err(|e| anyhow!("failed to load whisper model: {}", e))?;
 
                 info!("whisper model loaded successfully");
-                whisper_rs::install_logging_hooks();
+                // NOTE: do NOT call whisper_rs::install_logging_hooks() here.
+                // It redirects ggml/whisper logs into Rust's tracing subscriber via
+                // a global FFI callback. During app restart (process::exit), C++ static
+                // destructors free Metal GPU resources and try to log via this hook —
+                // but the tracing subscriber's thread-local storage is already torn down,
+                // causing a double panic → abort. Without the hook, ggml logs go to
+                // stderr harmlessly.
 
                 Ok(Self::Whisper {
                     context,
@@ -173,6 +251,16 @@ impl TranscriptionEngine {
                 model: model.clone(),
                 vocabulary: vocabulary.clone(),
             }),
+            #[cfg(feature = "parakeet")]
+            Self::Parakeet { model, vocabulary } => Ok(TranscriptionSession::Parakeet {
+                model: model.clone(),
+                vocabulary: vocabulary.clone(),
+            }),
+            #[cfg(feature = "parakeet-mlx")]
+            Self::ParakeetMlx { model, vocabulary } => Ok(TranscriptionSession::ParakeetMlx {
+                model: model.clone(),
+                vocabulary: vocabulary.clone(),
+            }),
             Self::Deepgram {
                 api_key,
                 languages,
@@ -189,6 +277,8 @@ impl TranscriptionEngine {
                 client,
                 languages,
                 vocabulary,
+                headers,
+                raw_audio,
             } => Ok(TranscriptionSession::OpenAICompatible {
                 endpoint: endpoint.clone(),
                 api_key: api_key.clone(),
@@ -196,6 +286,8 @@ impl TranscriptionEngine {
                 client: client.clone(),
                 languages: languages.clone(),
                 vocabulary: vocabulary.clone(),
+                headers: headers.clone(),
+                raw_audio: *raw_audio,
             }),
             Self::Disabled => Ok(TranscriptionSession::Disabled),
         }
@@ -215,6 +307,10 @@ impl TranscriptionEngine {
             Self::Whisper { config, .. } => (**config).clone(),
             #[cfg(feature = "qwen3-asr")]
             Self::Qwen3Asr { .. } => AudioTranscriptionEngine::Qwen3Asr,
+            #[cfg(feature = "parakeet")]
+            Self::Parakeet { .. } => AudioTranscriptionEngine::Parakeet,
+            #[cfg(feature = "parakeet-mlx")]
+            Self::ParakeetMlx { .. } => AudioTranscriptionEngine::ParakeetMlx,
             Self::Deepgram { .. } => AudioTranscriptionEngine::Deepgram,
             Self::OpenAICompatible { .. } => AudioTranscriptionEngine::OpenAICompatible,
             Self::Disabled => AudioTranscriptionEngine::Disabled,
@@ -238,6 +334,16 @@ pub enum TranscriptionSession {
         model: Arc<StdMutex<audiopipe::Model>>,
         vocabulary: Vec<VocabularyEntry>,
     },
+    #[cfg(feature = "parakeet")]
+    Parakeet {
+        model: Arc<StdMutex<audiopipe::Model>>,
+        vocabulary: Vec<VocabularyEntry>,
+    },
+    #[cfg(feature = "parakeet-mlx")]
+    ParakeetMlx {
+        model: Arc<StdMutex<audiopipe::Model>>,
+        vocabulary: Vec<VocabularyEntry>,
+    },
     Deepgram {
         api_key: String,
         languages: Vec<Language>,
@@ -250,6 +356,8 @@ pub enum TranscriptionSession {
         client: Arc<Client>,
         languages: Vec<Language>,
         vocabulary: Vec<VocabularyEntry>,
+        headers: Option<std::collections::HashMap<String, String>>,
+        raw_audio: bool,
     },
     Disabled,
 }
@@ -270,20 +378,36 @@ impl TranscriptionSession {
                 languages,
                 vocabulary,
             } => {
-                match transcribe_with_deepgram(
-                    api_key,
-                    audio,
-                    device,
-                    sample_rate,
-                    languages.clone(),
-                    vocabulary,
-                )
-                .await
-                {
-                    Ok(t) => Ok(t),
-                    Err(e) => {
-                        error!("device: {}, deepgram transcription failed: {:?}", device, e);
-                        Err(e)
+                // Deepgram is a paid API — skip near-silence to avoid burning costs.
+                // Empirical RMS values (see audio_manager/manager.rs):
+                //   output silence = 0.0, output playing = 0.0028, input speech ≈ 0.05+
+                // Audio here is post-normalization (target RMS 0.2), but true silence
+                // (rms < EPSILON) is not normalized and stays at 0.0.
+                let rms =
+                    (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
+                if rms < 0.002 {
+                    tracing::debug!(
+                        "device: {}, skipping deepgram — audio RMS {:.6} below silence threshold",
+                        device,
+                        rms
+                    );
+                    Ok(String::new())
+                } else {
+                    match transcribe_with_deepgram(
+                        api_key,
+                        audio,
+                        device,
+                        sample_rate,
+                        languages.clone(),
+                        vocabulary,
+                    )
+                    .await
+                    {
+                        Ok(t) => Ok(t),
+                        Err(e) => {
+                            error!("device: {}, deepgram transcription failed: {:?}", device, e);
+                            Err(e)
+                        }
                     }
                 }
             }
@@ -312,6 +436,46 @@ impl TranscriptionSession {
                 }
             }
 
+            #[cfg(feature = "parakeet")]
+            Self::Parakeet { model, .. } => {
+                let mut engine = model.lock().map_err(|e| anyhow!("stt model lock: {}", e))?;
+                // parakeet's ONNX encoder supports up to ~50s but quality is best at <=30s.
+                // benchmarked: 30s hard chunks with no overlap gives 33.9% WER vs 34.5%
+                // with 1s overlap+LCS (the dedup algorithm eats correct words).
+                // this is a safety net — the reconciler already caps batches at 45s.
+                let chunk_samples = (sample_rate as usize) * 30;
+                if audio.len() <= chunk_samples {
+                    let opts = audiopipe::TranscribeOptions::default();
+                    let result = engine
+                        .transcribe_with_sample_rate(audio, sample_rate, opts)
+                        .map_err(|e| anyhow!("{}", e))?;
+                    Ok(result.text)
+                } else {
+                    let mut texts = Vec::new();
+                    for chunk in audio.chunks(chunk_samples) {
+                        let opts = audiopipe::TranscribeOptions::default();
+                        let result = engine
+                            .transcribe_with_sample_rate(chunk, sample_rate, opts)
+                            .map_err(|e| anyhow!("{}", e))?;
+                        let text = result.text.trim().to_string();
+                        if !text.is_empty() {
+                            texts.push(text);
+                        }
+                    }
+                    Ok(texts.join(" "))
+                }
+            }
+
+            #[cfg(feature = "parakeet-mlx")]
+            Self::ParakeetMlx { model, .. } => {
+                let mut engine = model.lock().map_err(|e| anyhow!("stt model lock: {}", e))?;
+                let opts = audiopipe::TranscribeOptions::default();
+                let result = engine
+                    .transcribe_with_sample_rate(audio, sample_rate, opts)
+                    .map_err(|e| anyhow!("{}", e))?;
+                Ok(result.text)
+            }
+
             Self::Whisper {
                 state,
                 languages,
@@ -326,6 +490,8 @@ impl TranscriptionSession {
                 client,
                 languages,
                 vocabulary,
+                headers,
+                raw_audio,
             } => {
                 // Convert vocabulary entries to words for the API
                 let vocab_words: Vec<String> = vocabulary.iter().map(|v| v.word.clone()).collect();
@@ -339,6 +505,8 @@ impl TranscriptionSession {
                     sample_rate,
                     languages.clone(),
                     &vocab_words,
+                    headers.as_ref(),
+                    *raw_audio,
                 )
                 .await
                 {
@@ -361,6 +529,10 @@ impl TranscriptionSession {
                     Self::Whisper { vocabulary, .. } => vocabulary,
                     #[cfg(feature = "qwen3-asr")]
                     Self::Qwen3Asr { vocabulary, .. } => vocabulary,
+                    #[cfg(feature = "parakeet")]
+                    Self::Parakeet { vocabulary, .. } => vocabulary,
+                    #[cfg(feature = "parakeet-mlx")]
+                    Self::ParakeetMlx { vocabulary, .. } => vocabulary,
                     Self::Deepgram { vocabulary, .. } => vocabulary,
                     Self::OpenAICompatible { vocabulary, .. } => vocabulary,
                     Self::Disabled => return Ok(text),

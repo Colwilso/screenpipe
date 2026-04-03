@@ -39,7 +39,7 @@ Create `~/.screenpipe/pipes/<name>/pipe.md` with YAML frontmatter + prompt:
 ---
 schedule: every 30m
 enabled: true
-preset: Oai
+preset: ["Primary", "Fallback"]
 ---
 
 Your prompt instructions here. The AI agent executes this on schedule.
@@ -53,7 +53,7 @@ Your prompt instructions here. The AI agent executes this on schedule.
 
 **Schedule syntax**: `every 30m`, `every 1h`, `every day at 9am`, `every monday at 9am`, or cron: `*/30 * * * *`, `0 9 * * *`
 
-**Config fields**: `schedule`, `enabled` (bool), `preset` (AI preset name), `history` (bool — include previous output as context)
+**Config fields**: `schedule`, `enabled` (bool), `preset` (string or array — e.g. `"Oai"` or `["Primary", "Fallback"]`), `history` (bool — include previous output as context)
 
 Screenpipe prepends a context header with time range, timezone, OS, and API URL before each execution. No template variables needed.
 
@@ -118,3 +118,11 @@ bunx screenpipe@latest connection list
 Connection IDs: `telegram`, `slack`, `discord`, `email`, `todoist`, `teams`, `google-calendar`, `apple-intelligence`, `openclaw`
 
 Credentials are stored locally at `~/.screenpipe/connections.json`.
+
+## Publishing pipes to the store
+
+```bash
+screenpipe pipe publish <pipe-name>
+```
+
+Reads `~/.screenpipe/pipes/<pipe-name>/pipe.md`, extracts title/description/icon/category from YAML frontmatter, and publishes to the screenpipe pipe store. Requires auth (SCREENPIPE_API_KEY env var or `~/.screenpipe/auth.json`).

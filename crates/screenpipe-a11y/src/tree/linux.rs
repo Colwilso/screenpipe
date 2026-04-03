@@ -16,8 +16,8 @@
 //! - Enable with: `gsettings set org.gnome.desktop.interface toolkit-accessibility true`
 
 use super::{
-    AccessibilityTreeNode, NodeBounds, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform,
-    TruncationReason,
+    AccessibilityTreeNode, NodeBounds, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
+    TreeWalkerPlatform, TruncationReason,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -123,7 +123,11 @@ fn role_name(role: u32) -> &'static str {
 // ---------------------------------------------------------------------------
 
 const STATE_ACTIVE: u32 = 1;
+const STATE_ENABLED: u32 = 7;
+const STATE_EXPANDED: u32 = 9;
+const STATE_FOCUSABLE: u32 = 10;
 const STATE_FOCUSED: u32 = 12;
+const STATE_SELECTED: u32 = 18;
 
 fn has_state(state_set: &[u32], bit: u32) -> bool {
     let word = (bit / 32) as usize;
@@ -151,16 +155,18 @@ const EXCLUDED_APPS: &[&str] = &[
     "screenpipe",
     "nm-connection-editor",
     "polkit",
-    // Window managers — no user content
+    // Window managers / desktop shells — no user content
     "xfwm4",
     "mutter",
+    "muffin",
     "kwin",
     "marco",
     "openbox",
     "compiz",
+    "cinnamon",
+    "budgie-panel",
+    "budgie-wm",
 ];
-
-const SENSITIVE_TITLES: &[&str] = &["password", "private", "incognito", "secret"];
 
 /// Known browser process names for URL extraction.
 const BROWSER_NAMES: &[&str] = &[
@@ -173,6 +179,7 @@ const BROWSER_NAMES: &[&str] = &[
     "edge",
     "epiphany",
     "zen",
+    "comet",
     "google-chrome",
     "microsoft-edge",
 ];
@@ -555,6 +562,23 @@ fn walk_accessible(conn: &Connection, aref: &AccessibleRef, depth: usize, state:
     }
 }
 
+/// Fill automation state properties from AT-SPI state set (single D-Bus call).
+fn fill_atspi_state(node: &mut AccessibilityTreeNode, conn: &Connection, aref: &AccessibleRef) {
+    let state_set = get_accessible_state(conn, aref);
+    if !state_set.is_empty() {
+        node.is_enabled = Some(has_state(&state_set, STATE_ENABLED));
+        node.is_focused = Some(has_state(&state_set, STATE_FOCUSED));
+        node.is_selected = Some(has_state(&state_set, STATE_SELECTED));
+        node.is_expanded = Some(has_state(&state_set, STATE_EXPANDED));
+        node.is_keyboard_focusable = Some(has_state(&state_set, STATE_FOCUSABLE));
+    }
+    // Description doubles as help_text on Linux
+    let desc = get_accessible_description(conn, aref);
+    if !desc.is_empty() {
+        node.help_text = Some(desc);
+    }
+}
+
 /// Extract text from a text-bearing accessible element.
 fn extract_text(
     conn: &Connection,
@@ -572,12 +596,14 @@ fn extract_text(
     if matches!(role, 79 | 61 | 11) {
         if let Some(text) = get_text_content(conn, aref) {
             append_text(&mut state.text_buffer, &text);
-            state.nodes.push(AccessibilityTreeNode {
-                role: role_str.to_string(),
-                text: text.trim().to_string(),
-                depth: depth.min(255) as u8,
+            let mut node = AccessibilityTreeNode::new(
+                role_str.to_string(),
+                text.trim().to_string(),
+                depth.min(255) as u8,
                 bounds,
-            });
+            );
+            fill_atspi_state(&mut node, conn, aref);
+            state.nodes.push(node);
             return;
         }
     }
@@ -586,12 +612,14 @@ fn extract_text(
     if matches!(role, 29 | 73 | 116) {
         if let Some(text) = get_text_content(conn, aref) {
             append_text(&mut state.text_buffer, &text);
-            state.nodes.push(AccessibilityTreeNode {
-                role: role_str.to_string(),
-                text: text.trim().to_string(),
-                depth: depth.min(255) as u8,
+            let mut node = AccessibilityTreeNode::new(
+                role_str.to_string(),
+                text.trim().to_string(),
+                depth.min(255) as u8,
                 bounds,
-            });
+            );
+            fill_atspi_state(&mut node, conn, aref);
+            state.nodes.push(node);
             return;
         }
     }
@@ -600,12 +628,14 @@ fn extract_text(
     let name = get_accessible_name(conn, aref);
     if !name.is_empty() {
         append_text(&mut state.text_buffer, &name);
-        state.nodes.push(AccessibilityTreeNode {
-            role: role_str.to_string(),
-            text: name.trim().to_string(),
-            depth: depth.min(255) as u8,
+        let mut node = AccessibilityTreeNode::new(
+            role_str.to_string(),
+            name.trim().to_string(),
+            depth.min(255) as u8,
             bounds,
-        });
+        );
+        fill_atspi_state(&mut node, conn, aref);
+        state.nodes.push(node);
         return;
     }
 
@@ -613,12 +643,14 @@ fn extract_text(
     let desc = get_accessible_description(conn, aref);
     if !desc.is_empty() {
         append_text(&mut state.text_buffer, &desc);
-        state.nodes.push(AccessibilityTreeNode {
-            role: role_str.to_string(),
-            text: desc.trim().to_string(),
-            depth: depth.min(255) as u8,
+        let mut node = AccessibilityTreeNode::new(
+            role_str.to_string(),
+            desc.trim().to_string(),
+            depth.min(255) as u8,
             bounds,
-        });
+        );
+        fill_atspi_state(&mut node, conn, aref);
+        state.nodes.push(node);
     }
 }
 
@@ -853,7 +885,7 @@ impl LinuxTreeWalker {
 }
 
 impl TreeWalkerPlatform for LinuxTreeWalker {
-    fn walk_focused_window(&self) -> Result<Option<TreeSnapshot>> {
+    fn walk_focused_window(&self) -> Result<TreeWalkResult> {
         let start = Instant::now();
 
         // Safety: single-threaded access guaranteed by walker thread design
@@ -862,23 +894,24 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
         // Find the focused window
         let (app_name, window_title, window_ref, _pid) = match find_focused_window(conn) {
             Some(result) => result,
-            None => return Ok(None),
+            None => return Ok(TreeWalkResult::NotFound),
         };
 
-        // Check sensitive window titles
-        let window_lower = window_title.to_lowercase();
-        if SENSITIVE_TITLES.iter().any(|s| window_lower.contains(s)) {
-            return Ok(None);
+        // Skip incognito / private browsing windows (localized title check)
+        if self.config.ignore_incognito_windows && crate::incognito::is_title_private(&window_title)
+        {
+            return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
         }
 
         let app_lower = app_name.to_lowercase();
+        let window_lower = window_title.to_lowercase();
 
         // Apply user-configured ignored windows
         if self.config.ignored_windows.iter().any(|pattern| {
             let p = pattern.to_lowercase();
             app_lower.contains(&p) || window_lower.contains(&p)
         }) {
-            return Ok(None);
+            return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
         }
 
         // Apply user-configured included windows (whitelist)
@@ -888,7 +921,7 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
                 app_lower.contains(&p) || window_lower.contains(&p)
             });
             if !matches {
-                return Ok(None);
+                return Ok(TreeWalkResult::Skipped(SkipReason::NotInIncludeList));
             }
         }
 
@@ -940,7 +973,7 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
             walk_duration
         );
 
-        Ok(Some(TreeSnapshot {
+        Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name: window_title,
             text_content,
@@ -1013,11 +1046,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sensitive_titles() {
-        assert!(SENSITIVE_TITLES
-            .iter()
-            .any(|s| "enter password".contains(s)));
-        assert!(!SENSITIVE_TITLES.iter().any(|s| "calculator".contains(s)));
+    fn test_incognito_detection() {
+        use crate::incognito::is_title_private;
+        assert!(is_title_private("Enter Password - Chrome"));
+        assert!(is_title_private("Private Browsing - Firefox"));
+        assert!(!is_title_private("Calculator"));
     }
 
     #[test]

@@ -10,11 +10,12 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, Zap, History, Search, Trash2, ChevronLeft, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip } from "lucide-react";
+import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
 import { PipeAIIcon, PipeAIIconLarge } from "@/components/pipe-ai-icon";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { MemoizedReactMarkdown } from "@/components/markdown";
 import { VideoComponent } from "@/components/rewind/video";
 import { MermaidDiagram } from "@/components/rewind/mermaid-diagram";
@@ -35,7 +36,7 @@ import { usePlatform } from "@/lib/hooks/use-platform";
 import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
-import { UpgradeDialog } from "@/components/upgrade-dialog";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
 import {
   parseMentions,
   buildAppMentionSuggestions,
@@ -48,7 +49,8 @@ import { type CustomTemplate } from "@/lib/summary-templates";
 import { usePipes } from "@/lib/hooks/use-pipes";
 
 const SCREENPIPE_API = "http://localhost:3030";
-const PI_CHAT_SESSION = "chat";
+// Session ID is per-conversation — set on mount (new conv) and updated on load/new.
+// Stored as a ref so event listeners always see the current value without stale closures.
 
 interface MentionSuggestion {
   tag: string;
@@ -77,6 +79,39 @@ const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
 
 // TOOLS definition removed — search is now handled by Pi's screenpipe-search skill
 
+/**
+ * Extract tier info from gateway error JSON embedded in error strings and
+ * return a user-facing message appropriate to their actual subscription tier.
+ */
+function buildDailyLimitMessage(errorStr: string): string {
+  try {
+    const isCostLimit = errorStr.includes("daily_cost_limit_exceeded");
+    const isRateLimit = errorStr.includes("rate limit") || errorStr.includes("Rate limit");
+
+    if (isRateLimit) {
+      return "This model is temporarily rate-limited. Try again in a few seconds, or switch to a different model.";
+    }
+
+    if (isCostLimit) {
+      return "Daily usage limit reached for this model. Try a lighter model or wait until tomorrow.";
+    }
+
+    const tierMatch = errorStr.match(/"tier":\s*"([^"]+)"/);
+    const tier = tierMatch?.[1];
+
+    if (tier === "subscribed") {
+      return "You've hit your daily limit. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage.";
+    } else if (tier === "logged_in") {
+      return "You've used your free queries for today. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage, or upgrade to Pro.";
+    } else {
+      return "You've used your free queries for today. Sign in for more, or switch to a free model (Qwen3 Coder, Gemini Flash).";
+    }
+  } catch {
+    return "You've reached your daily limit. Try a free model like Qwen3 Coder or Gemini Flash.";
+  }
+}
+
+/** Extract the gateway-reported tier from an error string, if present. */
 // Helper to get timezone offset string (e.g., "+1" or "-5")
 function getTimezoneOffsetString(): string {
   const offsetMinutes = new Date().getTimezoneOffset();
@@ -119,9 +154,10 @@ EXAMPLES OF GOOD SEARCHES:
 - User: "what apps did I use today" → call activity-summary with start_time: today_start, end_time: now → report active_minutes per app
 - User: "what was I reading about X" → search q:"X", start_time:"3h ago" → show text with deep links
 
-Rules for showing videos/audio:
-- Show videos by putting .mp4 file paths in inline code blocks: \`/path/to/video.mp4\`
-- Use the exact, absolute file_path from search results
+Rules for showing media:
+- Show videos/images using standard markdown: ![description](/path/to/file.mp4) or ![description](/path/to/image.jpg)
+- ONLY use the exact, unmodified file_path or audio_file_path from search results. NEVER construct or guess paths.
+- Before showing a video, verify the file exists by checking it with the shell (e.g. ls or Test-Path). If missing, tell the user and retry search with a different time range instead of showing a broken player.
 
 SPEAKER MANAGEMENT (localhost:3030):
 - GET /speakers/unnamed?limit=10 — list unnamed speakers
@@ -139,9 +175,9 @@ VISUALIZATION:
 When the user asks for diagrams, flowcharts, or visualizations, generate Mermaid diagrams using fenced code blocks with the "mermaid" language tag.
 
 DEEP LINKS & MEDIA:
-- Frame (PREFERRED): [10:30 AM — Chrome](screenpipe://frame/12345) — use frame_id from OCR search results. NEVER invent frame IDs.
+- Frame (PREFERRED): [10:30 AM — Chrome](screenpipe://frame/12345) — use frame_id from screen text search results. NEVER invent frame IDs.
 - Timeline (audio only): [meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z) — use exact timestamp from audio search results.
-- Video: show .mp4 paths in inline code: \`/path/to/video.mp4\`
+- Video/Image: use markdown ![description](/path/to/file.mp4)
 NEVER fabricate frame IDs or timestamps — only use values from actual search results.
 
 Current time: ${now.toISOString()}
@@ -185,6 +221,9 @@ interface Message {
   images?: string[]; // base64 data URLs of attached images
   timestamp: number;
   contentBlocks?: ContentBlock[];
+  model?: string;
+  provider?: string;
+  retryPrompt?: string; // when set, renders a retry CTA on error messages
 }
 
 // Tool icons by name
@@ -208,11 +247,13 @@ function GridDissolveLoader({
   label,
   toolName,
   thinkingSecs,
+  tokenCount,
 }: {
   phase?: LoaderPhase;
   label?: string;
   toolName?: string;
   thinkingSecs?: number;
+  tokenCount?: number;
 }) {
   const ROWS = 3;
   const COLS = 5;
@@ -262,6 +303,12 @@ function GridDissolveLoader({
     "analyzing..."
   );
 
+  const tokenLabel = tokenCount != null && tokenCount > 0
+    ? tokenCount >= 1000
+      ? `${(tokenCount / 1000).toFixed(1)}k tokens`
+      : `${tokenCount} tokens`
+    : null;
+
   return (
     <div className="flex items-center gap-2">
       <div
@@ -288,70 +335,147 @@ function GridDissolveLoader({
         ))}
       </div>
       <span className="text-[11px] font-mono text-muted-foreground tracking-wide">
-        {displayLabel}
+        {displayLabel}{tokenLabel && <span className="ml-1.5 opacity-60">· {tokenLabel}</span>}
       </span>
     </div>
   );
 }
 
-function ToolCallBlock({ toolCall }: { toolCall: ToolCall }) {
-  const [expanded, setExpanded] = useState(false);
-  const icon = TOOL_ICONS[toolCall.toolName] || "🔧";
+// Human-friendly label for a tool call (no JSON, no raw paths)
+function friendlyToolLabel(toolCall: ToolCall): string {
+  const fileName = (p: string) => p.split("/").pop() || p;
+  switch (toolCall.toolName) {
+    case "bash":
+      return `Ran ${toolCall.args.command ? `\`${String(toolCall.args.command).slice(0, 60)}${String(toolCall.args.command).length > 60 ? "…" : ""}\`` : "command"}`;
+    case "read":
+      return `Read ${fileName(toolCall.args.path || "")}`;
+    case "edit":
+      return `Edited ${fileName(toolCall.args.path || "")}`;
+    case "write":
+      return `Wrote ${fileName(toolCall.args.path || "")}`;
+    case "grep":
+      return `Searched for \`${toolCall.args.pattern || "pattern"}\``;
+    case "find":
+    case "ls":
+      return `Listed files`;
+    default:
+      return `${toolCall.toolName}`;
+  }
+}
 
-  // Format args for display
-  const argsPreview = toolCall.toolName === "bash"
-    ? toolCall.args.command || ""
-    : toolCall.toolName === "read"
-      ? toolCall.args.path || ""
-      : toolCall.toolName === "edit"
-        ? toolCall.args.path || ""
-        : toolCall.toolName === "write"
-          ? toolCall.args.path || ""
-          : JSON.stringify(toolCall.args).slice(0, 100);
+// Render friendly expanded details instead of raw JSON
+function FriendlyToolDetails({ toolCall }: { toolCall: ToolCall }) {
+  if (toolCall.toolName === "edit" && toolCall.args.old_string && toolCall.args.new_string) {
+    return (
+      <div className="py-1.5 text-xs font-mono space-y-0">
+        {String(toolCall.args.old_string).split("\n").map((line: string, i: number) => (
+          <div key={`old-${i}`} className="text-foreground/40">- {line}</div>
+        ))}
+        {String(toolCall.args.new_string).split("\n").map((line: string, i: number) => (
+          <div key={`new-${i}`} className="text-foreground/80">+ {line}</div>
+        ))}
+      </div>
+    );
+  }
+  if (toolCall.toolName === "bash" && toolCall.args.command) {
+    return (
+      <div className="py-1.5">
+        <pre className="whitespace-pre-wrap break-words text-foreground/70 text-xs font-mono max-h-[200px] overflow-y-auto overflow-x-hidden max-w-full">
+          {toolCall.args.command}
+        </pre>
+      </div>
+    );
+  }
+  const entries = Object.entries(toolCall.args).filter(([k]) => k !== "path" && k !== "command");
+  if (entries.length === 0) return null;
+  return (
+    <div className="py-1.5 text-xs font-mono text-muted-foreground space-y-0">
+      {entries.map(([key, val]) => (
+        <div key={key} className="truncate">
+          <span className="text-foreground/40">{key}:</span>{" "}
+          <span className="text-foreground/70">{typeof val === "string" ? val.slice(0, 200) : JSON.stringify(val).slice(0, 200)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Single tool call row in the progress rail
+function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const label = friendlyToolLabel(toolCall);
 
   return (
-    <div className="rounded-lg border border-border/50 bg-background/50 text-xs font-mono overflow-hidden w-full min-w-0">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-muted/50 transition-colors text-left min-w-0"
-      >
-        {toolCall.isRunning ? (
-          <Loader2 className="h-3 w-3 animate-spin text-muted-foreground flex-shrink-0" />
-        ) : toolCall.isError ? (
-          <span className="text-destructive flex-shrink-0">✗</span>
-        ) : (
-          <span className="text-green-500 flex-shrink-0">✓</span>
-        )}
-        <span className="text-muted-foreground flex-shrink-0">{icon}</span>
-        <span className="font-semibold flex-shrink-0">{toolCall.toolName}</span>
-        <span className="text-muted-foreground truncate flex-1">{argsPreview}</span>
-        <span className="text-muted-foreground flex-shrink-0">{expanded ? "▾" : "▸"}</span>
-      </button>
-      {expanded && (
-        <div className="border-t border-border/50">
-          {/* Args */}
-          <div className="px-3 py-2 bg-neutral-900 dark:bg-neutral-950 text-neutral-300">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">input</div>
-            <pre className="whitespace-pre-wrap break-words text-neutral-100 max-h-[200px] overflow-y-auto overflow-x-hidden max-w-full">
-              {toolCall.toolName === "bash" ? toolCall.args.command : JSON.stringify(toolCall.args, null, 2)}
-            </pre>
-          </div>
-          {/* Result */}
-          {toolCall.result !== undefined && (
-            <div className="px-3 py-2 bg-neutral-900/80 dark:bg-neutral-950/80 text-neutral-300 border-t border-neutral-800">
-              <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">
-                {toolCall.isError ? "error" : "output"}
-              </div>
-              <pre className={cn(
-                "whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto overflow-x-hidden max-w-full",
-                toolCall.isError ? "text-red-400" : "text-neutral-100"
-              )}>
-                {toolCall.result}
-              </pre>
-            </div>
+    <div className="relative flex min-w-0">
+      {/* Vertical rail line */}
+      <div className="flex flex-col items-center flex-shrink-0 w-5">
+        {/* Dot */}
+        <div className="relative flex items-center justify-center w-5 h-5">
+          {toolCall.isRunning ? (
+            // Pulsing hollow dot for running
+            <motion.div
+              className="w-2 h-2 border border-foreground"
+              animate={{ opacity: [1, 1, 0.3, 0.3, 1] }}
+              transition={{ duration: 1, repeat: Infinity, times: [0, 0.25, 0.25, 0.75, 0.75], ease: "linear" }}
+            />
+          ) : toolCall.isError ? (
+            // X mark for error
+            <span className="text-[10px] font-mono font-bold text-foreground leading-none">✗</span>
+          ) : (
+            // Solid dot for success
+            <motion.div
+              className="w-2 h-2 bg-foreground"
+              initial={{ scale: 0 }}
+              animate={{ scale: 1 }}
+              transition={{ duration: 0.15, ease: "easeOut" }}
+            />
           )}
         </div>
-      )}
+        {/* Connecting line */}
+        {!isLast && (
+          <div className="w-px flex-1 bg-border" />
+        )}
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 min-w-0 pb-2">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="w-full flex items-center gap-1.5 text-left min-w-0 group py-0.5"
+        >
+          <span className="truncate flex-1 text-xs font-mono text-foreground/70 group-hover:text-foreground transition-colors duration-150">
+            {label}
+          </span>
+          <span className="text-foreground/30 flex-shrink-0 text-[10px] font-mono group-hover:text-foreground/60 transition-colors duration-150">
+            {expanded ? "−" : "+"}
+          </span>
+        </button>
+        <AnimatePresence>
+          {expanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="overflow-hidden"
+            >
+              <div className="border-l border-border ml-0 pl-3 mt-1 mb-1">
+                <FriendlyToolDetails toolCall={toolCall} />
+                {toolCall.result !== undefined && (
+                  <div className="mt-1 pt-1 border-t border-border/50">
+                    <pre className={cn(
+                      "whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto overflow-x-hidden max-w-full text-xs font-mono",
+                      toolCall.isError ? "text-foreground/50" : "text-foreground/60"
+                    )}>
+                      {toolCall.result}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }
@@ -461,7 +585,7 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
         },
         pre({ children, ...props }) {
           return (
-            <pre className="overflow-x-auto rounded-lg bg-neutral-900 dark:bg-neutral-950 text-neutral-100 p-3 my-2 text-xs max-w-full" {...props}>
+            <pre className="overflow-x-auto rounded-lg bg-neutral-900 dark:bg-neutral-950 p-3 my-2 text-xs max-w-full not-prose" {...props}>
               {children}
             </pre>
           );
@@ -483,14 +607,14 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
 
           if (isCodeBlock) {
             return (
-              <code className="font-mono text-xs block whitespace-pre-wrap break-all text-neutral-100" {...props}>
+              <code className="font-mono text-xs block whitespace-pre-wrap break-all text-neutral-200" {...props}>
                 {content}
               </code>
             );
           }
 
           return (
-            <code className="px-1.5 py-0.5 rounded bg-neutral-800 dark:bg-neutral-900 text-neutral-100 font-mono text-xs" {...props}>
+            <code className="px-1.5 py-0.5 rounded bg-neutral-800 dark:bg-neutral-900 text-neutral-200 font-mono text-xs not-prose" {...props}>
               {content}
             </code>
           );
@@ -534,73 +658,126 @@ function groupContentBlocks(blocks: ContentBlock[]): GroupedBlock[] {
   return result;
 }
 
-function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
-  const [expanded, setExpanded] = useState(false);
-
-  // For 1-2 tool calls, render individually (not worth collapsing)
-  if (toolCalls.length <= 2) {
-    return (
-      <>
-        {toolCalls.map((tc) => (
-          <ToolCallBlock key={tc.id} toolCall={tc} />
-        ))}
-      </>
-    );
+// Build natural-language summary of completed tool calls
+function buildToolSummary(toolCalls: ToolCall[]): string {
+  const counts: Record<string, number> = {};
+  for (const tc of toolCalls) {
+    const action = tc.toolName === "bash" ? "ran" : tc.toolName === "read" ? "read" : tc.toolName === "edit" ? "edited" : tc.toolName === "write" ? "wrote" : tc.toolName === "grep" ? "searched" : tc.toolName;
+    counts[action] = (counts[action] || 0) + 1;
   }
+  const parts = Object.entries(counts).map(([action, count]) => {
+    if (action === "read") return `read ${count} file${count > 1 ? "s" : ""}`;
+    if (action === "edited") return `edited ${count} file${count > 1 ? "s" : ""}`;
+    if (action === "wrote") return `wrote ${count} file${count > 1 ? "s" : ""}`;
+    if (action === "ran") return `ran ${count} command${count > 1 ? "s" : ""}`;
+    if (action === "searched") return `${count} search${count > 1 ? "es" : ""}`;
+    return `${count} ${action}`;
+  });
+  return parts.join(", ");
+}
 
-  const doneCount = toolCalls.filter((tc) => !tc.isRunning).length;
-  const total = toolCalls.length;
+function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
+  const [manualExpand, setManualExpand] = useState<boolean | null>(null);
+
   const hasRunning = toolCalls.some((tc) => tc.isRunning);
   const hasError = toolCalls.some((tc) => tc.isError);
-  const activeCall = toolCalls.find((tc) => tc.isRunning);
+  const allDone = !hasRunning;
+  const doneCount = toolCalls.filter((tc) => !tc.isRunning).length;
+  const total = toolCalls.length;
+  const summary = allDone ? buildToolSummary(toolCalls) : "";
 
-  // Build a short preview of the active tool call
-  const activePreview = activeCall
-    ? `${activeCall.toolName} ${
-        activeCall.toolName === "bash"
-          ? activeCall.args.command || ""
-          : activeCall.toolName === "read" || activeCall.toolName === "edit" || activeCall.toolName === "write"
-            ? activeCall.args.path || ""
-            : ""
-      }`.trim()
-    : "";
+  // Auto-expand while running, auto-collapse when done (user can override)
+  const isExpanded = manualExpand !== null ? manualExpand : hasRunning;
 
   return (
-    <div className="rounded-lg border border-border/50 bg-background/50 text-xs font-mono overflow-hidden w-full min-w-0">
+    <div className="w-full min-w-0">
+      {/* Header bar — clickable to toggle */}
       <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-muted/50 transition-colors text-left min-w-0"
+        onClick={() => setManualExpand(isExpanded ? false : true)}
+        className="w-full flex items-center gap-2 py-1 text-left min-w-0 group"
       >
-        {hasRunning ? (
-          <Loader2 className="h-3 w-3 animate-spin text-muted-foreground flex-shrink-0" />
-        ) : hasError ? (
-          <span className="text-destructive flex-shrink-0">✗</span>
-        ) : (
-          <span className="text-green-500 flex-shrink-0">✓</span>
-        )}
-        <span className="font-semibold flex-shrink-0">
-          {total} steps{hasRunning ? ` (${doneCount}/${total})` : ""}
+        {/* Status indicator */}
+        <span className="flex-shrink-0 text-xs font-mono text-foreground/40">
+          {hasRunning ? (
+            <motion.span
+              className="inline-block"
+              animate={{ opacity: [1, 1, 0.3, 0.3, 1] }}
+              transition={{ duration: 1, repeat: Infinity, times: [0, 0.25, 0.25, 0.75, 0.75], ease: "linear" }}
+            >
+              [{doneCount}/{total}]
+            </motion.span>
+          ) : (
+            <span>[{total}]</span>
+          )}
         </span>
-        {!expanded && activePreview && (
-          <span className="text-muted-foreground truncate flex-1">{activePreview}</span>
-        )}
-        {!activePreview && <span className="flex-1" />}
-        <span className="text-muted-foreground flex-shrink-0">{expanded ? "▾" : "▸"}</span>
+
+        {/* Summary text */}
+        <span className="truncate flex-1 text-xs font-mono text-foreground/50 group-hover:text-foreground/80 transition-colors duration-150">
+          {hasRunning
+            ? friendlyToolLabel(toolCalls.find((tc) => tc.isRunning)!)
+            : summary || `${total} steps`
+          }
+          {hasError && allDone && (
+            <span className="ml-1.5 text-foreground/30">· {toolCalls.filter(tc => tc.isError).length} failed</span>
+          )}
+        </span>
+
+        {/* Expand chevron */}
+        <span className="flex-shrink-0 text-[10px] font-mono text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150">
+          {isExpanded ? "▾" : "▸"}
+        </span>
       </button>
-      {expanded && (
-        <div className="border-t border-border/50 space-y-1 p-2">
-          {toolCalls.map((tc) => (
-            <ToolCallBlock key={tc.id} toolCall={tc} />
-          ))}
-        </div>
-      )}
+
+      {/* Expanded rail view */}
+      <AnimatePresence>
+        {isExpanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="overflow-hidden"
+          >
+            <div className="pl-1 pt-1">
+              {toolCalls.map((tc, i) => (
+                <motion.div
+                  key={tc.id}
+                  initial={{ opacity: 0, x: -8 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ duration: 0.15, delay: i * 0.03 }}
+                >
+                  <ToolCallRailItem
+                    toolCall={tc}
+                    isLast={i === toolCalls.length - 1}
+                  />
+                </motion.div>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
 
 // Renders message content with interleaved text and tool call blocks
-function MessageContent({ message }: { message: Message }) {
+function MessageContent({ message, onImageClick, onRetry }: { message: Message; onImageClick?: (images: string[], index: number) => void; onRetry?: (prompt: string) => void }) {
   const isUser = message.role === "user";
+
+  // Retry CTA — shown at the bottom of error messages that have a retryPrompt
+  const retryCta = !isUser && message.retryPrompt ? (
+    <div className="mt-3 pt-3 border-t border-border/40 flex items-center gap-3">
+      <button
+        type="button"
+        onClick={() => onRetry?.(message.retryPrompt!)}
+        className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-foreground text-background hover:bg-foreground/80 transition-colors"
+      >
+        <RefreshCw className="h-3 w-3" />
+        Try again
+      </button>
+      <span className="text-xs text-muted-foreground">or edit your message above</span>
+    </div>
+  ) : null;
 
   // If we have content blocks (Pi messages with tool calls), render them in order
   // Group consecutive tool blocks into collapsible containers
@@ -620,16 +797,24 @@ function MessageContent({ message }: { message: Message }) {
           }
           return null;
         })}
+        {retryCta}
       </div>
     );
   }
 
-  // Render attached image thumbnails for user messages
+  // Render attached image thumbnails for user messages — larger, ChatGPT-style; click to open viewer
   const imageThumbs = isUser && message.images && message.images.length > 0 ? (
-    <div className="flex gap-1.5 flex-wrap">
+    <div className="flex gap-2 flex-wrap">
       {message.images.map((img, i) => (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img key={i} src={img} alt={`Attached ${i + 1}`} className="max-w-[120px] max-h-[80px] rounded border border-background/20 object-cover" />
+        <button
+          key={i}
+          type="button"
+          onClick={() => onImageClick?.(message.images ?? [], i)}
+          className="rounded-lg border border-border/50 shadow-sm overflow-hidden p-0 block text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={img} alt={`Attached ${i + 1}`} className="max-w-[200px] max-h-[160px] min-h-[80px] w-full object-cover cursor-pointer" />
+        </button>
       ))}
     </div>
   ) : null;
@@ -648,6 +833,7 @@ function MessageContent({ message }: { message: Message }) {
     <div className="space-y-2">
       {imageThumbs}
       <MarkdownBlock text={message.content} isUser={isUser} />
+      {retryCta}
     </div>
   );
 }
@@ -713,6 +899,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [streamedCharCount, setStreamedCharCount] = useState(0);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
@@ -720,19 +907,21 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<MentionSuggestion[]>([]);
   const [isLoadingSpeakers, setIsLoadingSpeakers] = useState(false);
+  const [appFilterOpen, setAppFilterOpen] = useState(false);
+  const [recentSpeakers, setRecentSpeakers] = useState<MentionSuggestion[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
-  const [upgradeReason, setUpgradeReason] = useState<"daily_limit" | "model_not_allowed" | "rate_limit">("daily_limit");
-  const [upgradeResetsAt, setUpgradeResetsAt] = useState<string | undefined>();
   const [scheduleDialogMessage, setScheduleDialogMessage] = useState<{ prompt: string; response: string } | null>(null);
   const [prefillContext, setPrefillContext] = useState<string | null>(null);
   const [prefillSource, setPrefillSource] = useState<string>("search");
   const [prefillFrameId, setPrefillFrameId] = useState<number | null>(null);
   const [pastedImages, setPastedImages] = useState<string[]>([]); // Base64 data URLs
+  const [imageViewer, setImageViewer] = useState<{ images: string[]; index: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const isEmbedded = !!className; // embedded in settings vs overlay panel
 
@@ -744,11 +933,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const piMessageIdRef = useRef<string | null>(null);
   const piContentBlocksRef = useRef<ContentBlock[]>([]);
   const piStartInFlightRef = useRef(false);
+  const piFirstCallRetried = useRef(false);
   const piStoppedIntentionallyRef = useRef(false);
   const piCrashCountRef = useRef(0);
   const piLastCrashRef = useRef(0);
   const piThinkingStartRef = useRef<number | null>(null);
   const piSessionSyncedRef = useRef(false);
+  const piSessionIdRef = useRef<string>(crypto.randomUUID());
+  const piRunningConfigRef = useRef<{ provider: string; model: string; token: string | null } | null>(null);
 
   // Active pipe execution (when watching a running pipe)
   const [activePipeExecution, setActivePipeExecution] = useState<{
@@ -832,6 +1024,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     piMessageIdRef,
     piContentBlocksRef,
     piSessionSyncedRef,
+    piSessionIdRef,
     setIsLoading,
     setIsStreaming,
     setPastedImages,
@@ -951,6 +1144,16 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     const unlisten = listen("chat-ping", () => {
       emit("chat-ready", {});
     });
+    // Check for pending prefill from same-window navigation (e.g. pipes → home)
+    const pending = sessionStorage.getItem("pendingChatPrefill");
+    if (pending) {
+      sessionStorage.removeItem("pendingChatPrefill");
+      try {
+        const data = JSON.parse(pending);
+        // Small delay to let the chat fully initialize
+        setTimeout(() => emit("chat-prefill", data), 500);
+      } catch {}
+    }
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
@@ -977,62 +1180,37 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         const fullMessage = `${context}\n\n${prompt}`;
         // Start a new conversation then send
         (async () => {
-          if (piInfo?.running) {
-            try {
-              // Abort any in-flight processing, then reset session
-              // Always abort — Pi may be processing even if our ref was cleared
-              await commands.piAbort(PI_CHAT_SESSION);
-              // Wait for Pi to process the abort before sending new_session
-              await new Promise(r => setTimeout(r, 500));
-              await commands.piNewSession(PI_CHAT_SESSION);
-              // Wait for Pi to process the session reset before sending prompt
-              await new Promise(r => setTimeout(r, 500));
-            } catch (e) {
-              console.warn("[Pi] Failed to reset session:", e);
-            }
-          }
-          // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
-          piStreamingTextRef.current = "";
-          piMessageIdRef.current = null;
-          piContentBlocksRef.current = [];
-          setIsLoading(false);
-          setIsStreaming(false);
-          setMessages([]);
-          setConversationId(null);
-          setPrefillContext(null);
-          setPrefillFrameId(null);
-          // Set input as fallback in case auto-send fails (pi not ready)
-          setInput(fullMessage);
-          // Wait for Pi to be ready before sending (poll up to 10s)
-          const waitForPi = async (maxMs: number): Promise<boolean> => {
-            const start = Date.now();
-            while (Date.now() - start < maxMs) {
-              try {
-                const info = await commands.piInfo(PI_CHAT_SESSION);
-                if (info.status === "ok" && info.data.running) {
-                  setPiInfo(info.data);
-                  return true;
-                }
-              } catch {}
-              await new Promise(r => setTimeout(r, 500));
-            }
-            return false;
-          };
-          const ready = piInfo?.running || await waitForPi(10000);
-          if (ready) {
-            // Signal that the next sendPiMessage call should bypass the piInfo guard
-            // (we just confirmed Pi is running via waitForPi but React state may be stale)
+          try {
+            // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
+            piStreamingTextRef.current = "";
+            piMessageIdRef.current = null;
+            piContentBlocksRef.current = [];
+            setIsLoading(false);
+            setIsStreaming(false);
+            setMessages([]);
+            setConversationId(null);
+            setPrefillContext(null);
+            setPrefillFrameId(null);
+            // Set input as fallback in case auto-send fails
+            setInput(fullMessage);
+            // Assign a fresh session ID — this is a brand-new conversation.
+            // Without this, the prefill would send to the previous conversation's
+            // Pi process which still has old context baked in.
+            piSessionIdRef.current = crypto.randomUUID();
+            piSessionSyncedRef.current = true; // fresh session, no history to inject
+            // With multi-session, Pi starts fresh per conversation — sendPiMessage
+            // handles auto-starting it. Just bypass the canChat guard and send.
             autoSendBypassRef.current = true;
-            // Give React a tick to re-render with updated piInfo
             await new Promise(r => setTimeout(r, 200));
             if (sendMessageRef.current) {
               await sendMessageRef.current(fullMessage);
               setInput("");
               if (inputRef.current) inputRef.current.style.height = "auto";
             }
+          } finally {
             autoSendBypassRef.current = false;
+            prefillInFlightRef.current = false;
           }
-          prefillInFlightRef.current = false;
         })();
         return;
       }
@@ -1066,6 +1244,23 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       }
     });
     return () => { unlisten.then((fn) => fn()); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Pick up pending conversation from pipe execution history (set via localStorage
+  // because the emit event is lost during page navigation/remount)
+  useEffect(() => {
+    const pendingId = localStorage.getItem("pending-chat-conversation");
+    if (pendingId) {
+      localStorage.removeItem("pending-chat-conversation");
+      (async () => {
+        const { loadConversationFile } = await import("@/lib/chat-storage");
+        const conv = await loadConversationFile(pendingId);
+        if (conv) {
+          loadConversation(conv);
+        }
+      })();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1207,7 +1402,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
     const cursorPos = e.target.selectionStart || 0;
     const textBeforeCursor = value.slice(0, cursorPos);
-    const atMatch = textBeforeCursor.match(/@(\w*)$/);
+    const atMatch = textBeforeCursor.match(/@([\w-]*)$/);
 
     if (atMatch) {
       setShowMentionDropdown(true);
@@ -1270,6 +1465,10 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   };
 
   useEffect(() => {
+    // Don't resolve preset until settings are loaded from the store —
+    // before that, settings.aiPresets contains only the hardcoded default,
+    // which would cause Pi to start with the wrong model then immediately restart.
+    if (!isSettingsLoaded) return;
     // Don't overwrite pipe-specific preset when watching a pipe execution
     if (activePipeExecution) return;
     const defaultPreset = settings.aiPresets?.find((p) => p.defaultPreset);
@@ -1281,18 +1480,15 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       }
       return next;
     });
-  }, [settings.aiPresets]);
+  }, [settings.aiPresets, isSettingsLoaded]);
 
   const hasPresets = settings.aiPresets && settings.aiPresets.length > 0;
   // All providers now route through Pi — isPi is always true when we have a preset
   const isPi = true;
   const hasValidModel = activePreset?.model && activePreset.model.trim() !== "";
-  const needsLogin = (activePreset?.provider === "screenpipe-cloud" || activePreset?.provider === "pi") && !settings.user?.token;
+  const needsLogin = activePreset?.provider === "screenpipe-cloud" && !settings.user?.token;
   // Pi auto-starts on first message, so don't block chat when Pi is not running
   const canChat = hasPresets && hasValidModel && !needsLogin && !piStarting;
-  // BYOK providers (bedrock, ollama, openai, custom, anthropic) should not
-  // show the screenpipe upgrade/credits dialog on rate-limit errors.
-  const isScreenpipeCloudProvider = !activePreset?.provider || activePreset.provider === "screenpipe-cloud" || activePreset.provider === "pi";
 
   const getDisabledReason = (): string | null => {
     if (!hasPresets) return "No AI presets configured";
@@ -1309,43 +1505,101 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     setTimeout(() => inputRef.current?.focus(), 100);
   }, []);
 
-  // Escape key to close window
+  // Escape key: abort agent if running, otherwise close window
   useEffect(() => {
-    const handleEscape = (e: KeyboardEvent) => {
+    const handleEscape = async (e: KeyboardEvent) => {
       if (e.key === "Escape" && !showMentionDropdown) {
-        commands.closeWindow("Chat");
+        if (isLoading || isStreaming) {
+          // Stop the agent
+          try {
+            await commands.piAbort(piSessionIdRef.current);
+          } catch (err) {
+            console.warn("[Pi] Failed to abort on Escape:", err);
+          }
+          setIsLoading(false);
+          setIsStreaming(false);
+        } else {
+          commands.closeWindow("Chat");
+        }
       }
     };
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
-  }, [showMentionDropdown]);
+  }, [showMentionDropdown, isLoading, isStreaming]);
 
+  // Smart auto-scroll: only scroll to bottom if user is near the bottom.
+  // If user scrolled up to read, don't interrupt them.
   useEffect(() => {
+    if (!isUserScrolledUp) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, isUserScrolledUp]);
+
+  const handleMessagesScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    // Consider "near bottom" if within 150px of the bottom
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    setIsUserScrolledUp(!nearBottom);
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    setIsUserScrolledUp(false);
+  }, []);
+
+  // Preload recent speakers when filter popover opens
+  useEffect(() => {
+    if (!appFilterOpen || recentSpeakers.length > 0) return;
+    (async () => {
+      try {
+        const response = await fetch(`${SCREENPIPE_API}/speakers/search?name=`);
+        if (response.ok) {
+          const speakers: Speaker[] = await response.json();
+          setRecentSpeakers(
+            speakers
+              .filter((s) => s.name)
+              .slice(0, 5)
+              .map((s) => ({
+                tag: s.name.includes(" ") ? `@"${s.name}"` : `@${s.name}`,
+                description: "speaker",
+                category: "speaker" as const,
+              }))
+          );
+        }
+      } catch {
+        // silent
+      }
+    })();
+  }, [appFilterOpen, recentSpeakers.length]);
 
   // Pi project dir is managed Rust-side at boot
 
   // Build Pi provider config from active preset
-  const buildProviderConfig = useCallback(() => {
-    if (!activePreset) return null;
+  const buildProviderConfig = useCallback((preset?: AIPreset | null) => {
+    const p = preset || activePreset;
+    if (!p) return null;
+    // Combine the screenpipe search instructions with the user's preset prompt.
+    // This is passed via --append-system-prompt to Pi, enabling Anthropic prompt
+    // caching (90% input cost reduction on subsequent messages).
+    const presetPrompt = p.prompt || "";
+    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}`.trim() || null;
     return {
-      provider: activePreset.provider,
-      url: activePreset.url || "",
-      model: activePreset.model || "",
-      apiKey: ("apiKey" in activePreset ? (activePreset.apiKey as string) : null) || null,
-      maxTokens: (activePreset as any).maxTokens ?? 4096,
-      awsProfile: ("awsProfile" in activePreset ? (activePreset as any).awsProfile : null) || null,
-      awsRegion: ("awsRegion" in activePreset ? (activePreset as any).awsRegion : null) || null,
+      provider: p.provider,
+      url: p.url || "",
+      model: p.model || "",
+      apiKey: ("apiKey" in p ? (p.apiKey as string) : null) || null,
+      maxTokens: (p as any).maxTokens ?? 4096,
+      systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens]);
+  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt]);
 
   // Check Pi status on mount — Pi is auto-started at app boot by Rust
   useEffect(() => {
     const checkPi = async () => {
       try {
-        const result = await commands.piInfo(PI_CHAT_SESSION);
+        const result = await commands.piInfo(piSessionIdRef.current);
         if (result.status === "ok") {
           setPiInfo(result.data);
         }
@@ -1357,7 +1611,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     // Keep polling Pi status — recovers from stale termination events and transient failures
     const interval = setInterval(async () => {
       try {
-        const result = await commands.piInfo(PI_CHAT_SESSION);
+        const result = await commands.piInfo(piSessionIdRef.current);
         if (result.status === "ok") {
           setPiInfo(result.data);
         }
@@ -1366,46 +1620,17 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     return () => clearInterval(interval);
   }, []);
 
-  // Track what provider+model Pi is actually running with (survives remounts via ref)
-  const piRunningConfigRef = useRef<{ provider?: string; model?: string; token?: string | null }>({});
-  const piRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Restart Pi when user switches preset so the new model takes effect immediately.
-  // Pi uses CLI args from startup, so config-only updates don't change the running model.
-  // Debounced to collapse rapid settings saves into a single restart.
-  useEffect(() => {
-    if (!activePreset) return;
-    const running = piRunningConfigRef.current;
-    const currentToken = settings.user?.token ?? null;
-    const configChanged = running.provider !== undefined &&
-      (running.provider !== activePreset.provider || running.model !== activePreset.model);
-    const tokenChanged = running.token !== undefined && running.token !== currentToken;
-
-    if (!configChanged && !tokenChanged) {
-      // First mount or same config — just record what we expect Pi to be running
-      if (running.provider === undefined) {
-        piRunningConfigRef.current = { provider: activePreset.provider, model: activePreset.model, token: currentToken };
-      }
-      return;
-    }
-
-    // Debounce: cancel any pending restart, schedule new one
-    if (piRestartTimerRef.current) clearTimeout(piRestartTimerRef.current);
-    piRestartTimerRef.current = setTimeout(() => {
-      piRestartTimerRef.current = null;
-      const providerConfig = buildProviderConfig();
-      console.log("[Pi] Preset changed, restarting:", providerConfig?.provider, providerConfig?.model);
-      piRunningConfigRef.current = { provider: activePreset.provider, model: activePreset.model, token: currentToken };
-      commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
-        console.error("[Pi] Preset switch failed:", e);
-      });
-    }, 400);
-
-    return () => {
-      if (piRestartTimerRef.current) clearTimeout(piRestartTimerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.model, settings.user?.token]);
+  // Restart Pi explicitly when user saves a preset — no useEffect, no debounce.
+  // Called directly from the AIPresetsSelector onPresetSaved callback.
+  const handlePiRestart = useCallback((preset: AIPreset) => {
+    const providerConfig = buildProviderConfig(preset);
+    console.log("[Pi] User saved preset, restarting:", providerConfig?.provider, providerConfig?.model);
+    piSessionSyncedRef.current = false;
+    commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
+      console.error("[Pi] Preset switch failed:", e);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.user?.token]);
 
   // Listen for Pi events (all providers route through Pi) and pipe events
   useEffect(() => {
@@ -1413,6 +1638,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     let unlistenPipeEvent: UnlistenFn | null = null;
     let unlistenTerminated: UnlistenFn | null = null;
     let unlistenLog: UnlistenFn | null = null;
+    let unlistenReauth: UnlistenFn | null = null;
     let mounted = true;
 
     // Shared handler for Pi event data — used by both pi_event and pipe_event
@@ -1422,6 +1648,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           const evt = data.assistantMessageEvent;
           if (evt.type === "text_delta" && evt.delta) {
             piStreamingTextRef.current += evt.delta;
+            setStreamedCharCount(piStreamingTextRef.current.length);
 
             // Append to last text block or create new one
             const blocks = piContentBlocksRef.current;
@@ -1538,38 +1765,20 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           console.error("[Pi] Auto-retry failed:", errorStr);
 
           // Detect rate limit or daily limit from the error
-          if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
+          if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
             // Distinguish between daily limit and per-minute rate limit
-            const isDailyLimit = errorStr.includes("daily_limit_exceeded");
+            const isDailyLimit = errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded");
             const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
 
-            if (isScreenpipeCloudProvider) {
-              // Extract reset time if available
-              try {
-                const resetMatch = errorStr.match(/"reset_in":\s*(\d+)/);
-                const resetsAtMatch = errorStr.match(/"resets_at":\s*"([^"]+)"/);
-                if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-                else if (resetMatch) setUpgradeResetsAt(`${resetMatch[1]} seconds`);
-              } catch {}
-
-              if (isDailyLimit) {
-                setUpgradeReason("daily_limit");
-                posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
-              } else {
-                setUpgradeReason("rate_limit");
-              }
+            if (isDailyLimit) {
+              posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
             }
 
             if (piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
               let content: string;
-              if (!isScreenpipeCloudProvider) {
-                // BYOK provider — show neutral error, not upgrade upsell
-                const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                content = `Request failed (429) — check your provider configuration or wait ${waitTime}.`;
-              } else if (isDailyLimit) {
-                content = "You've used all your free queries for today.";
+              if (isDailyLimit) {
+                content = buildDailyLimitMessage(errorStr);
               } else if (isPerMinuteRate) {
                 // Extract wait time from error
                 const waitMatch = errorStr.match(/wait (\d+) seconds/i);
@@ -1584,7 +1793,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             }
             // Don't clear refs yet — agent_end will follow
           } else if (errorStr.includes("model_not_allowed")) {
-            setUpgradeReason("model_not_allowed");
             if (piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
               setMessages((prev) =>
@@ -1602,41 +1810,28 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const msgId = piMessageIdRef.current;
             const fullError = `${reason} ${errorDetail}`.trim();
 
-            if (fullError.includes("daily_limit_exceeded") || fullError.includes("429") || fullError.includes("rate limit")) {
-              if (!isScreenpipeCloudProvider) {
-                // BYOK provider — neutral error, no upgrade upsell
-                const waitMatch = fullError.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: `Request failed (429) — check your provider configuration or wait ${waitTime}.` } : m)
+            if (fullError.includes("daily_limit_exceeded") || fullError.includes("daily_cost_limit_exceeded") || fullError.includes("429") || fullError.includes("rate limit")) {
+              const isDailyLimit = fullError.includes("daily_limit_exceeded") || fullError.includes("daily_cost_limit_exceeded");
+              const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
+              if (isDailyLimit) {
+                try {
+                  const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
+                } catch {}
+                                  setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(fullError) } : m)
                 );
               } else {
-                const isDailyLimit = fullError.includes("daily_limit_exceeded");
-                const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
-                if (isDailyLimit) {
-                  try {
-                    const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
-                    if (match) setUpgradeResetsAt(match[1]);
-                  } catch {}
-                  setUpgradeReason("daily_limit");
-                  setMessages((prev) =>
-                    prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
-                  );
-                } else {
-                  setUpgradeReason("rate_limit");
                   const waitMatch = fullError.match(/wait (\d+) seconds/i);
-                  const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                  const content = isPerMinuteRate
-                    ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                    : "Rate limited — try again in a moment or switch to a different model.";
-                  setMessages((prev) =>
-                    prev.map((m) => m.id === msgId ? { ...m, content } : m)
-                  );
-                }
+                const waitTime = waitMatch ? waitMatch[1] : "a moment";
+                const content = isPerMinuteRate
+                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
+                  : "Rate limited — try again in a moment or switch to a different model.";
+                setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content } : m)
+                );
               }
             } else if (fullError.includes("model_not_allowed")) {
-              setUpgradeReason("model_not_allowed");
-              setMessages((prev) =>
+                setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade." } : m)
               );
             } else if (fullError.includes("already processing")) {
@@ -1658,33 +1853,18 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("429")) {
-              if (!isScreenpipeCloudProvider) {
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "Request failed (429) — check your provider configuration." } : m)
-                );
-              } else {
-                try {
-                  const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
-                  if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
+            if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("daily_cost_limit_exceeded") || errMsg.includes("429")) {
+              try {
+                const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
                 } catch {}
-                setUpgradeReason("daily_limit");
-                posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
-                );
-              }
+                            posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errMsg) } : m)
+              );
             } else if (errMsg.includes("rate limit") || errMsg.includes("rate_limit")) {
-              if (!isScreenpipeCloudProvider) {
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
-                );
-              } else {
-                setUpgradeReason("rate_limit");
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
-                );
-              }
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
+              );
             } else {
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: `Error: ${errMsg}` } : m)
@@ -1728,22 +1908,13 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             // Surface credits_exhausted / rate limit errors from agent_end
             if (agentEndError && !content) {
               const errStr = agentEndError;
-              if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("429")) {
-                if (isScreenpipeCloudProvider) {
-                  try {
-                    const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
-                    if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-                  } catch {}
-                  setUpgradeReason("daily_limit");
-                  content = "You've used all your free queries for today.";
-                } else {
-                  content = "Request failed (429) — check your provider configuration.";
-                }
+              if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("daily_cost_limit_exceeded") || errStr.includes("429")) {
+                try {
+                  const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
+                    } catch {}
+                                  content = buildDailyLimitMessage(errStr);
               } else if (errStr.includes("rate limit")) {
-                if (isScreenpipeCloudProvider) {
-                  setUpgradeReason("rate_limit");
-                }
-                content = "Rate limited — try again in a moment.";
+                  content = "Rate limited — try again in a moment.";
               } else {
                 content = `Error: ${errStr}`;
               }
@@ -1758,7 +1929,10 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             setMessages((prev) => {
               const existing = prev.find((m) => m.id === msgId);
               // Don't overwrite error messages with "Done" or empty content
-              const isErrorMessage = existing?.content?.includes("used all your free queries") ||
+              const isErrorMessage = existing?.content?.includes("daily") && existing?.content?.includes("limit") ||
+                existing?.content?.includes("free queries") ||
+                existing?.content?.includes("daily Pro limit") ||
+                existing?.content?.includes("daily query limit") ||
                 existing?.content?.includes("requires an upgrade") ||
                 existing?.content?.includes("Rate limited") ||
                 existing?.content?.includes("rate limit") ||
@@ -1811,45 +1985,64 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           }
         } else if (data.type === "response" && data.success === false) {
           const errorStr = data.error || "Unknown error";
+          // Pi agent first-call bug (pi-mono#2461) — first RPC prompt crashes.
+          // Auto-retry the same prompt once. The second call works.
+          if (errorStr.includes("startsWith") || errorStr.includes("text.startsWith")) {
+            console.warn("[Pi] first-call bug hit, auto-retrying prompt:", errorStr);
+            if (piMessageIdRef.current && !piFirstCallRetried.current) {
+              piFirstCallRetried.current = true;
+              // Re-send the last prompt
+              const lastUserMsg = messages.findLast(m => m.role === "user");
+              if (lastUserMsg?.content) {
+                commands.piPrompt(piSessionIdRef.current, lastUserMsg.content, null).catch(() => {});
+              }
+            }
+            return;
+          }
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
-              if (!isScreenpipeCloudProvider) {
-                // BYOK provider — neutral error, no upgrade upsell
-                const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: `Request failed (429) — check your provider configuration or wait ${waitTime}.` } : m)
+            if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
+              const isDailyLimit = errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded");
+              const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
+              if (isDailyLimit) {
+                try {
+                  const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
+                } catch {}
+                                  setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errorStr) } : m)
                 );
               } else {
-                const isDailyLimit = errorStr.includes("daily_limit_exceeded");
-                const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
-                if (isDailyLimit) {
-                  try {
-                    const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
-                    if (match) setUpgradeResetsAt(match[1]);
-                  } catch {}
-                  setUpgradeReason("daily_limit");
-                  setMessages((prev) =>
-                    prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
-                  );
-                } else {
-                  setUpgradeReason("rate_limit");
                   const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-                  const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                  const content = isPerMinuteRate
-                    ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                    : "Rate limited — try again in a moment or switch to a different model.";
-                  setMessages((prev) =>
-                    prev.map((m) => m.id === msgId ? { ...m, content } : m)
-                  );
-                }
+                const waitTime = waitMatch ? waitMatch[1] : "a moment";
+                const content = isPerMinuteRate
+                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
+                  : "Rate limited — try again in a moment or switch to a different model.";
+                setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content } : m)
+                );
               }
             } else if (errorStr.includes("model_not_allowed")) {
-              setUpgradeReason("model_not_allowed");
-              setMessages((prev) =>
+                setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade." } : m)
+              );
+            } else if (errorStr.includes("already processing")) {
+              console.warn("[Pi] already-processing race in response event:", errorStr);
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? {
+                  ...m,
+                  content: "The AI was mid-response when your message arrived.",
+                  retryPrompt: lastUserMessageRef.current || undefined,
+                } : m)
+              );
+            } else if (errorStr.includes("api_error") || errorStr.includes("Internal server error") || /\b5\d\d\b/.test(errorStr)) {
+              // Upstream API 5xx — SDK already exhausted its auto-retry attempts
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? {
+                  ...m,
+                  content: "Something went wrong on the server.",
+                  retryPrompt: lastUserMessageRef.current || undefined,
+                } : m)
               );
             } else {
               setMessages((prev) =>
@@ -1896,7 +2089,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       unlistenEvent = await listen<any>("pi_event", (event) => {
         if (!mounted) return;
         const { sessionId, event: piEvent } = event.payload;
-        if (sessionId !== PI_CHAT_SESSION) return;
+        if (sessionId !== piSessionIdRef.current) return;
         handlePiEventData(piEvent);
       });
 
@@ -1915,22 +2108,24 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       unlistenTerminated = await listen<any>("pi_terminated", (event) => {
         if (!mounted) return;
         const { sessionId, pid: terminatedPid } = event.payload;
-        if (sessionId !== PI_CHAT_SESSION) return;
+        if (sessionId !== piSessionIdRef.current) return;
         if (piStoppedIntentionallyRef.current) {
           piStoppedIntentionallyRef.current = false;
           return;
         }
         console.log("[Pi] Process terminated, pid:", terminatedPid);
 
-        // If a message was in flight, mark it as errored so the UI doesn't stay stuck
+        // If a message was in flight, append error to the message so the user
+        // knows the agent stopped unexpectedly (not just "completed").
         if (piMessageIdRef.current) {
           const msgId = piMessageIdRef.current;
           setMessages((prev) =>
-            prev.map((m) =>
-              m.id === msgId && (m.content === "Processing..." || !m.content)
-                ? { ...m, content: "AI agent crashed — restarting automatically..." }
-                : m
-            )
+            prev.map((m) => {
+              if (m.id !== msgId) return m;
+              const existing = m.content && m.content !== "Processing..." ? m.content : "";
+              const errorSuffix = "\n\n---\n\n⚠️ agent stopped unexpectedly — restarting automatically...";
+              return { ...m, content: existing + errorSuffix };
+            })
           );
           piStreamingTextRef.current = "";
           piMessageIdRef.current = null;
@@ -1965,7 +2160,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (!mounted) return;
           // Check if a newer Pi process is already running (race: stop → start → terminated)
           try {
-            const result = await commands.piInfo(PI_CHAT_SESSION);
+            const result = await commands.piInfo(piSessionIdRef.current);
             if (result.status === "ok" && result.data.running && result.data.pid !== terminatedPid) {
               console.log("[Pi] Stale termination for pid", terminatedPid, "— newer pid", result.data.pid, "is running");
               setPiInfo(result.data);
@@ -1979,7 +2174,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               const providerConfig = buildProviderConfig();
               const home = await homeDir();
               const dir = await join(home, ".screenpipe", "pi-chat");
-              const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
+              const result = await commands.piStart(piSessionIdRef.current, dir, settings.user?.token ?? null, providerConfig);
               if (result.status === "ok") {
                 setPiInfo(result.data);
                 piSessionSyncedRef.current = false;
@@ -2006,7 +2201,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         const line = event.payload;
         if (line.includes("model_not_allowed") || line.includes("403")) {
           const msgId = piMessageIdRef.current;
-          setUpgradeReason("model_not_allowed");
           if (msgId) {
             setMessages((prev) =>
               prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade — try a different model in your AI preset." } : m)
@@ -2015,11 +2209,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         } else if (line.includes("429") || line.includes("rate") || line.includes("daily_limit")) {
           const msgId = piMessageIdRef.current;
           if (msgId) {
-            const content = isScreenpipeCloudProvider
-              ? "Rate limited — try again in a moment or switch to a different model."
-              : "Request failed (429) — check your provider configuration.";
             setMessages((prev) =>
-              prev.map((m) => m.id === msgId ? { ...m, content } : m)
+              prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment or switch to a different model." } : m)
             );
           }
         } else if (line.includes("content must be a string") || line.includes("does not support images") || line.includes("image_url is not supported")) {
@@ -2043,12 +2234,33 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
     setup();
 
+    // Restart the current session when a new auth token arrives (deeplink login).
+    listen<{ apiKey: string }>("pi-reauth", async (event) => {
+      if (!mounted) return;
+      try {
+        const home = await homeDir();
+        const dir = await join(home, ".screenpipe", "pi-chat");
+        const result = await commands.piStart(piSessionIdRef.current, dir, event.payload.apiKey, buildProviderConfig());
+        if (result.status === "ok") {
+          setPiInfo(result.data);
+          piSessionSyncedRef.current = false;
+        }
+      } catch (e) {
+        console.warn("[Pi] reauth restart skipped:", e);
+      }
+    }).then(fn => { unlistenReauth = fn; });
+
     return () => {
       mounted = false;
       unlistenEvent?.();
       unlistenPipeEvent?.();
       unlistenTerminated?.();
       unlistenLog?.();
+      unlistenReauth?.();
+      // Abort any in-flight Pi request when navigating away from chat.
+      // Without this, Pi keeps streaming in the background and rejects
+      // new messages with "already processing" when the user returns.
+      commands.piAbort(piSessionIdRef.current).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2276,45 +2488,64 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   // Send message using Pi agent
   async function sendPiMessage(userMessage: string, displayLabel?: string) {
-    // Auto-start Pi if it's dead (singleton recovery)
-    if (!piInfo?.running && !autoSendBypassRef.current) {
+    // Auto-start Pi if it's not running yet (new session or crash recovery)
+    if (!piInfo?.running) {
       if (piStartInFlightRef.current) {
-        toast({ title: "Pi starting", description: "Please wait a moment", variant: "destructive" });
-        return;
-      }
-      console.log("[Pi] Not running, auto-starting before sending message");
-      piStartInFlightRef.current = true;
-      setPiStarting(true);
-      try {
-        const providerConfig = buildProviderConfig();
-        const home = await homeDir();
-        const dir = await join(home, ".screenpipe", "pi-chat");
-        const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
-        if (result.status === "ok" && result.data.running) {
-          setPiInfo(result.data);
-          piSessionSyncedRef.current = false;
-          piCrashCountRef.current = 0; // reset crash loop counter on manual start
-          // Keep running-config ref in sync so preset watcher doesn't re-trigger
-          if (providerConfig) {
-            piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
-          }
-        } else {
-          toast({ title: "Failed to start Pi", description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+        if (!autoSendBypassRef.current) {
+          toast({ title: "Pi starting", description: "Please wait a moment", variant: "destructive" });
           return;
         }
-      } catch (e) {
-        toast({ title: "Failed to start Pi", description: String(e), variant: "destructive" });
-        return;
-      } finally {
-        setPiStarting(false);
-        piStartInFlightRef.current = false;
+        // Prefill auto-send: wait for in-flight start to complete
+        const startWait = Date.now();
+        while (piStartInFlightRef.current && Date.now() - startWait < 10000) {
+          await new Promise(r => setTimeout(r, 300));
+        }
+        if (piStartInFlightRef.current) return; // timed out
+      } else {
+        console.log("[Pi] Not running, auto-starting before sending message");
+        piStartInFlightRef.current = true;
+        setPiStarting(true);
+        try {
+          const providerConfig = buildProviderConfig();
+          const home = await homeDir();
+          const dir = await join(home, ".screenpipe", "pi-chat");
+          const result = await commands.piStart(piSessionIdRef.current, dir, settings.user?.token ?? null, providerConfig);
+          if (result.status === "ok" && result.data.running) {
+            setPiInfo(result.data);
+            piSessionSyncedRef.current = false;
+            piCrashCountRef.current = 0; // reset crash loop counter on manual start
+            // Keep running-config ref in sync so preset watcher doesn't re-trigger
+            if (providerConfig) {
+              piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
+            }
+          } else {
+            toast({ title: "Failed to start Screenpipe Cloud", description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+            return;
+          }
+        } catch (e) {
+          toast({ title: "Failed to start Screenpipe Cloud", description: String(e), variant: "destructive" });
+          return;
+        } finally {
+          setPiStarting(false);
+          piStartInFlightRef.current = false;
+        }
       }
     }
 
-    // Prevent sending while a previous message is still being processed
+    // If a previous message is still processing, abort it first.
+    // piAbort now waits for the Pi SDK to confirm the abort completed — no sleep needed.
     if (piMessageIdRef.current) {
-      toast({ title: "Please wait", description: "Previous message is still being processed", variant: "destructive" });
-      return;
+      console.warn("[Pi] Aborting previous message before sending new one");
+      try {
+        await commands.piAbort(piSessionIdRef.current);
+      } catch (e) {
+        console.warn("[Pi] Failed to abort previous:", e);
+      }
+      piStreamingTextRef.current = "";
+      piMessageIdRef.current = null;
+      piContentBlocksRef.current = [];
+      setIsLoading(false);
+      setIsStreaming(false);
     }
 
     const newUserMessage: Message = {
@@ -2331,6 +2562,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     piStreamingTextRef.current = "";
     piMessageIdRef.current = assistantMessageId;
     piContentBlocksRef.current = [];
+    setStreamedCharCount(0);
 
     // Clear follow-ups for new message
     setFollowUpSuggestions([]);
@@ -2355,20 +2587,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       message_index: messages.filter((m) => m.role === "user").length,
     });
 
-    const timeoutId = setTimeout(() => {
-      if (piMessageIdRef.current === assistantMessageId) {
-        piMessageIdRef.current = null;
-        setIsLoading(false);
-        setIsStreaming(false);
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantMessageId && m.content === "Processing..."
-              ? { ...m, content: "Request timed out. Check if Pi is running correctly." }
-              : m
-          )
-        );
-      }
-    }, 180000);
+    // No timeout — Pi can run for minutes on long tasks (e.g. 30-day analysis
+    // with many tool calls). Process death is detected via pi_terminated event.
+    const timeoutId: ReturnType<typeof setTimeout> | null = null;
 
     try {
       // Collect images (pasted image + prefill frame)
@@ -2419,7 +2640,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
       setMessages((prev) => [
         ...prev,
-        { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now() },
+        { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now(), model: activePreset?.model, provider: activePreset?.provider },
       ]);
 
       // If Pi's session is out of sync (restart, conversation load), inject history
@@ -2427,7 +2648,25 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       if (!piSessionSyncedRef.current && messages.length > 0) {
         const historyLines = messages
           .slice(-40)
-          .map(m => `${m.role}: ${m.content}`)
+          .map(m => {
+            let text = m.content || "";
+            // Include contentBlocks info (tool calls, results) for richer context
+            if (m.contentBlocks?.length) {
+              const blockTexts = m.contentBlocks.map((b: any) => {
+                if (b.type === "text" && b.text) return b.text;
+                if (b.type === "tool" && b.toolCall) {
+                  const tc = b.toolCall;
+                  let s = `[tool: ${tc.toolName}](${JSON.stringify(tc.args)})`;
+                  if (tc.result) s += ` → ${tc.result.slice(0, 500)}`;
+                  return s;
+                }
+                return "";
+              }).filter(Boolean).join("\n");
+              if (blockTexts && !text) text = blockTexts;
+              else if (blockTexts) text += "\n" + blockTexts;
+            }
+            return `${m.role}: ${text}`;
+          })
           .join("\n");
         promptMessage = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
         piSessionSyncedRef.current = true;
@@ -2435,31 +2674,39 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         piSessionSyncedRef.current = true;
       }
 
+      // Send prompt — abort/new_session now await completion, so no retry needed
       const result = await commands.piPrompt(
-        PI_CHAT_SESSION,
+        piSessionIdRef.current,
         promptMessage,
         piImages.length > 0 ? piImages : null,
       );
 
       if (result.status === "error") {
-        clearTimeout(timeoutId);
+        if (timeoutId) clearTimeout(timeoutId);
         piMessageIdRef.current = null;
         // Provide helpful error messages for common failures
-        let errorMsg = result.error;
-        if (errorMsg.includes("Broken pipe") || errorMsg.includes("not running") || errorMsg.includes("has died")) {
+        const rawError = result.error;
+        let errorMsg: string;
+        let retryPrompt: string | undefined;
+
+        if (rawError.includes("already processing")) {
+          errorMsg = "The AI was mid-response when your message arrived.";
+          retryPrompt = userMessage;
+        } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died")) {
           const provider = activePreset?.provider;
-          if (provider === "native-ollama") {
-            errorMsg = "Ollama is not running. Start it with: `ollama serve`";
-          } else {
-            errorMsg = "AI agent crashed — restarting automatically...";
-          }
-        } else if (errorMsg.includes("not found")) {
+          errorMsg = provider === "native-ollama"
+            ? "Ollama is not running. Start it with: `ollama serve`"
+            : "AI agent crashed — restarting automatically...";
+        } else if (rawError.includes("not found")) {
           errorMsg = `Model "${activePreset?.model}" not found. Check your AI preset in settings.`;
+        } else {
+          errorMsg = rawError;
+          retryPrompt = userMessage;
         }
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessageId
-              ? { ...m, content: `Error: ${errorMsg}` }
+              ? { ...m, content: errorMsg, ...(retryPrompt ? { retryPrompt } : {}) }
               : m
           )
         );
@@ -2467,7 +2714,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         setIsStreaming(false);
       }
     } catch (error) {
-      clearTimeout(timeoutId);
+      if (timeoutId) clearTimeout(timeoutId);
       piMessageIdRef.current = null;
       setMessages((prev) =>
         prev.map((m) =>
@@ -2504,12 +2751,12 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       if (args.speaker_name) params.append("speaker_name", String(args.speaker_name));
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const searchTimeoutId = setTimeout(() => controller.abort(), 120000);
 
       const response = await fetch(`${SCREENPIPE_API}/search?${params.toString()}`, {
         signal: controller.signal,
       });
-      clearTimeout(timeoutId);
+      clearTimeout(searchTimeoutId);
 
       if (!response.ok) throw new Error(`Search failed: ${response.status}`);
 
@@ -2575,28 +2822,46 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   // Keep ref in sync so useEffect callbacks can call sendMessage
   sendMessageRef.current = sendMessage;
 
+  const formatMessageAsMarkdown = (m: Message) => {
+    const role = m.role === "user" ? "**User**" : "**Assistant**";
+    const ts = new Date(m.timestamp).toLocaleString();
+    let body = m.content || "";
+
+    if (m.contentBlocks && m.contentBlocks.length > 0) {
+      const sections: string[] = [];
+      for (const block of m.contentBlocks) {
+        if (block.type === "text" && block.text) {
+          sections.push(block.text);
+        } else if (block.type === "tool") {
+          const tc = block.toolCall;
+          const argsStr = tc.args ? JSON.stringify(tc.args, null, 2) : "";
+          let section = `\n**Tool: ${tc.toolName}**\n\`\`\`json\n${argsStr}\n\`\`\``;
+          if (tc.result !== undefined) {
+            section += `\n**Result:**\n\`\`\`\n${tc.result}\n\`\`\``;
+          }
+          sections.push(section);
+        } else if (block.type === "thinking" && block.text) {
+          sections.push(`<details><summary>Thinking${block.durationMs ? ` (${(block.durationMs / 1000).toFixed(1)}s)` : ""}</summary>\n\n${block.text}\n\n</details>`);
+        }
+      }
+      if (sections.length > 0) {
+        body = sections.join("\n\n");
+      }
+    }
+
+    return `### ${role} — ${ts}\n\n${body}`;
+  };
+
   const copyFullChatAsMarkdown = async () => {
     if (messages.length === 0) return;
-    const md = messages
-      .map((m) => {
-        const role = m.role === "user" ? "**User**" : "**Assistant**";
-        const ts = new Date(m.timestamp).toLocaleString();
-        return `### ${role} — ${ts}\n\n${m.content}`;
-      })
-      .join("\n\n---\n\n");
+    const md = messages.map(formatMessageAsMarkdown).join("\n\n---\n\n");
     await navigator.clipboard.writeText(md);
     toast({ title: "copied full chat as markdown" });
   };
 
   const exportChatAsMarkdownFile = async () => {
     if (messages.length === 0) return;
-    const md = messages
-      .map((m) => {
-        const role = m.role === "user" ? "**User**" : "**Assistant**";
-        const ts = new Date(m.timestamp).toLocaleString();
-        return `### ${role} — ${ts}\n\n${m.content}`;
-      })
-      .join("\n\n---\n\n");
+    const md = messages.map(formatMessageAsMarkdown).join("\n\n---\n\n");
     try {
       const filePath = await saveDialog({
         filters: [{ name: "Markdown", extensions: ["md"] }],
@@ -2620,7 +2885,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   const handleStop = async () => {
     try {
-      await commands.piAbort(PI_CHAT_SESSION);
+      await commands.piAbort(piSessionIdRef.current);
     } catch (e) {
       console.warn("[Pi] Failed to abort:", e);
     }
@@ -2635,7 +2900,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   };
 
   return (
-    <div className={cn("flex flex-col bg-background", className ?? "h-screen")}>
+    <div className={cn("flex flex-col bg-background", className ?? "h-screen")} data-testid="section-home">
       {/* Header - draggable only in standalone mode */}
       {/* Add left padding on macOS to avoid traffic light overlap (standalone only) */}
       <div
@@ -2669,6 +2934,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         <Button
           variant={showHistory ? "secondary" : "ghost"}
           size="sm"
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={async (e) => {
             e.stopPropagation();
             if (!showHistory) {
@@ -2677,7 +2943,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             }
             setShowHistory(!showHistory);
           }}
-          className="h-7 px-2 gap-1 text-xs"
+          className="relative z-10 h-7 px-2 gap-1 text-xs"
           title="Chat history"
         >
           <History size={14} />
@@ -2686,34 +2952,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         <Button
           variant="default"
           size="sm"
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={async (e) => {
             e.stopPropagation();
-            // Kill Pi process if busy, then restart fresh
-            if (piInfo?.running && (isLoading || isStreaming)) {
-              piStoppedIntentionallyRef.current = true;
-              try { await commands.piStop(PI_CHAT_SESSION); } catch {}
-              piStreamingTextRef.current = "";
-              piMessageIdRef.current = null;
-              piContentBlocksRef.current = [];
-              setIsLoading(false);
-              setIsStreaming(false);
-              // Restart Pi fresh
-              try {
-                const providerConfig = buildProviderConfig();
-                const home = await homeDir();
-                const dir = await join(home, ".screenpipe", "pi-chat");
-                const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
-                if (result.status === "ok") {
-                  setPiInfo(result.data);
-                  piSessionSyncedRef.current = true;
-                }
-              } catch (err) {
-                console.warn("[Pi] Failed to restart after new chat:", err);
-              }
-            }
-            startNewConversation();
+            piStoppedIntentionallyRef.current = true;
+            await startNewConversation();
+            // Pi will auto-restart on the next message via the sendPiMessage flow
           }}
-          className="h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
+          className="relative z-10 h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
           title="New chat"
         >
           <Plus size={14} />
@@ -2818,6 +3064,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
         {/* Messages */}
         <div
+          ref={scrollContainerRef}
+          onScroll={handleMessagesScroll}
           className="relative flex-1 overflow-y-auto overflow-x-hidden"
           onContextMenu={(e) => {
             if (messages.length === 0) return;
@@ -2887,7 +3135,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               <Button
                 variant="outline"
                 onClick={async () => {
-                  await commands.showWindow({ Settings: { page: null } });
+                  await commands.showWindow({ Home: { page: null } });
                 }}
                 className="gap-2"
               >
@@ -2954,19 +3202,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                     : "bg-muted/30 border-border/50"
                 )}
               >
-                <MessageContent message={message} />
-                {/* Upgrade button for daily limit errors */}
-                {message.role === "assistant" &&
-                 (message.content.includes("used all your free queries") ||
-                  message.content.includes("requires an upgrade")) && (
-                  <button
-                    onClick={() => setShowUpgradeDialog(true)}
-                    className="mt-3 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-foreground text-background text-sm font-medium hover:bg-background hover:text-foreground transition-colors duration-150"
-                  >
-                    <Zap className="h-4 w-4" />
-                    upgrade now
-                  </button>
-                )}
+                <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} onRetry={(prompt) => sendMessage(prompt)} />
               </div>
                 {/* Action buttons - appear on hover, outside the message box */}
                 <div className="flex items-center gap-0.5 self-end mt-1 opacity-0 group-hover/message:opacity-100 transition-all duration-200">
@@ -3047,6 +3283,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   phase={loaderPhase}
                   toolName={toolName}
                   thinkingSecs={thinkingSecs}
+                  tokenCount={Math.round(streamedCharCount / 4)}
                 />
               </motion.div>
             );
@@ -3054,24 +3291,24 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         </AnimatePresence>
         <div ref={messagesEndRef} />
       </div> {/* End of max-w-4xl wrapper */}
+
+      {/* Floating scroll-to-bottom pill */}
+      {isUserScrolledUp && messages.length > 0 && (
+        <button
+          onClick={scrollToBottom}
+          className="sticky bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary text-primary-foreground shadow-lg text-xs font-medium hover:bg-primary/90 transition-opacity animate-in fade-in slide-in-from-bottom-2 duration-200"
+        >
+          <ChevronDown className="h-3.5 w-3.5" />
+          new content
+        </button>
+      )}
       </div>
       </div> {/* End of main content area with history sidebar */}
 
       {/* Input */}
       <div className="relative border-t border-border/50 bg-gradient-to-t from-muted/20 to-transparent">
         <div className="max-w-4xl mx-auto w-full">
-        <div className="p-2 border-b border-border/30">
-          <AIPresetsSelector
-            onPresetChange={setActivePreset}
-            controlledPresetId={activePipeExecution ? activePreset?.id : undefined}
-            onControlledSelect={activePipeExecution ? (id) => {
-              const match = settings.aiPresets?.find((p) => p.id === id);
-              if (match) setActivePreset(match);
-            } : undefined}
-            showLoginCta={false}
-          />
-        </div>
-
+        {/* Prefill, filters, suggestions first; then attached images in gap; then agent bar; then form */}
         {/* Prefill context indicator from search */}
         {(prefillContext || prefillFrameId) && (
           <div className="px-3 py-2 border-b border-border/30 bg-muted/30">
@@ -3205,13 +3442,214 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 key={i}
                 type="button"
                 onClick={() => sendMessage(s.text)}
-                className="px-2.5 py-1 text-[11px] bg-muted/20 hover:bg-muted/50 rounded-full border border-border/20 hover:border-border/50 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                className="px-2.5 py-1 text-[11px] bg-muted/20 hover:bg-muted/50 rounded-full border border-border/20 hover:border-border/50 text-muted-foreground hover:text-foreground transition-colors cursor-pointer max-w-[280px] truncate"
+                title={s.text}
               >
                 {s.text}
               </button>
             ))}
           </div>
         )}
+
+        {/* Attached images in the gap (above agent bar, like reference); click to open full-screen viewer */}
+        {pastedImages.length > 0 && (
+          <div className="px-3 py-2 border-b border-border/30 flex flex-wrap items-center gap-2">
+            {pastedImages.map((img, i) => (
+              <div key={i} className="relative group shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setImageViewer({ images: pastedImages, index: i })}
+                  className="block rounded-lg border border-border/50 shadow-sm overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={img}
+                    alt={`Attached ${i + 1}`}
+                    className="h-20 w-20 min-h-20 min-w-20 object-cover cursor-pointer"
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setPastedImages(prev => prev.filter((_, idx) => idx !== i)); }}
+                  className="absolute -top-1.5 -right-1.5 w-6 h-6 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-destructive/90"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="p-2 border-b border-border/30 flex items-center gap-2">
+          <Popover open={appFilterOpen} onOpenChange={setAppFilterOpen}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className={cn(
+                  "shrink-0 flex items-center gap-1 px-2 h-10 text-[11px] font-mono border rounded-md transition-colors",
+                  hasActiveFilters
+                    ? "border-foreground text-foreground"
+                    : "border-border text-muted-foreground hover:text-foreground hover:border-foreground"
+                )}
+                title="Search filters"
+              >
+                <Filter className="w-3 h-3" />
+                <span>filter</span>
+                {hasActiveFilters && (
+                  <span className="text-[10px] text-muted-foreground">
+                    ({(activeFilters.timeRanges.length > 0 ? 1 : 0) +
+                      (activeFilters.contentType ? 1 : 0) +
+                      (activeFilters.appName ? 1 : 0) +
+                      (activeFilters.speakerName ? 1 : 0)})
+                  </span>
+                )}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent className="w-64 p-0 max-h-[360px] overflow-y-auto" align="start">
+              {/* Time filters */}
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50">
+                time
+              </div>
+              {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "time").map((s) => {
+                const isActive = activeFilters.timeRanges.some((r) => r.label === s.description);
+                return (
+                  <button
+                    key={s.tag}
+                    type="button"
+                    onClick={() => {
+                      if (isActive) {
+                        removeFilter("time", s.description);
+                      } else {
+                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                      }
+                      setAppFilterOpen(false);
+                    }}
+                    className={cn(
+                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                      isActive && "bg-muted"
+                    )}
+                  >
+                    <span>{s.tag}</span>
+                    <span className="text-[10px] text-muted-foreground">{s.description}</span>
+                  </button>
+                );
+              })}
+
+              {/* Content type filters */}
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                content type
+              </div>
+              {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "content").map((s) => {
+                const contentTypeMap: Record<string, string> = { screen: "screen", audio: "audio", input: "input" };
+                const tagName = s.tag.slice(1);
+                const isActive = activeFilters.contentType === (contentTypeMap[tagName] || tagName);
+                return (
+                  <button
+                    key={s.tag}
+                    type="button"
+                    onClick={() => {
+                      if (isActive) {
+                        removeFilter("content");
+                      } else {
+                        if (activeFilters.contentType) removeFilter("content");
+                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                      }
+                      setAppFilterOpen(false);
+                    }}
+                    className={cn(
+                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                      isActive && "bg-muted"
+                    )}
+                  >
+                    <span>{s.tag}</span>
+                    <span className="text-[10px] text-muted-foreground">{s.description}</span>
+                  </button>
+                );
+              })}
+
+              {/* App filters */}
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                apps
+              </div>
+              {appMentionSuggestions.length === 0 ? (
+                <div className="px-3 py-2 text-[10px] text-muted-foreground">no apps detected yet</div>
+              ) : (
+                appMentionSuggestions.map((suggestion) => {
+                  const isActive = activeFilters.appName === suggestion.appName;
+                  return (
+                    <button
+                      key={`app-${suggestion.tag}`}
+                      type="button"
+                      onClick={() => {
+                        if (isActive) {
+                          removeFilter("app");
+                        } else {
+                          if (activeFilters.appName) removeFilter("app");
+                          setInput((prev) => `${suggestion.tag} ${prev.trim()}`.trim() + " ");
+                        }
+                        setAppFilterOpen(false);
+                      }}
+                      className={cn(
+                        "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                        isActive && "bg-muted"
+                      )}
+                    >
+                      <span>{suggestion.tag}</span>
+                      <span className="text-[10px] text-muted-foreground truncate">{suggestion.description}</span>
+                    </button>
+                  );
+                })
+              )}
+
+              {/* Speakers */}
+              {recentSpeakers.length > 0 && (
+                <>
+                  <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                    speakers
+                  </div>
+                  {recentSpeakers.map((s) => {
+                    const speakerName = s.tag.startsWith('@"') ? s.tag.slice(2, -1) : s.tag.slice(1);
+                    const isActive = activeFilters.speakerName === speakerName;
+                    return (
+                      <button
+                        key={`speaker-${s.tag}`}
+                        type="button"
+                        onClick={() => {
+                          if (isActive) {
+                            removeFilter("speaker");
+                          } else {
+                            if (activeFilters.speakerName) removeFilter("speaker");
+                            setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                          }
+                          setAppFilterOpen(false);
+                        }}
+                        className={cn(
+                          "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                          isActive && "bg-muted"
+                        )}
+                      >
+                        <span>{s.tag}</span>
+                        <span className="text-[10px] text-muted-foreground">speaker</span>
+                      </button>
+                    );
+                  })}
+                </>
+              )}
+            </PopoverContent>
+          </Popover>
+          <div className="flex-1 min-w-0">
+            <AIPresetsSelector
+              onPresetChange={setActivePreset}
+              onPresetSaved={handlePiRestart}
+              controlledPresetId={activePipeExecution ? activePreset?.id : undefined}
+              onControlledSelect={activePipeExecution ? (id) => {
+                const match = settings.aiPresets?.find((p) => p.id === id);
+                if (match) setActivePreset(match);
+              } : undefined}
+              showLoginCta={false}
+            />
+          </div>
+        </div>
 
         <form
           onSubmit={handleSubmit}
@@ -3237,8 +3675,15 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               )}
             </AnimatePresence>
           )}
-          <div className="flex gap-2 items-end">
-            <div className="relative flex-1">
+          <div
+            className={cn(
+              "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
+              "bg-background/50 border-border/50",
+              disabledReason && "border-muted-foreground/30"
+            )}
+          >
+            {/* Textarea row: full width so scrollbar is above the buttons and no dead zone */}
+            <div className="relative flex-1 min-w-0">
               <textarea
                 ref={inputRef}
                 value={input}
@@ -3249,39 +3694,13 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                     ? disabledReason
                     : "Ask about your screen... (type @ for filters, paste images)"
                 }
-                disabled={isLoading || !canChat}
+                disabled={!canChat}
+                spellCheck={false}
+                autoCorrect="off"
                 rows={1}
-                className={cn(
-                  "flex w-full border border-border bg-input px-3 py-2 text-sm font-mono ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-foreground disabled:cursor-not-allowed disabled:opacity-50 caret-foreground resize-none overflow-y-auto",
-                  "flex-1 bg-background/50 border-border/50 focus:border-foreground/30 focus:ring-foreground/10 transition-colors",
-                  disabledReason && "border-muted-foreground/30",
-                  pastedImages.length > 0 && "pb-12" // Make room for image previews below
-                )}
+                className="w-full min-h-[44px] border-0 bg-transparent px-3 py-2.5 pr-3 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 caret-foreground resize-none overflow-y-auto scrollbar-minimal"
                 style={{ maxHeight: "150px" }}
               />
-
-              {/* Attached image previews below textarea */}
-              {pastedImages.length > 0 && (
-                <div className="absolute bottom-1 left-2 right-2 flex items-center gap-1.5 overflow-x-auto py-1">
-                  {pastedImages.map((img, i) => (
-                    <div key={i} className="relative group shrink-0">
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={img}
-                        alt={`Attached ${i + 1}`}
-                        className="h-8 w-8 object-cover rounded border border-border/50"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setPastedImages(prev => prev.filter((_, idx) => idx !== i))}
-                        className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <X className="w-2.5 h-2.5" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
 
               <AnimatePresence>
                 {showMentionDropdown && filteredMentions.length > 0 && (
@@ -3333,47 +3752,43 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 )}
               </AnimatePresence>
             </div>
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              onClick={handleFilePicker}
-              disabled={isLoading || !canChat}
-              className="shrink-0 text-muted-foreground hover:text-foreground"
-              title="Attach image"
-            >
-              <Paperclip className="h-4 w-4" />
-            </Button>
-            <Button
-              type={isStreaming ? "button" : "submit"}
-              size="icon"
-              disabled={(!input.trim() && !isStreaming && pastedImages.length === 0) || !canChat}
-              onClick={isStreaming ? handleStop : undefined}
-              className={cn(
-                "shrink-0 transition-all duration-200",
-                isStreaming
-                  ? "bg-foreground text-background hover:bg-foreground/80"
-                  : "bg-foreground text-background hover:bg-background hover:text-foreground"
-              )}
-            >
-              {isStreaming ? (
-                <Square className="h-4 w-4" />
-              ) : (
-                <Send className="h-4 w-4" />
-              )}
-            </Button>
+            {/* Buttons row below textarea so scrollbar is above and full width is typeable */}
+            <div className="flex items-center justify-end gap-0.5 shrink-0 px-2 pb-2 pt-1">
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                onClick={handleFilePicker}
+                disabled={isLoading || !canChat}
+                className="h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Attach image"
+              >
+                <Paperclip className="h-4 w-4" />
+              </Button>
+              <Button
+                type={isStreaming ? "button" : "submit"}
+                size="icon"
+                disabled={(!input.trim() && !isStreaming && pastedImages.length === 0) || !canChat}
+                onClick={isStreaming ? handleStop : undefined}
+                className={cn(
+                  "h-8 w-8 transition-all duration-200",
+                  isStreaming
+                    ? "bg-foreground text-background hover:bg-foreground/80"
+                    : "bg-foreground text-background hover:bg-background hover:text-foreground"
+                )}
+              >
+                {isStreaming ? (
+                  <Square className="h-4 w-4" />
+                ) : (
+                  <Send className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
           </div>
         </form>
       </div> {/* End of max-w-4xl input wrapper */}
       </div>
 
-      <UpgradeDialog
-        open={showUpgradeDialog}
-        onOpenChange={setShowUpgradeDialog}
-        reason={upgradeReason}
-        resetsAt={upgradeResetsAt}
-        source="chat"
-      />
 
       {scheduleDialogMessage && (
         <SchedulePromptDialog
@@ -3389,6 +3804,72 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           responsePreview={scheduleDialogMessage.response}
         />
       )}
+
+      {/* Full-screen image viewer (like reference): click any attached photo to open */}
+      <Dialog open={!!imageViewer} onOpenChange={(open) => !open && setImageViewer(null)}>
+        <DialogContent
+          hideCloseButton
+          className="fixed inset-0 z-50 max-w-none w-full h-full !left-0 !top-0 !translate-x-0 !translate-y-0 rounded-none border-0 bg-muted/95 p-0 flex flex-col gap-0"
+        >
+          {imageViewer && (
+            <>
+              <div className="flex items-center justify-between px-4 py-3 border-b border-border/50 shrink-0">
+                <span className="text-sm font-medium text-muted-foreground">
+                  {imageViewer.index + 1}/{imageViewer.images.length} Attached image {imageViewer.index + 1}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setImageViewer(null)}
+                  className="p-2 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                  aria-label="Close"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="flex-1 flex items-center justify-center min-h-0 p-4 bg-background/50">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={imageViewer.images[imageViewer.index]}
+                  alt={`Attached image ${imageViewer.index + 1}`}
+                  className="max-w-full max-h-full object-contain rounded-lg"
+                />
+              </div>
+              <div className="flex items-center justify-center gap-4 py-3 border-t border-border/50 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setImageViewer((v) => v && v.index > 0 ? { ...v, index: v.index - 1 } : v)}
+                  disabled={imageViewer.index === 0}
+                  className="p-2 rounded-md hover:bg-muted disabled:opacity-40 disabled:pointer-events-none text-foreground"
+                  aria-label="Previous image"
+                >
+                  <ChevronLeft className="h-5 w-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setImageViewer((v) => v && v.index < v.images.length - 1 ? { ...v, index: v.index + 1 } : v)}
+                  disabled={imageViewer.index === imageViewer.images.length - 1}
+                  className="p-2 rounded-md hover:bg-muted disabled:opacity-40 disabled:pointer-events-none text-foreground"
+                  aria-label="Next image"
+                >
+                  <ChevronRight className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="flex justify-center gap-1.5 pb-3">
+                {imageViewer.images.map((_, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      "w-2 h-2 rounded-full transition-colors",
+                      i === imageViewer.index ? "bg-foreground" : "bg-muted-foreground/40"
+                    )}
+                    aria-hidden
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

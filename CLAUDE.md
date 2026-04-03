@@ -5,6 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Product vision
 Read `VISION.md` before making product decisions, adding features, or changing UX. Stability over features. Activation over new capabilities. No feature creep. Design voice: no emoji, no exclamation marks, black and white, sharp corners, 40% empty space.
 
+## Design
+
+Refer to `DESIGN.md` before making design decisions.
+
 ## File Headers
 Every source file (.rs, .ts, .tsx, .js, .jsx, .swift, .py) must include this comment at the top (below any shebangs or `use` directives that must be first):
 

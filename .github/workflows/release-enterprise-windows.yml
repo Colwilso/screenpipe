@@ -11,6 +11,9 @@ name: Release Enterprise (Windows)
 on:
   workflow_dispatch:
 
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
 jobs:
   release-enterprise-windows:
     runs-on: windows-2022
@@ -38,7 +41,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.7"
+          bun-version: "1.3.10"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -141,8 +144,7 @@ jobs:
         run: |
           echo "ORT_STRATEGY=system" >> $GITHUB_ENV
           echo "ORT_LIB_LOCATION=${{ github.workspace }}/ort-system-lib" >> $GITHUB_ENV
-          # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
-          echo "AWS_LC_SYS_PREBUILT_NASM=1" >> $GITHUB_ENV
+          echo "OPENBLAS_PATH=${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas" >> $GITHUB_ENV
 
       - name: Use enterprise config
         shell: bash
@@ -179,7 +181,7 @@ jobs:
           RUSTFLAGS: "-C link-arg=/LTCG"
           CMAKE_ARGS: "-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF"
         with:
-          args: "--target x86_64-pc-windows-msvc --features enterprise-build"
+          args: "--target x86_64-pc-windows-msvc --features enterprise-build,directml"
           projectPath: "./apps/screenpipe-app-tauri"
           tauriScript: bunx tauri -v
           retryAttempts: 3
@@ -293,8 +295,19 @@ jobs:
           ENTERPRISE_NOTIFY_SECRET: ${{ secrets.ENTERPRISE_NOTIFY_SECRET }}
         run: |
           VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          curl -sf -X POST "https://screenpi.pe/api/enterprise/builds/notify" \
+          if [ -z "$ENTERPRISE_NOTIFY_SECRET" ]; then
+            echo "::error::ENTERPRISE_NOTIFY_SECRET is not set in GitHub secrets"
+            exit 1
+          fi
+          HTTP_CODE=$(curl -s -o /tmp/notify_response.txt -w "%{http_code}" -X POST "https://screenpi.pe/api/enterprise/builds/notify" \
             -H "Authorization: Bearer $ENTERPRISE_NOTIFY_SECRET" \
             -H "Content-Type: application/json" \
-            -d "{\"version\": \"$VERSION\"}"
-          echo "Notified subscribers for v$VERSION"
+            -d "{\"version\": \"$VERSION\"}")
+          BODY=$(cat /tmp/notify_response.txt)
+          echo "Response: HTTP $HTTP_CODE — $BODY"
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Notified subscribers for v$VERSION"
+          else
+            echo "::error::Notification failed (HTTP $HTTP_CODE). If 401, the ENTERPRISE_NOTIFY_SECRET in GitHub Actions does not match the one in Vercel env."
+            exit 1
+          fi

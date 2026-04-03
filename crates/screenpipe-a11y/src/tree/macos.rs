@@ -4,7 +4,10 @@
 
 //! macOS accessibility tree walker using cidre AX APIs.
 
-use super::{AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform};
+use super::{
+    AccessibilityTreeNode, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
+    TreeWalkerPlatform,
+};
 use anyhow::Result;
 use chrono::Utc;
 use cidre::{ax, cf, ns};
@@ -24,6 +27,7 @@ const BROWSER_NAMES: &[&str] = &[
     "vivaldi",
     "opera",
     "zen",
+    "comet",
     "brave browser",
     "google chrome",
     "microsoft edge",
@@ -154,23 +158,27 @@ fn looks_like_url(s: &str) -> bool {
 /// macOS tree walker using cidre's AX bindings.
 pub struct MacosTreeWalker {
     config: TreeWalkerConfig,
+    incognito_detector: Box<dyn crate::incognito::IncognitoDetector>,
 }
 
 impl MacosTreeWalker {
     pub fn new(config: TreeWalkerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            incognito_detector: crate::incognito::create_detector(),
+        }
     }
 }
 
 impl TreeWalkerPlatform for MacosTreeWalker {
-    fn walk_focused_window(&self) -> Result<Option<TreeSnapshot>> {
+    fn walk_focused_window(&self) -> Result<TreeWalkResult> {
         // Wrap in autorelease pool — cidre AX/NS APIs create autoreleased
         // ObjC objects. Without this, objects accumulate on the tokio
         // blocking thread (reused across calls), causing a memory leak
         // proportional to capture rate.
         // Note: ar_pool requires R: Clone, so we return Result<_, String>
         // and convert back to anyhow::Error.
-        cidre::objc::ar_pool(|| -> Result<Option<TreeSnapshot>, String> {
+        cidre::objc::ar_pool(|| -> Result<TreeWalkResult, String> {
             self.walk_focused_window_inner()
                 .map_err(|e| format!("{}", e))
         })
@@ -179,7 +187,7 @@ impl TreeWalkerPlatform for MacosTreeWalker {
 }
 
 impl MacosTreeWalker {
-    fn walk_focused_window_inner(&self) -> Result<Option<TreeSnapshot>> {
+    fn walk_focused_window_inner(&self) -> Result<TreeWalkResult> {
         let start = Instant::now();
 
         // 1. Get the focused application via the AX system-wide element.
@@ -188,14 +196,14 @@ impl MacosTreeWalker {
         let sys = ax::UiElement::sys_wide();
         let focused_app = match sys.focused_app() {
             Ok(app) => app,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(TreeWalkResult::NotFound),
         };
         let pid = match focused_app.pid() {
             Ok(pid) => pid,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(TreeWalkResult::NotFound),
         };
         let Some(app) = ns::RunningApp::with_pid(pid) else {
-            return Ok(None);
+            return Ok(TreeWalkResult::NotFound);
         };
 
         let app_name = app
@@ -216,7 +224,7 @@ impl MacosTreeWalker {
             "loginwindow",
         ];
         if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex)) {
-            return Ok(None);
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
         // Apply user-configured ignored windows (check app name)
@@ -224,7 +232,7 @@ impl MacosTreeWalker {
             let p = pattern.to_lowercase();
             app_lower.contains(&p)
         }) {
-            return Ok(None);
+            return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
         }
 
         // 2. Get the focused window via AX API
@@ -243,32 +251,46 @@ impl MacosTreeWalker {
 
         let window_val = match ax_app.attr_value(ax::attr::focused_window()) {
             Ok(v) => v,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(TreeWalkResult::NotFound),
         };
 
         if window_val.get_type_id() != ax::UiElement::type_id() {
-            return Ok(None);
+            return Ok(TreeWalkResult::NotFound);
         }
         let window: &ax::UiElement = unsafe { std::mem::transmute(&*window_val) };
 
         let window_name = get_string_attr(window, ax::attr::title()).unwrap_or_default();
 
-        // Skip windows with sensitive titles
-        let window_lower = window_name.to_lowercase();
-        if window_lower.contains("password")
-            || window_lower.contains("private")
-            || window_lower.contains("incognito")
-            || window_lower.contains("secret")
+        // Fast path: Arc (and potentially other browsers) tag incognito windows
+        // with "Incognito" in AXIdentifier (e.g. "bigIncognitoBrowserWindow-...").
+        // This is more reliable than AppleScript which Arc 1.138+ broke entirely.
+        if self.config.ignore_incognito_windows {
+            if let Some(ax_id) = get_string_attr(window, ax::attr::id()) {
+                let ax_id_lower = ax_id.to_lowercase();
+                if ax_id_lower.contains("incognito") || ax_id_lower.contains("private") {
+                    return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
+                }
+            }
+        }
+
+        // Skip incognito / private browsing windows.  Uses the full detector
+        // which checks AppleScript window properties for Chromium browsers
+        // (Chrome, Edge, etc.) and falls back to localized title matching.
+        if self.config.ignore_incognito_windows
+            && self
+                .incognito_detector
+                .is_incognito(&app_name, 0, &window_name)
         {
-            return Ok(None);
+            return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
         }
 
         // Apply user-configured ignored windows (also check window title)
+        let window_lower = window_name.to_lowercase();
         if self.config.ignored_windows.iter().any(|pattern| {
             let p = pattern.to_lowercase();
             window_lower.contains(&p)
         }) {
-            return Ok(None);
+            return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
         }
 
         // Apply user-configured included windows (also check window title)
@@ -282,7 +304,7 @@ impl MacosTreeWalker {
                 window_lower.contains(&p)
             });
             if !matches_app && !matches_window {
-                return Ok(None);
+                return Ok(TreeWalkResult::Skipped(SkipReason::NotInIncludeList));
             }
         }
 
@@ -337,7 +359,7 @@ impl MacosTreeWalker {
             walk_duration
         );
 
-        Ok(Some(TreeSnapshot {
+        Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name,
             text_content,
@@ -388,8 +410,8 @@ impl WalkState {
             nodes: Vec::with_capacity(256),
             node_count: 0,
             max_depth: config.max_depth,
-            max_nodes: config.max_nodes,
-            walk_timeout: config.walk_timeout,
+            max_nodes: config.effective_max_nodes(),
+            walk_timeout: config.effective_walk_timeout(),
             element_timeout_secs: config.element_timeout_secs,
             start,
             truncated: false,
@@ -532,12 +554,15 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);
-                state.nodes.push(AccessibilityTreeNode {
-                    role: role_str.to_string(),
-                    text: val.trim().to_string(),
-                    depth: depth.min(255) as u8,
+                let mut node = AccessibilityTreeNode::new(
+                    role_str.to_string(),
+                    val.trim().to_string(),
+                    depth.min(255) as u8,
                     bounds,
-                });
+                );
+                node.value = Some(val.trim().to_string());
+                fill_ax_props(&mut node, elem, role_str);
+                state.nodes.push(node);
                 return;
             }
         }
@@ -548,12 +573,14 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);
-                state.nodes.push(AccessibilityTreeNode {
-                    role: role_str.to_string(),
-                    text: val.trim().to_string(),
-                    depth: depth.min(255) as u8,
+                let mut node = AccessibilityTreeNode::new(
+                    role_str.to_string(),
+                    val.trim().to_string(),
+                    depth.min(255) as u8,
                     bounds,
-                });
+                );
+                fill_ax_props(&mut node, elem, role_str);
+                state.nodes.push(node);
                 return;
             }
         }
@@ -563,12 +590,14 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
     if let Some(title) = get_string_attr(elem, ax::attr::title()) {
         if !title.is_empty() {
             append_text(&mut state.text_buffer, &title);
-            state.nodes.push(AccessibilityTreeNode {
-                role: role_str.to_string(),
-                text: title.trim().to_string(),
-                depth: depth.min(255) as u8,
+            let mut node = AccessibilityTreeNode::new(
+                role_str.to_string(),
+                title.trim().to_string(),
+                depth.min(255) as u8,
                 bounds,
-            });
+            );
+            fill_ax_props(&mut node, elem, role_str);
+            state.nodes.push(node);
             return;
         }
     }
@@ -577,12 +606,14 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
     if let Some(desc) = get_string_attr(elem, ax::attr::desc()) {
         if !desc.is_empty() {
             append_text(&mut state.text_buffer, &desc);
-            state.nodes.push(AccessibilityTreeNode {
-                role: role_str.to_string(),
-                text: desc.trim().to_string(),
-                depth: depth.min(255) as u8,
+            let mut node = AccessibilityTreeNode::new(
+                role_str.to_string(),
+                desc.trim().to_string(),
+                depth.min(255) as u8,
                 bounds,
-            });
+            );
+            fill_ax_props(&mut node, elem, role_str);
+            state.nodes.push(node);
         }
     }
 }
@@ -679,6 +710,55 @@ fn get_string_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<String> {
     })
 }
 
+/// Extract a boolean attribute from an AX element.
+fn get_bool_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<bool> {
+    elem.attr_value(attr).ok().and_then(|v| {
+        if v.get_type_id() == cf::Boolean::type_id() {
+            let b: &cf::Boolean = unsafe { std::mem::transmute(&*v) };
+            Some(b.value())
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether a role represents an interactive/actionable element (buttons, inputs, etc.).
+fn is_interactive_role(role_str: &str) -> bool {
+    matches!(
+        role_str,
+        "AXButton"
+            | "AXTextField"
+            | "AXTextArea"
+            | "AXComboBox"
+            | "AXCheckBox"
+            | "AXRadioButton"
+            | "AXPopUpButton"
+            | "AXMenuButton"
+            | "AXMenuItem"
+            | "AXLink"
+            | "AXDisclosureTriangle"
+            | "AXTab"
+    )
+}
+
+/// Fill automation properties on an AccessibilityTreeNode from an AX element.
+/// Only fetches bool states for interactive elements to limit IPC overhead.
+fn fill_ax_props(node: &mut AccessibilityTreeNode, elem: &ax::UiElement, role_str: &str) {
+    node.automation_id = get_string_attr(elem, ax::attr::id());
+    node.subrole = get_string_attr(elem, ax::attr::subrole());
+    node.role_description = get_string_attr(elem, ax::attr::role_desc());
+    node.help_text = get_string_attr(elem, ax::attr::help());
+    // Bool states and extra string attrs only for interactive elements (limits IPC calls)
+    if is_interactive_role(role_str) {
+        node.placeholder = get_string_attr(elem, ax::attr::placeholder_value());
+        node.url = get_string_attr(elem, ax::attr::url());
+        node.is_enabled = get_bool_attr(elem, ax::attr::enabled());
+        node.is_focused = get_bool_attr(elem, ax::attr::focused());
+        node.is_selected = get_bool_attr(elem, ax::attr::selected());
+        node.is_expanded = get_bool_attr(elem, ax::attr::expanded());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,7 +841,7 @@ mod tests {
             ..Default::default()
         };
         let walker = MacosTreeWalker::new(config);
-        if let Ok(Some(snapshot)) = walker.walk_focused_window() {
+        if let Ok(TreeWalkResult::Found(snapshot)) = walker.walk_focused_window() {
             assert!(snapshot.node_count <= 11); // +1 for the rounding in the check
         }
     }

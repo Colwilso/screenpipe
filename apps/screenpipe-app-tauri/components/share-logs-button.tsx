@@ -24,33 +24,12 @@ import {
 } from "./ui/tooltip";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { loadAllConversations } from "@/lib/chat-storage";
+import { redactPii } from "@/lib/utils/redact-pii";
 
 interface VideoChunk {
   device_name: string;
   file_path: string;
   id: number;
-}
-
-function redactPii(text: string): string {
-  return text
-    // emails
-    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "[EMAIL]")
-    // phone numbers (various formats)
-    .replace(/(\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/g, "[PHONE]")
-    // SSN
-    .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]")
-    // credit card numbers
-    .replace(/\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b/g, "[CARD]")
-    // API keys / tokens (long hex or base64 strings)
-    .replace(/\b(sk|pk|key|token|secret|password|api[_-]?key)[_-]?\s*[:=]\s*\S{8,}/gi, "$1=[REDACTED]")
-    // bearer tokens
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{20,}/g, "Bearer [REDACTED]")
-    // IP addresses (keep localhost)
-    .replace(/\b(?!127\.0\.0\.1\b)(?!0\.0\.0\.0\b)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, "[IP]")
-    // home directory paths (redact username)
-    .replace(/\/Users\/[^/\s]+/g, "/Users/[USER]")
-    .replace(/C:\\Users\\[^\\\s]+/g, "C:\\Users\\[USER]")
-    .replace(/\/home\/[^/\s]+/g, "/home/[USER]");
 }
 
 const ShareLinkDisplay = ({
@@ -197,12 +176,27 @@ export const ShareLogsButton = ({
       const file = e.target.files?.[0];
       if (!file) return;
 
-      // Convert to data URL for preview
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        setScreenshot(e.target?.result as string);
-      };
-      reader.readAsDataURL(file);
+      // Resize and compress to JPEG so Discord can render it (max ~1920px wide)
+      const img = new Image();
+      const dataUrl = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => resolve(ev.target?.result as string);
+        reader.readAsDataURL(file);
+      });
+
+      img.src = dataUrl;
+      await new Promise<void>((resolve) => { img.onload = () => resolve(); });
+
+      const MAX_WIDTH = 1920;
+      const scale = img.width > MAX_WIDTH ? MAX_WIDTH / img.width : 1;
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext("2d")!;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      const compressed = canvas.toDataURL("image/jpeg", 0.8);
+      setScreenshot(compressed);
     } catch (err) {
       console.error("Failed to select screenshot:", err);
     }
@@ -340,8 +334,8 @@ export const ShareLogsButton = ({
           os_version,
           app_version,
           feedback_text: feedbackText,
-          screenshot_url: screenshotPath,
-          video_url: videoPath,
+          screenshot_url: screenshot ? screenshotPath : undefined,
+          video_url: mergedVideoPath ? videoPath : undefined,
           screenpipe_id: settings.analyticsId,
         }),
       });

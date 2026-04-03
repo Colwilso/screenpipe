@@ -228,20 +228,29 @@ pub async fn trigger_sync(state: State<'_, SyncState>) -> Result<(), String> {
 /// Get sync configuration.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_sync_config() -> Result<SyncConfig, String> {
-    // TODO: Read from persistent storage
-    Ok(SyncConfig::default())
+pub async fn get_sync_config(app: AppHandle) -> Result<SyncConfig, String> {
+    let store = crate::store::get_store(&app, None).map_err(|e| e.to_string())?;
+    let config = store.get("sync_config").unwrap_or(serde_json::Value::Null);
+    match serde_json::from_value::<SyncConfig>(config) {
+        Ok(c) => Ok(c),
+        Err(_) => Ok(SyncConfig::default()),
+    }
 }
 
 /// Update sync configuration.
 #[tauri::command]
 #[specta::specta]
 pub async fn update_sync_config(
+    app: AppHandle,
     state: State<'_, SyncState>,
     config: SyncConfig,
 ) -> Result<(), String> {
     *state.enabled.write().await = config.enabled;
-    // TODO: Persist config and update sync service
+
+    let store = crate::store::get_store(&app, None).map_err(|e| e.to_string())?;
+    store.set("sync_config", serde_json::json!(config));
+    store.save().map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -290,6 +299,36 @@ pub async fn remove_sync_device(
             .map_err(|e| format!("failed to remove device: {}", e))?;
     }
     Ok(())
+}
+
+/// Delete all locally-stored data that was synced from a specific remote device.
+/// This calls the local screenpipe server's /data/delete-device endpoint.
+/// Refuses to delete data for the current device as a safety guard.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_device_local_data(
+    state: State<'_, SyncState>,
+    machine_id: String,
+) -> Result<String, String> {
+    if machine_id == state.machine_id {
+        return Err("cannot delete your own device's local data".to_string());
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://localhost:3030/data/delete-device")
+        .json(&serde_json::json!({ "machine_id": machine_id }))
+        .send()
+        .await
+        .map_err(|e| format!("failed to call delete-device: {}", e))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("delete-device failed: {}", body));
+    }
+
+    let body = resp.text().await.unwrap_or_default();
+    Ok(body)
 }
 
 /// Initialize sync with password.
@@ -606,41 +645,117 @@ pub async fn auto_start_archive(app: &AppHandle) {
         "retention_days": archive_settings.retention_days,
     });
 
+    // Retry up to 5 times with increasing delays if the server isn't ready yet.
+    // The server may still be starting when this runs (15s after app launch).
+    let retry_delays = [0, 5, 10, 15, 30]; // seconds
+    for (attempt, delay) in retry_delays.iter().enumerate() {
+        if *delay > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(*delay)).await;
+        }
+
+        match client
+            .post("http://localhost:3030/archive/init")
+            .json(&init_request)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                info!(
+                    "cloud archive auto-started (retention={}d)",
+                    archive_settings.retention_days
+                );
+                return;
+            }
+            Ok(response) if response.status().as_u16() == 409 => {
+                info!("cloud archive: already initialized, re-enabling");
+                // Already initialized — make sure it's enabled
+                let enable_req = serde_json::json!({ "enabled": true });
+                if let Err(e) = client
+                    .post("http://localhost:3030/archive/configure")
+                    .json(&enable_req)
+                    .send()
+                    .await
+                {
+                    warn!("cloud archive: failed to re-enable: {}", e);
+                }
+                return;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!(
+                    "cloud archive auto-start: init failed ({}): {} (attempt {}/{})",
+                    status,
+                    body,
+                    attempt + 1,
+                    retry_delays.len()
+                );
+                // Non-transient error (auth, config), don't retry
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "cloud archive auto-start: server not reachable (attempt {}/{}): {}",
+                    attempt + 1,
+                    retry_delays.len(),
+                    e
+                );
+                // Transient — server may still be starting, retry
+            }
+        }
+    }
+
+    warn!(
+        "cloud archive auto-start: gave up after {} attempts",
+        retry_delays.len()
+    );
+}
+
+/// Auto-start local data retention on app launch if previously enabled.
+pub async fn auto_start_retention(app: &AppHandle) {
+    let settings = match SettingsStore::get(app) {
+        Ok(Some(s)) => s,
+        _ => return,
+    };
+
+    let enabled = settings
+        .extra
+        .get("localRetentionEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !enabled {
+        return;
+    }
+
+    let days = settings
+        .extra
+        .get("localRetentionDays")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(14) as u32;
+
+    let client = reqwest::Client::new();
+    let configure_req = serde_json::json!({
+        "enabled": true,
+        "retention_days": days,
+    });
+
     match client
-        .post("http://localhost:3030/archive/init")
-        .json(&init_request)
+        .post("http://localhost:3030/retention/configure")
+        .json(&configure_req)
         .send()
         .await
     {
         Ok(response) if response.status().is_success() => {
-            info!(
-                "cloud archive auto-started (retention={}d)",
-                archive_settings.retention_days
-            );
-        }
-        Ok(response) if response.status().as_u16() == 409 => {
-            info!("cloud archive: already initialized, re-enabling");
-            // Already initialized — make sure it's enabled
-            let enable_req = serde_json::json!({ "enabled": true });
-            if let Err(e) = client
-                .post("http://localhost:3030/archive/configure")
-                .json(&enable_req)
-                .send()
-                .await
-            {
-                warn!("cloud archive: failed to re-enable: {}", e);
-            }
+            info!("local retention auto-started (retention={}d)", days);
         }
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            warn!(
-                "cloud archive auto-start: init failed ({}): {}",
-                status, body
-            );
+            warn!("local retention auto-start failed ({}): {}", status, body);
         }
         Err(e) => {
-            warn!("cloud archive auto-start: server not reachable: {}", e);
+            warn!("local retention auto-start: server not reachable: {}", e);
         }
     }
 }

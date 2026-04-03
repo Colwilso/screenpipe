@@ -127,6 +127,10 @@ static SKIP_APPS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         "i3bar",
         "Plank",
         "Dock",
+        "Cinnamon",
+        "cinnamon",
+        "Muffin",
+        "Budgie-panel",
         // Screenpipe's own UI should never be captured
         "screenpipe",
         "screenpipe - Development",
@@ -250,6 +254,12 @@ impl WindowFilters {
                 .iter()
                 .any(|ignore| app_name_lower.contains(ignore) || title_lower.contains(ignore))
         {
+            return false;
+        }
+
+        // Check if window title suggests a blocked URL (catches streaming sites
+        // like DAZN/Netflix where URL detection only works for focused windows)
+        if self.is_title_suggesting_blocked_url(title) {
             return false;
         }
 

@@ -33,6 +33,12 @@ pub struct VisionManagerConfig {
     pub monitor_ids: Vec<String>,
     /// When true, record every connected monitor regardless of `monitor_ids`.
     pub use_all_monitors: bool,
+    /// Automatically detect and skip incognito / private browsing windows.
+    pub ignore_incognito_windows: bool,
+    /// Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
+    pub pause_on_drm_content: bool,
+    /// Languages for OCR recognition.
+    pub languages: Vec<screenpipe_core::Language>,
 }
 
 /// Status of the VisionManager
@@ -108,11 +114,12 @@ impl VisionManager {
     /// Uses prefix matching (name + resolution) so that position changes after
     /// reconnect don't break the filter.
     pub fn is_monitor_allowed(&self, monitor: &screenpipe_screen::monitor::SafeMonitor) -> bool {
-        if self.config.use_all_monitors
-            || self.config.monitor_ids.is_empty()
-            || self.config.monitor_ids == vec!["default"]
-        {
+        if self.config.use_all_monitors || self.config.monitor_ids.is_empty() {
             return true;
+        }
+        // "default" means only the primary monitor
+        if self.config.monitor_ids == vec!["default"] {
+            return monitor.is_primary();
         }
         let stable_id = monitor.stable_id();
         fn prefix(sid: &str) -> &str {
@@ -254,6 +261,7 @@ impl VisionManager {
             monitor_y: monitor.y() as f64,
             monitor_width: monitor.width() as f64,
             monitor_height: monitor.height() as f64,
+            ignore_incognito_windows: self.config.ignore_incognito_windows,
             ..TreeWalkerConfig::default()
         };
 
@@ -270,6 +278,8 @@ impl VisionManager {
         let vision_metrics = self.config.vision_metrics.clone();
         let hot_frame_cache = self.hot_frame_cache.clone();
         let use_pii_removal = self.config.use_pii_removal;
+        let pause_on_drm_content = self.config.pause_on_drm_content;
+        let languages = self.config.languages.clone();
         let power_profile_rx = self.power_profile_rx.clone();
 
         info!(
@@ -294,6 +304,8 @@ impl VisionManager {
                 vision_metrics,
                 hot_frame_cache,
                 use_pii_removal,
+                pause_on_drm_content,
+                languages,
                 power_profile_rx,
             )
             .await
@@ -327,8 +339,40 @@ impl VisionManager {
         }
     }
 
-    /// Get list of currently recording monitor IDs
+    /// Get list of currently recording monitor IDs.
+    /// Removes dead tasks (finished JoinHandles) so MonitorWatcher can restart them.
     pub async fn active_monitors(&self) -> Vec<u32> {
+        // Collect dead task IDs first to avoid holding DashMap refs during removal
+        let dead: Vec<u32> = self
+            .recording_tasks
+            .iter()
+            .filter(|entry| entry.value().is_finished())
+            .map(|entry| *entry.key())
+            .collect();
+
+        for id in &dead {
+            if let Some((_, handle)) = self.recording_tasks.remove(id) {
+                // Await to clean up the JoinHandle and capture exit reason
+                match handle.await {
+                    Ok(()) => {
+                        warn!(
+                            "monitor {} capture task exited (see prior error log for cause), will be restarted by monitor watcher",
+                            id
+                        );
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        info!("monitor {} capture task was cancelled", id);
+                    }
+                    Err(e) => {
+                        error!(
+                            "monitor {} capture task panicked: {}, will be restarted by monitor watcher",
+                            id, e
+                        );
+                    }
+                }
+            }
+        }
+
         self.recording_tasks
             .iter()
             .map(|entry| *entry.key())

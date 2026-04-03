@@ -14,7 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { commands } from "@/lib/utils/tauri";
 import { useSettings } from "@/lib/hooks/use-settings";
-import { Sparkles, Zap, Clock, Star, CreditCard } from "lucide-react";
+import { Sparkles, Zap, Clock, Star } from "lucide-react";
 import posthog from "posthog-js";
 
 interface UpgradeDialogProps {
@@ -23,6 +23,8 @@ interface UpgradeDialogProps {
   reason?: "daily_limit" | "model_not_allowed" | "rate_limit";
   resetsAt?: string;
   source?: string;
+  /** Tier reported by the gateway in the error response — more reliable than local settings */
+  gatewayTier?: "anonymous" | "logged_in" | "subscribed";
 }
 
 export function UpgradeDialog({
@@ -30,10 +32,13 @@ export function UpgradeDialog({
   onOpenChange,
   reason = "daily_limit",
   source = "unknown",
+  gatewayTier,
 }: UpgradeDialogProps) {
   const { settings } = useSettings();
   const isLoggedIn = !!settings.user?.token;
-  const tier = settings.user?.cloud_subscribed ? "subscribed" : isLoggedIn ? "logged_in" : "anonymous";
+  const localTier = settings.user?.cloud_subscribed ? "subscribed" : isLoggedIn ? "logged_in" : "anonymous";
+  // Prefer the tier the gateway reported — it's authoritative
+  const tier = gatewayTier ?? localTier;
   const trackedRef = useRef(false);
 
   // Track dialog shown
@@ -54,13 +59,34 @@ export function UpgradeDialog({
 
   const handleSubscribe = async (isAnnual: boolean) => {
     trackAction(isAnnual ? "subscribe_annual" : "subscribe_monthly");
-    const baseUrl = isAnnual
-      ? "https://buy.stripe.com/00w7sL5sT0kCdzX7tD7ss0H"
-      : "https://buy.stripe.com/9B63cv1cD1oG2Vjg097ss0G";
-    const params = new URLSearchParams();
-    if (settings.user?.id) params.set("client_reference_id", settings.user.id);
-    if (settings.user?.email) params.set("customer_email", settings.user.email);
-    await openUrl(`${baseUrl}?${params.toString()}`);
+    if (!settings.user?.token) {
+      await commands.openLoginWindow();
+      onOpenChange(false);
+      return;
+    }
+    try {
+      const response = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${settings.user.token}`,
+        },
+        body: JSON.stringify({
+          tier: "pro",
+          billingPeriod: isAnnual ? "yearly" : "monthly",
+          userId: settings.user.id,
+          email: settings.user.email,
+        }),
+      });
+      const data = await response.json();
+      if (data.url) {
+        await openUrl(data.url);
+      } else {
+        await openUrl("https://screenpi.pe/billing");
+      }
+    } catch {
+      await openUrl("https://screenpi.pe/billing");
+    }
     onOpenChange(false);
   };
 
@@ -86,7 +112,9 @@ export function UpgradeDialog({
             <Sparkles className="h-4 w-4 shrink-0" />
             <span>
               {reason === "daily_limit"
-                ? "you've used all your free queries today"
+                ? tier === "subscribed"
+                  ? "you've hit your daily pro limit"
+                  : "you've used all your free queries today"
                 : reason === "rate_limit"
                 ? "too many requests"
                 : "this model requires an upgrade"}
@@ -94,7 +122,11 @@ export function UpgradeDialog({
           </DialogTitle>
           <DialogDescription className="text-xs">
             {reason === "daily_limit"
-              ? "upgrade to pro to keep going"
+              ? tier === "subscribed"
+                ? "you've reached your daily limit. try a lighter model or wait until midnight UTC"
+                : tier === "logged_in"
+                ? "upgrade to pro for 1500 queries/day"
+                : "sign in for 50/day, or upgrade to pro for 1500/day"
               : reason === "rate_limit"
               ? "upgrade for 3x higher rate limits"
               : "upgrade for access to all models"}
@@ -102,38 +134,42 @@ export function UpgradeDialog({
         </DialogHeader>
 
         <div className="space-y-2.5">
-          <Button
-            variant="outline"
-            className="w-full justify-start gap-2.5 h-auto py-2.5 text-xs"
-            onClick={() => handleSubscribe(false)}
-          >
-            <Zap className="h-4 w-4 shrink-0" />
-            <div className="text-left flex-1 min-w-0">
-              <div className="font-medium">screenpipe pro — $39/mo</div>
-              <div className="text-[11px] text-muted-foreground mt-0.5">
-                cloud transcription + claude opus 4.6 + encrypted sync
-              </div>
-            </div>
-          </Button>
+          {tier !== "subscribed" && (
+            <>
+              <Button
+                variant="outline"
+                className="w-full justify-start gap-2.5 h-auto py-2.5 text-xs"
+                onClick={() => handleSubscribe(false)}
+              >
+                <Zap className="h-4 w-4 shrink-0" />
+                <div className="text-left flex-1 min-w-0">
+                  <div className="font-medium">screenpipe pro — $39/mo</div>
+                  <div className="text-[11px] text-muted-foreground mt-0.5">
+                    cloud transcription + claude opus 4.6 + encrypted sync
+                  </div>
+                </div>
+              </Button>
 
-          <Button
-            variant="outline"
-            className="w-full justify-start gap-2.5 h-auto py-2.5 text-xs"
-            onClick={() => handleSubscribe(true)}
-          >
-            <Star className="h-4 w-4 shrink-0" />
-            <div className="text-left flex-1 min-w-0">
-              <div className="font-medium flex items-center gap-1.5">
-                $312/year
-                <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-                  save 33%
-                </Badge>
-              </div>
-              <div className="text-[11px] text-muted-foreground mt-0.5">
-                everything in pro, billed annually
-              </div>
-            </div>
-          </Button>
+              <Button
+                variant="outline"
+                className="w-full justify-start gap-2.5 h-auto py-2.5 text-xs"
+                onClick={() => handleSubscribe(true)}
+              >
+                <Star className="h-4 w-4 shrink-0" />
+                <div className="text-left flex-1 min-w-0">
+                  <div className="font-medium flex items-center gap-1.5">
+                    $312/year
+                    <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                      save 33%
+                    </Badge>
+                  </div>
+                  <div className="text-[11px] text-muted-foreground mt-0.5">
+                    everything in pro, billed annually
+                  </div>
+                </div>
+              </Button>
+            </>
+          )}
 
           {!isLoggedIn && (
             <Button
@@ -150,24 +186,6 @@ export function UpgradeDialog({
               </div>
             </Button>
           )}
-
-          <Button
-            variant="outline"
-            className="w-full justify-start gap-2.5 h-auto py-2.5 text-xs"
-            onClick={async () => {
-              trackAction("buy_credits");
-              await openUrl("https://screenpi.pe/billing");
-              onOpenChange(false);
-            }}
-          >
-            <CreditCard className="h-4 w-4 shrink-0" />
-            <div className="text-left flex-1 min-w-0">
-              <div className="font-medium">buy credits</div>
-              <div className="text-[11px] text-muted-foreground mt-0.5">
-                pay per query — no subscription needed
-              </div>
-            </div>
-          </Button>
 
           <Button
             variant="ghost"

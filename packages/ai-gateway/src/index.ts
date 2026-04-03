@@ -6,11 +6,14 @@ import { RateLimiter, checkRateLimit } from './utils/rate-limiter';
 import { trackUsage, getUsageStatus, isModelAllowed, getTierConfig } from './services/usage-tracker';
 import { handleChatCompletions } from './handlers/chat';
 import { handleModelListing } from './handlers/models';
-import { handleFileTranscription, handleWebSocketUpgrade } from './handlers/transcription';
+import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
 import { handleVoiceTranscription, handleVoiceQuery, handleTextToSpeech, handleVoiceChat } from './handlers/voice';
 import { handleVertexProxy, handleVertexModels } from './handlers/vertex-proxy';
 import { handleWebSearch } from './handlers/web-search';
-import { logCost, getModelCost, inferProvider, getSpendSummary } from './services/cost-tracker';
+import { logCost, getModelCost, inferProvider, getSpendSummary, getDailyUserCost, getMaxDailyCostPerUser, isZeroCostModel } from './services/cost-tracker';
+import { trackResponseUsage } from './utils/stream-usage-tracker';
+import { getModelWeight } from './services/usage-tracker';
+import { pruneModelHealth } from './services/model-health';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
 
 export { RateLimiter };
@@ -32,13 +35,6 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
 		console.log('path', path);
 
-		// Handle WebSocket upgrade for real-time transcription (no auth required)
-		const upgradeHeader = request.headers.get('upgrade')?.toLowerCase();
-		if (path === '/v1/listen' && upgradeHeader === 'websocket') {
-			console.log('websocket request to /v1/listen detected, bypassing auth');
-			return await handleWebSocketUpgrade(request, env);
-		}
-
 		// Authenticate and get tier info for all other endpoints
 		const authResult = await validateAuth(request, env);
 		console.log('auth result:', { tier: authResult.tier, deviceId: authResult.deviceId });
@@ -52,7 +48,14 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 		// Usage status endpoint - returns current usage without incrementing
 		if (path === '/v1/usage' && request.method === 'GET') {
 			const status = await getUsageStatus(env, authResult.deviceId, authResult.tier, authResult.userId);
-			return addCorsHeaders(createSuccessResponse(status));
+			// Enrich with cost-based limit info
+			const dailyCost = await getDailyUserCost(env, authResult.deviceId);
+			const maxCost = getMaxDailyCostPerUser(env);
+			const enriched = {
+				...status,
+				cost_limit_reached: dailyCost >= maxCost,
+			};
+			return addCorsHeaders(createSuccessResponse(enriched));
 		}
 
 		// Admin spend endpoint - aggregated AI cost data
@@ -65,6 +68,16 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			const range = parseInt(url.searchParams.get('range') || '7', 10);
 			const summary = await getSpendSummary(env, range);
 			return addCorsHeaders(createSuccessResponse(summary));
+		}
+
+		// Admin A/B test results endpoint
+		if (path === '/v1/admin/transcription-ab' && request.method === 'GET') {
+			const authHeader = request.headers.get('Authorization');
+			const token = authHeader?.replace('Bearer ', '');
+			if (!env.ADMIN_SECRET || token !== env.ADMIN_SECRET) {
+				return addCorsHeaders(createErrorResponse(401, 'unauthorized'));
+			}
+			return addCorsHeaders(await handleABTestAdmin(request, env));
 		}
 
 		// Chat completions - main AI endpoint
@@ -80,6 +93,24 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 					tier: authResult.tier,
 					allowed_models: allowedModels,
 				})));
+			}
+
+			// Per-user daily cost cap — only for expensive models (weight >= 3).
+			// Cheap models (weight 0-1) like qwen3.5-flash, haiku, deepseek-chat
+			// should not trigger cost caps — they're affordable and pipes need them.
+			// Subscribed users get 5x higher cap.
+			const modelWeight = getModelWeight(body.model);
+			if (!isZeroCostModel(body.model) && modelWeight >= 3) {
+				const dailyCost = await getDailyUserCost(env, authResult.deviceId);
+				const baseCap = getMaxDailyCostPerUser(env);
+				const maxCost = authResult.tier === 'subscribed' ? baseCap * 5 : baseCap;
+				if (dailyCost >= maxCost) {
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'daily_cost_limit_exceeded',
+						message: `You've reached your daily AI usage limit. Try a free model or wait until tomorrow.`,
+						free_models: ['gemini-3-flash'],
+					})));
+				}
 			}
 
 			// Track usage and check daily limit (includes IP-based abuse prevention)
@@ -115,22 +146,24 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			}
 
 			// Add credit info header if paid via credits
-			const response = await handleChatCompletions(body, env);
+			let response = await handleChatCompletions(body, env);
 
-			// Log cost asynchronously — no latency impact
+			// Log cost — for streaming, intercept SSE events to get real token counts
 			if (body.stream) {
-				ctx.waitUntil(logCost(env, {
+				const { response: trackedResponse, usage: usagePromise } = trackResponseUsage(response, 'openai');
+				response = trackedResponse;
+				ctx.waitUntil(usagePromise.then(u => logCost(env, {
 					device_id: authResult.deviceId,
 					user_id: authResult.userId,
 					tier: authResult.tier,
 					provider: inferProvider(body.model),
 					model: body.model,
-					input_tokens: null,
-					output_tokens: null,
-					estimated_cost_usd: getModelCost(body.model, null, null),
+					input_tokens: u.input_tokens ?? null,
+					output_tokens: u.output_tokens ?? null,
+					estimated_cost_usd: getModelCost(body.model, u.input_tokens ?? null, u.output_tokens ?? null),
 					endpoint: '/v1/chat/completions',
 					stream: true,
-				}));
+				})));
 			} else {
 				ctx.waitUntil((async () => {
 					try {
@@ -198,11 +231,51 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 		}
 
 		if (path === '/v1/listen' && request.method === 'POST') {
-			return await handleFileTranscription(request, env);
+			// Per-user daily cost cap for transcription
+			// 2x safety margin: free=$10/day, subscribed=$50/day
+			const dailyCost = await getDailyUserCost(env, authResult.deviceId);
+			const baseCap = getMaxDailyCostPerUser(env);
+			const maxCost = authResult.tier === 'subscribed' ? baseCap * 10 : baseCap * 2;
+			if (dailyCost >= maxCost) {
+				return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+					error: 'daily_cost_limit_exceeded',
+					message: `You've reached your daily transcription limit ($${maxCost}/day). Audio will be transcribed locally until tomorrow.`,
+					daily_cost: dailyCost,
+					limit: maxCost,
+				})));
+			}
+
+			// Estimate cost from audio size: ~30s chunks at $0.26/hr = $0.0022/chunk
+			// More precise: estimate duration from Content-Length (MP3 at 64kbps = 8KB/s)
+			const contentLength = parseInt(request.headers.get('content-length') || '0');
+			const estimatedSeconds = contentLength > 0 ? contentLength / 8000 : 30;
+			const estimatedCost = (estimatedSeconds / 3600) * 0.26;
+
+			const response = await handleFileTranscription(request, env, ctx, authResult.deviceId);
+
+			// Log cost after successful transcription
+			if (response.ok) {
+				ctx.waitUntil(logCost(env, {
+					device_id: authResult.deviceId,
+					user_id: authResult.userId,
+					tier: authResult.tier,
+					provider: 'deepgram',
+					model: 'nova-3',
+					input_tokens: Math.round(estimatedSeconds),
+					output_tokens: null,
+					estimated_cost_usd: estimatedCost,
+					endpoint: '/v1/listen',
+					stream: false,
+				}));
+			}
+
+			return response;
 		}
 
 		if (path === '/v1/models' && request.method === 'GET') {
-			// Return tier-filtered models for non-subscribed users
+			// Prune old health records opportunistically (fire-and-forget)
+			ctx.waitUntil(pruneModelHealth(env));
+			// Return tier-filtered models with live health status
 			return await handleModelListing(env, authResult.tier);
 		}
 
@@ -261,6 +334,21 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				// If body parse fails, let the proxy handle the error downstream
 			}
 
+			// Per-user daily cost cap — only expensive models (weight >= 3)
+			const msgModelWeight = getModelWeight(parsedModel);
+			if (!isZeroCostModel(parsedModel) && msgModelWeight >= 3) {
+				const dailyCost = await getDailyUserCost(env, authResult.deviceId);
+				const baseCap = getMaxDailyCostPerUser(env);
+				const maxCost = authResult.tier === 'subscribed' ? baseCap * 5 : baseCap;
+				if (dailyCost >= maxCost) {
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'daily_cost_limit_exceeded',
+						message: `You've reached your daily AI usage limit. Try a free model or wait until tomorrow.`,
+						free_models: ['gemini-3-flash'],
+					})));
+				}
+			}
+
 			// Track usage and check daily limit (weighted by model)
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, parsedModel);
@@ -276,24 +364,26 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				})));
 			}
 
-			const vertexResponse = await handleVertexProxy(request, env);
-			// Log cost — try to extract tokens from non-streaming Anthropic responses
-			ctx.waitUntil((async () => {
-				try {
-					if (parsedStream) {
-						await logCost(env, {
-							device_id: authResult.deviceId,
-							user_id: authResult.userId,
-							tier: authResult.tier,
-							provider: inferProvider(parsedModel),
-							model: parsedModel,
-							input_tokens: null,
-							output_tokens: null,
-							estimated_cost_usd: getModelCost(parsedModel, null, null),
-							endpoint: '/v1/messages',
-							stream: true,
-						});
-					} else {
+			let vertexResponse = await handleVertexProxy(request, env);
+			// Log cost — intercept stream for real token counts
+			if (parsedStream) {
+				const { response: trackedResponse, usage: usagePromise } = trackResponseUsage(vertexResponse, 'anthropic');
+				vertexResponse = trackedResponse;
+				ctx.waitUntil(usagePromise.then(u => logCost(env, {
+					device_id: authResult.deviceId,
+					user_id: authResult.userId,
+					tier: authResult.tier,
+					provider: inferProvider(parsedModel),
+					model: parsedModel,
+					input_tokens: u.input_tokens ?? null,
+					output_tokens: u.output_tokens ?? null,
+					estimated_cost_usd: getModelCost(parsedModel, u.input_tokens ?? null, u.output_tokens ?? null),
+					endpoint: '/v1/messages',
+					stream: true,
+				})));
+			} else {
+				ctx.waitUntil((async () => {
+					try {
 						const clonedResp = vertexResponse.clone();
 						const json = await clonedResp.json() as any;
 						const inputTokens = json?.usage?.input_tokens ?? null;
@@ -310,11 +400,11 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 							endpoint: '/v1/messages',
 							stream: false,
 						});
+					} catch (e) {
+						console.error('cost log /v1/messages failed:', e);
 					}
-				} catch (e) {
-					console.error('cost log /v1/messages failed:', e);
-				}
-			})());
+				})());
+			}
 			return vertexResponse;
 		}
 
@@ -344,6 +434,21 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				// body parse failure — proceed with defaults
 			}
 
+			// Per-user daily cost cap — only expensive models (weight >= 3)
+			const ocModelWeight = getModelWeight(ocModel);
+			if (!isZeroCostModel(ocModel) && ocModelWeight >= 3) {
+				const dailyCost = await getDailyUserCost(env, authResult.deviceId);
+				const baseCap = getMaxDailyCostPerUser(env);
+				const maxCost = authResult.tier === 'subscribed' ? baseCap * 5 : baseCap;
+				if (dailyCost >= maxCost) {
+					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
+						error: 'daily_cost_limit_exceeded',
+						message: `You've reached your daily AI usage limit. Try a free model or wait until tomorrow.`,
+						free_models: ['gemini-3-flash'],
+					})));
+				}
+			}
+
 			// Track usage for OpenCode requests (weighted by model)
 			const ipAddress = request.headers.get('cf-connecting-ip') || undefined;
 			const usage = await trackUsage(env, authResult.deviceId, authResult.tier, authResult.userId, ipAddress, ocModel);
@@ -359,23 +464,26 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				})));
 			}
 
-			const anthropicResponse = await handleVertexProxy(request, env);
-			ctx.waitUntil((async () => {
-				try {
-					if (ocStream) {
-						await logCost(env, {
-							device_id: authResult.deviceId,
-							user_id: authResult.userId,
-							tier: authResult.tier,
-							provider: inferProvider(ocModel),
-							model: ocModel,
-							input_tokens: null,
-							output_tokens: null,
-							estimated_cost_usd: getModelCost(ocModel, null, null),
-							endpoint: '/anthropic/v1/messages',
-							stream: true,
-						});
-					} else {
+			let anthropicResponse = await handleVertexProxy(request, env);
+			// Log cost — intercept stream for real token counts
+			if (ocStream) {
+				const { response: trackedResponse, usage: usagePromise } = trackResponseUsage(anthropicResponse, 'anthropic');
+				anthropicResponse = trackedResponse;
+				ctx.waitUntil(usagePromise.then(u => logCost(env, {
+					device_id: authResult.deviceId,
+					user_id: authResult.userId,
+					tier: authResult.tier,
+					provider: inferProvider(ocModel),
+					model: ocModel,
+					input_tokens: u.input_tokens ?? null,
+					output_tokens: u.output_tokens ?? null,
+					estimated_cost_usd: getModelCost(ocModel, u.input_tokens ?? null, u.output_tokens ?? null),
+					endpoint: '/anthropic/v1/messages',
+					stream: true,
+				})));
+			} else {
+				ctx.waitUntil((async () => {
+					try {
 						const clonedResp = anthropicResponse.clone();
 						const json = await clonedResp.json() as any;
 						const inputTokens = json?.usage?.input_tokens ?? null;
@@ -392,11 +500,11 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 							endpoint: '/anthropic/v1/messages',
 							stream: false,
 						});
+					} catch (e) {
+						console.error('cost log /anthropic/v1/messages failed:', e);
 					}
-				} catch (e) {
-					console.error('cost log /anthropic/v1/messages failed:', e);
-				}
-			})());
+				})());
+			}
 			return anthropicResponse;
 		}
 
@@ -480,7 +588,7 @@ curl -X POST $HOST/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer $TOKEN" \
 -d '{
-"model": "gpt-4o",
+"model": "gpt-5.4",
 "messages": [
 	{
 	"role": "system",

@@ -5,14 +5,15 @@
 /// Tests for `get_untranscribed_chunks` — the reconciliation sweep query.
 ///
 /// Run with: cargo test --package screenpipe-db --test untranscribed_chunks_test -- --nocapture
-
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
     use screenpipe_db::{AudioDevice, DatabaseManager, DeviceType};
 
     async fn setup_test_db() -> DatabaseManager {
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         match sqlx::migrate!("./src/migrations").run(&db.pool).await {
             Ok(_) => {}

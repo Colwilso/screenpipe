@@ -24,17 +24,25 @@ use crate::{
             add_tags, add_to_database, execute_raw_sql, get_tags_batch, merge_frames_handler,
             remove_tags, validate_media_handler,
         },
-        data::delete_time_range_handler,
+        data::{delete_device_data_handler, delete_time_range_handler, device_storage_handler},
         elements::{get_frame_elements, search_elements},
         frames::{
-            get_frame_context, get_frame_data, get_frame_metadata, get_frame_ocr_data,
+            get_frame_context, get_frame_data, get_frame_metadata, get_frame_text_data,
             get_next_valid_frame, run_frame_ocr,
         },
         health::{
             api_list_monitors, api_vision_status, audio_metrics_handler, health_check,
             vision_metrics_handler,
         },
-        meetings::{get_meeting_handler, list_meetings_handler},
+        meetings::{
+            bulk_delete_meetings_handler, delete_meeting_handler, get_meeting_handler,
+            list_meetings_handler, meeting_status_handler, merge_meetings_handler,
+            start_meeting_handler, stop_meeting_handler, update_meeting_handler,
+        },
+        memories::{
+            create_memory_handler, delete_memory_handler, get_memory_handler,
+            list_memories_handler, update_memory_handler,
+        },
         search::{keyword_search_handler, search},
         speakers::{
             delete_speaker_handler, get_similar_speakers_handler, get_unnamed_speakers_handler,
@@ -146,8 +154,14 @@ pub struct AppState {
     pub hot_frame_cache: Arc<HotFrameCache>,
     /// Cloud archive state (initialized via /archive/init endpoint)
     pub archive_state: crate::archive::ArchiveState,
+    /// Local data retention state (auto-delete old data)
+    pub retention_state: crate::retention::RetentionState,
     /// Vault lock manager — encrypts data at rest when locked
     pub vault: screenpipe_vault::VaultManager,
+    /// Active manually-started meeting id (set via POST /meetings/start, cleared via POST /meetings/stop)
+    pub manual_meeting: Arc<tokio::sync::RwLock<Option<i64>>>,
+    /// Browser extension bridge — relays JS eval requests to the connected extension
+    pub browser_bridge: Arc<crate::routes::browser::BrowserBridge>,
 }
 
 pub struct SCServer {
@@ -170,6 +184,8 @@ pub struct SCServer {
     /// Shared pipe permission token registry — set before starting so PipeManager can use it.
     pub pipe_permissions:
         Arc<DashMap<String, Arc<screenpipe_core::pipes::permissions::PipePermissions>>>,
+    /// Shared manual meeting lock — pass in from binary so persister and server share the same state.
+    pub manual_meeting: Option<Arc<tokio::sync::RwLock<Option<i64>>>>,
 }
 
 impl SCServer {
@@ -201,6 +217,7 @@ impl SCServer {
             hot_frame_cache: None,
             power_manager: None,
             pipe_permissions: Arc::new(DashMap::new()),
+            manual_meeting: None,
         }
     }
 
@@ -229,6 +246,11 @@ impl SCServer {
         // Create the listener (SO_REUSEADDR on Windows to avoid TIME_WAIT conflicts)
         let listener = bind_listener(self.addr).await?;
         info!("Server listening on {}", self.addr);
+
+        // Advertise via mDNS
+        if let Err(e) = screenpipe_connect::mdns::advertise(self.addr.port()) {
+            tracing::warn!("mdns advertisement failed (non-fatal): {}", e);
+        }
 
         // Start serving
         serve(
@@ -426,8 +448,14 @@ impl SCServer {
             frame_extraction_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
             hot_frame_cache,
             archive_state: crate::archive::ArchiveState::new(),
+            retention_state: crate::retention::RetentionState::new(),
             pipe_permissions: self.pipe_permissions.clone(),
             vault: screenpipe_vault::VaultManager::new(self.screenpipe_dir.clone()),
+            manual_meeting: self
+                .manual_meeting
+                .clone()
+                .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(None))),
+            browser_bridge: crate::routes::browser::BrowserBridge::new(),
         });
 
         let cors = CorsLayer::new()
@@ -446,8 +474,10 @@ impl SCServer {
             .post("/tags/:content_type/:id", add_tags)
             .delete("/tags/:content_type/:id", remove_tags)
             .get("/frames/:frame_id", get_frame_data)
-            .get("/frames/:frame_id/ocr", get_frame_ocr_data)
-            .post("/frames/:frame_id/ocr", run_frame_ocr)
+            .get("/frames/:frame_id/text", get_frame_text_data)
+            .get("/frames/:frame_id/ocr", get_frame_text_data) // deprecated alias
+            .post("/frames/:frame_id/text", run_frame_ocr)
+            .post("/frames/:frame_id/ocr", run_frame_ocr) // deprecated alias
             .get("/frames/:frame_id/context", get_frame_context)
             .get("/frames/:frame_id/metadata", get_frame_metadata)
             .get("/frames/next-valid", get_next_valid_frame)
@@ -464,7 +494,19 @@ impl SCServer {
             .post("/speakers/reassign", reassign_speaker_handler)
             .post("/speakers/undo-reassign", undo_speaker_reassign_handler)
             .get("/meetings", list_meetings_handler)
+            .get("/meetings/status", meeting_status_handler)
+            .post("/meetings/merge", merge_meetings_handler)
+            .post("/meetings/bulk-delete", bulk_delete_meetings_handler)
+            .post("/meetings/start", start_meeting_handler)
+            .post("/meetings/stop", stop_meeting_handler)
             .get("/meetings/:id", get_meeting_handler)
+            .delete("/meetings/:id", delete_meeting_handler)
+            .put("/meetings/:id", update_meeting_handler)
+            .post("/memories", create_memory_handler)
+            .get("/memories", list_memories_handler)
+            .get("/memories/:id", get_memory_handler)
+            .put("/memories/:id", update_memory_handler)
+            .delete("/memories/:id", delete_memory_handler)
             .post("/experimental/frames/merge", merge_frames_handler)
             .get("/experimental/validate/media", validate_media_handler)
             .post("/audio/start", start_audio)
@@ -484,9 +526,18 @@ impl SCServer {
             .merge(server.into_router())
             // Vault lock/unlock routes
             .route("/vault/status", get(crate::routes::vault::vault_status))
-            .route("/vault/lock", axum::routing::post(crate::routes::vault::vault_lock))
-            .route("/vault/unlock", axum::routing::post(crate::routes::vault::vault_unlock))
-            .route("/vault/setup", axum::routing::post(crate::routes::vault::vault_setup))
+            .route(
+                "/vault/lock",
+                axum::routing::post(crate::routes::vault::vault_lock),
+            )
+            .route(
+                "/vault/unlock",
+                axum::routing::post(crate::routes::vault::vault_unlock),
+            )
+            .route(
+                "/vault/setup",
+                axum::routing::post(crate::routes::vault::vault_setup),
+            )
             // Cloud Sync API routes
             .route("/sync/init", axum::routing::post(sync_api::sync_init))
             .route("/sync/status", get(sync_api::sync_status))
@@ -518,6 +569,16 @@ impl SCServer {
                 "/archive/run",
                 axum::routing::post(crate::archive::archive_run),
             )
+            // Local data retention (auto-delete old data)
+            .route(
+                "/retention/configure",
+                axum::routing::post(crate::retention::retention_configure),
+            )
+            .route("/retention/status", get(crate::retention::retention_status))
+            .route(
+                "/retention/run",
+                axum::routing::post(crate::retention::retention_run),
+            )
             // Vision status endpoint (not in OpenAPI spec to avoid oasgen registration issues)
             .route("/vision/status", get(api_vision_status))
             // Vision pipeline metrics (not in OpenAPI spec)
@@ -527,6 +588,14 @@ impl SCServer {
             .route(
                 "/data/delete-range",
                 axum::routing::post(delete_time_range_handler),
+            )
+            .route(
+                "/data/delete-device",
+                axum::routing::post(delete_device_data_handler),
+            )
+            .route(
+                "/data/device-storage",
+                axum::routing::get(device_storage_handler),
             )
             .route(
                 "/audio/retranscribe",
@@ -580,6 +649,40 @@ impl SCServer {
                     "/:id/history",
                     axum::routing::delete(crate::pipes_api::clear_pipe_history),
                 )
+                .route(
+                    "/:id/session/:exec_id",
+                    axum::routing::get(crate::pipes_api::get_pipe_session),
+                )
+                // Store/registry routes (nested under /pipes/store)
+                .route(
+                    "/store",
+                    axum::routing::get(crate::routes::pipe_store::pipe_store_search),
+                )
+                .route(
+                    "/store/publish",
+                    axum::routing::post(crate::routes::pipe_store::pipe_store_publish),
+                )
+                .route(
+                    "/store/install",
+                    axum::routing::post(crate::routes::pipe_store::pipe_store_install),
+                )
+                .route(
+                    "/store/update",
+                    axum::routing::post(crate::routes::pipe_store::pipe_store_update),
+                )
+                .route(
+                    "/store/check-updates",
+                    axum::routing::get(crate::routes::pipe_store::pipe_store_check_updates),
+                )
+                .route(
+                    "/store/:slug",
+                    axum::routing::get(crate::routes::pipe_store::pipe_store_detail)
+                        .delete(crate::routes::pipe_store::pipe_store_unpublish),
+                )
+                .route(
+                    "/store/:slug/review",
+                    axum::routing::post(crate::routes::pipe_store::pipe_store_review),
+                )
                 .with_state(pm.clone());
             router.nest("/pipes", pipe_routes)
         } else {
@@ -588,15 +691,25 @@ impl SCServer {
 
         // Connections routes (pipe-facing integrations: Telegram, Slack, etc.)
         let cm: crate::connections_api::SharedConnectionManager = Arc::new(Mutex::new(
-            screenpipe_connect::connections::ConnectionManager::new(
-                self.screenpipe_dir.clone(),
-            ),
+            screenpipe_connect::connections::ConnectionManager::new(self.screenpipe_dir.clone()),
         ));
         let wa: crate::connections_api::SharedWhatsAppGateway = Arc::new(Mutex::new(
-            screenpipe_connect::whatsapp::WhatsAppGateway::new(
-                self.screenpipe_dir.clone(),
-            ),
+            screenpipe_connect::whatsapp::WhatsAppGateway::new(self.screenpipe_dir.clone()),
         ));
+
+        // Auto-reconnect WhatsApp if a previous session exists on disk
+        {
+            let wa_lock = wa.lock().await;
+            if wa_lock.has_session() {
+                tracing::info!("whatsapp: found existing session, auto-reconnecting...");
+                let bun_path =
+                    screenpipe_connect::whatsapp::which_bun().unwrap_or_else(|| "bun".to_string());
+                if let Err(e) = wa_lock.start_pairing(&bun_path).await {
+                    tracing::warn!("whatsapp: auto-reconnect failed: {:?}", e);
+                }
+            }
+        }
+
         let router = router.nest("/connections", crate::connections_api::router(cm, wa));
 
         // Power management routes (if power manager is available)
@@ -619,6 +732,37 @@ impl SCServer {
             .route("/ws/events", get(ws_events_handler))
             .route("/ws/health", get(ws_health_handler))
             .route("/ws/metrics", get(ws_metrics_handler))
+            // Browser extension bridge
+            .route(
+                "/browser/ws",
+                get({
+                    let bridge = app_state.browser_bridge.clone();
+                    move |ws| {
+                        crate::routes::browser::browser_ws_handler(ws, axum::extract::State(bridge))
+                    }
+                }),
+            )
+            .route(
+                "/browser/eval",
+                axum::routing::post({
+                    let bridge = app_state.browser_bridge.clone();
+                    move |body| {
+                        crate::routes::browser::browser_eval_handler(
+                            axum::extract::State(bridge),
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/browser/status",
+                get({
+                    let bridge = app_state.browser_bridge.clone();
+                    move || {
+                        crate::routes::browser::browser_status_handler(axum::extract::State(bridge))
+                    }
+                }),
+            )
             .route(
                 "/frames/export",
                 get(handle_video_export_ws).post(handle_video_export_post),

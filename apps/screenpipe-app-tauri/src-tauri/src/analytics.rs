@@ -62,7 +62,7 @@ impl AnalyticsManager {
             email,
             interval: Duration::from_secs(interval_hours * 36),
             enabled: Arc::new(Mutex::new(analytics_enabled)),
-            api_host: "https://eu.i.posthog.com".to_string(),
+            api_host: "https://us.i.posthog.com".to_string(),
             local_api_base_url,
             screenpipe_dir_path,
             attribution: Mutex::new(None),
@@ -312,9 +312,9 @@ impl AnalyticsManager {
             "setting_monitor_count": get_arr_len("monitorIds"),
             "setting_video_quality": get_str("videoQuality").unwrap_or("balanced"),
 
-            // Element capture / accessibility
-            "setting_enable_input_capture": get_bool("enableInputCapture").unwrap_or(false),
-            "setting_enable_accessibility": get_bool("enableAccessibility").unwrap_or(true),
+            // Element capture / accessibility — always enabled
+            "setting_enable_input_capture": true,
+            "setting_enable_accessibility": true,
 
             // Audio
             "setting_disable_audio": get_bool("disableAudio").unwrap_or(false),
