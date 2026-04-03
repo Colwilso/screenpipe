@@ -52,6 +52,7 @@ import { NotificationsSettings } from "@/components/settings/notifications-setti
 import { UsageSection } from "@/components/settings/usage-section";
 import { StandaloneChat } from "@/components/standalone-chat";
 import Timeline from "@/components/rewind/timeline";
+import { ActivityDashboard } from "@/components/activity/activity-dashboard";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -68,7 +69,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
-type MainSection = "home" | "timeline" | "pipes" | "help";
+type MainSection = "home" | "timeline" | "pipes" | "activity" | "help";
 
 type SettingsModalSection =
   | "account"
@@ -300,6 +301,8 @@ function SettingsPageContent() {
         return <Timeline embedded />;
       case "pipes":
         return <PipeStoreView />;
+      case "activity":
+        return <ActivityDashboard />;
       case "help":
         return <FeedbackSection />;
       default:
@@ -347,6 +350,7 @@ function SettingsPageContent() {
     { id: "home", label: "Home", icon: <Home className="h-4 w-4" /> },
     { id: "pipes", label: "Pipes", icon: <Workflow className="h-4 w-4" /> },
     { id: "timeline", label: "Timeline", icon: <Clock className="h-4 w-4" /> },
+    { id: "activity", label: "Activity", icon: <BarChart3 className="h-4 w-4" /> },
   ].filter((s) => !isSectionHidden(s.id));
 
   // Settings modal sidebar items (filtered by enterprise policy)
@@ -414,7 +418,7 @@ function SettingsPageContent() {
             <div className={cn(isTranslucent ? "vibrant-sidebar-border" : "", "border-b", sidebarCollapsed ? "px-2 py-3" : "px-4 py-3")}>
               {/* Row 1: name + phone + collapse */}
               <div className={cn("flex items-center", sidebarCollapsed ? "justify-center" : "justify-between")}>
-                {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>screenpipe</h1>}
+                {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>Alioth</h1>}
                 <div className="flex items-center gap-1.5">
                   <button
                     onClick={toggleMeeting}
