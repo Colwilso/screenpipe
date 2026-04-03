@@ -268,6 +268,8 @@ pub enum AIProviderType {
     Pi,
     #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "bedrock")]
+    Bedrock,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
