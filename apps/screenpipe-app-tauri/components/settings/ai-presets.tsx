@@ -1072,27 +1072,7 @@ const AISection = ({
           </Label>
         </div>
         <div className="grid grid-cols-2 gap-4 mb-4 mt-4">
-          <AIProviderCard
-            type="openai-chatgpt"
-            title="ChatGPT"
-            description="Sign in with your ChatGPT Plus/Pro subscription"
-            imageSrc="/images/openai.png"
-            selected={settingsPreset?.provider === "openai-chatgpt"}
-            onClick={() => handleAiProviderChange("openai-chatgpt")}
-          />
-
-          <AIProviderCard
-            type="anthropic"
-            title="Claude.ai"
-            description="Use your Anthropic API key"
-            imageSrc="/images/claude-ai.svg"
-            selected={(settingsPreset?.provider as string) === "anthropic"}
-            onClick={() => {
-              if ((settingsPreset?.provider as string) !== "anthropic") {
-                handleAiProviderChange("anthropic");
-              }
-            }}
-          />
+          {/* ChatGPT, Claude.ai, and Screenpipe Cloud hidden */}
 
           <AIProviderCard
             type="custom"
@@ -1120,19 +1100,6 @@ const AISection = ({
             selected={settingsPreset?.provider === "bedrock"}
             onClick={() => handleAiProviderChange("bedrock")}
           />
-
-          {piAvailable && (
-            <AIProviderCard
-              type="screenpipe-cloud"
-              title="Screenpipe Cloud"
-              description="AI coding agent powered by Screenpipe Cloud. Requires login."
-              imageSrc="/images/screenpipe.png"
-              selected={settingsPreset?.provider === "screenpipe-cloud"}
-              onClick={() => handleAiProviderChange("screenpipe-cloud")}
-              disabled={!settings.user?.token}
-              warningText={!settings.user?.token ? "Login required" : undefined}
-            />
-          )}
 
         </div>
       </div>

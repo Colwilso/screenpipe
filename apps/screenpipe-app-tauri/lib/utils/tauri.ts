@@ -1028,6 +1028,14 @@ apiKey: string | null;
  */
 maxTokens?: number; 
 /**
+ * AWS profile name for Bedrock provider
+ */
+awsProfile: string | null; 
+/**
+ * AWS region for Bedrock provider
+ */
+awsRegion: string | null; 
+/**
  * Optional system prompt from AI preset (appended to Pi's built-in system prompt)
  */
 systemPrompt?: string | null }
