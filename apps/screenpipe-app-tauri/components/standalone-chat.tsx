@@ -1590,6 +1590,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       model: p.model || "",
       apiKey: ("apiKey" in p ? (p.apiKey as string) : null) || null,
       maxTokens: (p as any).maxTokens ?? 4096,
+      awsProfile: ("awsProfile" in p ? (p.awsProfile as string) : null) || null,
+      awsRegion: ("awsRegion" in p ? (p.awsRegion as string) : null) || null,
       systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1643,7 +1645,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
     // Shared handler for Pi event data — used by both pi_event and pipe_event
     const handlePiEventData = (data: any) => {
-
+      try {
         if (data.type === "message_update" && data.assistantMessageEvent) {
           const evt = data.assistantMessageEvent;
           if (evt.type === "text_delta" && evt.delta) {
@@ -1814,10 +1816,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               const isDailyLimit = fullError.includes("daily_limit_exceeded") || fullError.includes("daily_cost_limit_exceeded");
               const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
               if (isDailyLimit) {
-                try {
-                  const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
-                } catch {}
-                                  setMessages((prev) =>
+                setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(fullError) } : m)
                 );
               } else {
@@ -1854,10 +1853,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const msgId = piMessageIdRef.current;
 
             if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("daily_cost_limit_exceeded") || errMsg.includes("429")) {
-              try {
-                const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
-                } catch {}
-                            posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
+              posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errMsg) } : m)
               );
@@ -1909,10 +1905,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             if (agentEndError && !content) {
               const errStr = agentEndError;
               if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("daily_cost_limit_exceeded") || errStr.includes("429")) {
-                try {
-                  const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
-                    } catch {}
-                                  content = buildDailyLimitMessage(errStr);
+                content = buildDailyLimitMessage(errStr);
               } else if (errStr.includes("rate limit")) {
                   content = "Rate limited — try again in a moment.";
               } else {
@@ -2006,10 +1999,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               const isDailyLimit = errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded");
               const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
               if (isDailyLimit) {
-                try {
-                  const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
-                } catch {}
-                                  setMessages((prev) =>
+                setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errorStr) } : m)
                 );
               } else {
@@ -2083,7 +2073,31 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             setIsStreaming(false);
           }
         }
-      };
+      } catch (error) {
+        // Unhandled error in Pi event processing — log with context and recover gracefully
+        console.error("[Pi] Event handler error:", error, "Event type:", data?.type, "Event data:", data);
+
+        // Clean up streaming state to prevent stuck UI
+        if (piMessageIdRef.current) {
+          const msgId = piMessageIdRef.current;
+          setMessages((prev) =>
+            prev.map((m) => m.id === msgId ? {
+              ...m,
+              content: `Something went wrong processing the response. Error: ${error instanceof Error ? error.message : String(error)}`
+            } : m)
+          );
+        }
+
+        // Reset all streaming refs to prevent subsequent errors
+        piStreamingTextRef.current = "";
+        piMessageIdRef.current = null;
+        piContentBlocksRef.current = [];
+        piThinkingStartRef.current = null;
+        setActivePipeExecution(null);
+        setIsLoading(false);
+        setIsStreaming(false);
+      }
+    };
 
     const setup = async () => {
       unlistenEvent = await listen<any>("pi_event", (event) => {

@@ -129,7 +129,7 @@ const INITIAL_DIAGNOSTICS: DiagnosticResults = {
 };
 
 export interface AIProviderCardProps {
-  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "screenpipe-cloud";
+  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "bedrock" | "custom" | "embedded" | "screenpipe-cloud";
   title: string;
   description: string;
   imageSrc: string;
