@@ -64,6 +64,10 @@ cd packages/screenpipe-js/cli && bun run build         # @screenpipe/dev CLI
 **Always use the Tauri dev build**, not the npm CLI:
 
 ```bash
+# Quick start (convenience script from repo root)
+./run-screenpipe-dev.sh
+
+# Or manually:
 # Kill any stale engine on port 3030 first
 lsof -ti :3030 | xargs kill 2>/dev/null
 
@@ -74,6 +78,10 @@ cd apps/screenpipe-app-tauri && bun tauri dev
 The Tauri app embeds the engine as a library dependency. Local changes to `screenpipe-core` (pipes, presets, agents) only take effect in the Tauri build. The npm CLI (`/opt/homebrew/bin/screenpipe`) is a published package with none of our local patches.
 
 **Never start the npm engine on port 3030.** If it's already running when `bun tauri dev` launches, the embedded server silently fails to bind and pipes run through the unpatched npm binary. Always kill port 3030 before starting the Tauri app.
+
+**Convenience scripts in repo root:**
+- `./run-screenpipe-dev.sh` — Start Tauri app in dev mode (kills port 3030, starts app)
+- `./run-screenpipe-build.sh` — Build Tauri app for release (macOS Apple Silicon)
 
 ## Testing
 ```bash
