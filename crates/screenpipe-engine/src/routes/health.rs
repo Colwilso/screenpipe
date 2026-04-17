@@ -209,7 +209,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         let device_active = if app_uptime < grace_period {
             true // Consider active during grace period
         } else {
-            now - last_capture < 5 // Consider active if captured in last 5 seconds
+            now.saturating_sub(last_capture) < 5 // Consider active if captured in last 5 seconds
         };
 
         // Track if any device is active
@@ -227,7 +227,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         global_audio_active = if app_uptime < grace_period {
             true // Consider active during grace period
         } else {
-            now - last_capture < 5 // Consider active if captured in last 5 seconds
+            now.saturating_sub(last_capture) < 5 // Consider active if captured in last 5 seconds
         };
     }
 
