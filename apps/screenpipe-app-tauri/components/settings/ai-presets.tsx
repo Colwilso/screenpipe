@@ -397,9 +397,10 @@ const AISection = ({
 
       setDialog(false);
     } catch (error) {
+      console.error("Failed to save preset:", error);
       toast({
         title: "Error saving preset",
-        description: "Something went wrong while saving the preset",
+        description: error instanceof Error ? error.message : "Unknown error - check console for details",
         variant: "destructive",
       });
     } finally {
@@ -1087,7 +1088,14 @@ const AISection = ({
           </Label>
         </div>
         <div className="grid grid-cols-2 gap-4 mb-4 mt-4">
-          {/* ChatGPT, Claude.ai, and Screenpipe Cloud hidden */}
+          <AIProviderCard
+            type="bedrock"
+            title="AWS Bedrock"
+            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
+            imageSrc="/images/bedrock-logo.png"
+            selected={settingsPreset?.provider === "bedrock"}
+            onClick={() => handleAiProviderChange("bedrock")}
+          />
 
           <AIProviderCard
             type="custom"
@@ -1096,24 +1104,6 @@ const AISection = ({
             imageSrc="/images/custom.png"
             selected={settingsPreset?.provider === "custom"}
             onClick={() => handleAiProviderChange("custom")}
-          />
-
-          <AIProviderCard
-            type="native-ollama"
-            title="Ollama"
-            description="Run AI models locally using your existing Ollama installation"
-            imageSrc="/images/ollama.png"
-            selected={settingsPreset?.provider === "native-ollama"}
-            onClick={() => handleAiProviderChange("native-ollama")}
-          />
-
-          <AIProviderCard
-            type="bedrock"
-            title="AWS Bedrock"
-            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
-            imageSrc="/images/custom.png"
-            selected={settingsPreset?.provider === "bedrock"}
-            onClick={() => handleAiProviderChange("bedrock")}
           />
 
         </div>
@@ -1676,6 +1666,7 @@ const providerImageSrc: Record<string, string> = {
   "openai-chatgpt": "/images/openai.png",
   anthropic: "/images/claude-ai.svg",
   "native-ollama": "/images/ollama.png",
+  bedrock: "/images/bedrock-logo.png",
   custom: "/images/custom.png",
   pi: "/images/screenpipe.png",
   screenpipe: "/images/screenpipe.png",

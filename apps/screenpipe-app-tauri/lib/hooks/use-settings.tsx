@@ -246,20 +246,21 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 	linux: ["Info center", "Discover", "Parted"],
 };
 
-// Default Screenpipe Cloud preset
-const DEFAULT_CLOUD_PRESET: AIPreset = {
-	id: "screenpipe-cloud",
-	provider: "screenpipe-cloud",
+// Default Bedrock preset (replaced after settings load from store.bin)
+const DEFAULT_BEDROCK_PRESET: AIPreset = {
+	id: "bedrock",
+	provider: "bedrock",
 	url: "",
-	model: "auto",
-	maxContextChars: 1000000,
+	model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	awsProfile: "nasc_lma",
+	awsRegion: "us-east-1",
+	maxContextChars: 512000,
 	defaultPreset: true,
 	prompt: "",
 };
 
-// Legacy presets removed — screenpipe-cloud is the only default now
 let DEFAULT_SETTINGS: Settings = {
-			aiPresets: [DEFAULT_CLOUD_PRESET as any],
+			aiPresets: [DEFAULT_BEDROCK_PRESET as any],
 			deviceId: crypto.randomUUID(),
 			deepgramApiKey: "",
 			isLoading: false,
@@ -417,7 +418,7 @@ function createSettingsStore() {
 
 		// Migration: Add default presets if user has none
 		if (!settings.aiPresets || settings.aiPresets.length === 0) {
-			settings.aiPresets = [DEFAULT_CLOUD_PRESET as any];
+			settings.aiPresets = [DEFAULT_BEDROCK_PRESET as any];
 			needsUpdate = true;
 		}
 
@@ -437,17 +438,7 @@ function createSettingsStore() {
 			needsUpdate = true;
 		}
 
-		// Migration: Add screenpipe-cloud preset for existing users (without touching their existing presets)
-		const hasCloudPreset = settings.aiPresets?.some(
-			(p: any) => p.id === "screenpipe-cloud" || p.provider === "screenpipe-cloud"
-		);
-		if (settings.aiPresets && settings.aiPresets.length > 0 && !hasCloudPreset) {
-			// Only set as default if no other preset is already default
-			const hasDefault = settings.aiPresets.some((p: any) => p.defaultPreset);
-			const cloudPreset = { ...DEFAULT_CLOUD_PRESET, defaultPreset: !hasDefault };
-			settings.aiPresets = [cloudPreset as any, ...settings.aiPresets];
-			needsUpdate = true;
-		}
+		// Migration: removed cloud preset auto-addition
 
 		// Migration: Add chat history for existing users
 		if (!settings.chatHistory) {
