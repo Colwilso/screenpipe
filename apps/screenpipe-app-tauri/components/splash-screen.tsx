@@ -7,7 +7,7 @@
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useEffect, useState } from "react";
 
-export function SplashScreen() {
+export default function SplashScreen() {
   const { settings } = useSettings();
   const [show, setShow] = useState(true);
   const [fade, setFade] = useState(false);
