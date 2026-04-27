@@ -26,12 +26,16 @@ export interface TeamInfo {
   name: string;
   created_at: string;
   member_count: number;
+  auto_join_domain?: string | null;
 }
 
 export interface TeamMember {
   user_id: string;
   role: "admin" | "member";
   joined_at: string;
+  // populated by backend when /api/team/members joins the users table
+  name?: string | null;
+  email?: string | null;
 }
 
 export interface TeamConfig {

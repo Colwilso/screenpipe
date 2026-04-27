@@ -5,12 +5,21 @@ import React, { useEffect } from "react";
 import {
   isPermissionGranted,
   requestPermission,
-  sendNotification,
+  sendNotification as _sendNotification,
 } from "@tauri-apps/plugin-notification";
+import { platform } from "@tauri-apps/plugin-os";
 
 import { listen } from "@tauri-apps/api/event";
 import { showNotificationPanel } from "@/lib/hooks/use-notification-panel";
 import { showChatWithPrefill } from "@/lib/chat-utils";
+import { localFetch } from "@/lib/api";
+
+// notify_rust on Linux calls block_on for D-Bus inside the tokio runtime,
+// which panics and kills the worker thread. Skip OS notifications on Linux.
+function sendNotification(options: { title: string; body: string }) {
+  if (platform() === "linux") return;
+  _sendNotification(options);
+}
 
 type NotificationRequested = {
   title: string;
@@ -153,7 +162,7 @@ const NotificationHandler: React.FC = () => {
               source: `notification-native`,
             });
           } else {
-            await fetch(`http://localhost:3030/pipes/${action.pipe}/run`, {
+            await localFetch(`/pipes/${action.pipe}/run`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ notification_context: action.context }),
@@ -163,7 +172,7 @@ const NotificationHandler: React.FC = () => {
         }
 
         if (action.type === "api" && action.url) {
-          await fetch(`http://localhost:3030${action.url}`, {
+          await localFetch(action.url, {
             method: action.method || "POST",
             headers: { "Content-Type": "application/json" },
             body: action.body ? JSON.stringify(action.body) : undefined,
@@ -171,8 +180,21 @@ const NotificationHandler: React.FC = () => {
           return;
         }
 
-        if (action.type === "deeplink" && action.url) {
-          if (action.url.startsWith("screenpipe://")) {
+        // URL-opening actions. Two explicit types so senders can't conflate
+        // them:
+        //   "link"      — external URL, opens in default browser
+        //   "deeplink"  — screenpipe:// in-app route
+        //
+        // Note: these are also handled in Rust inside `native_notif_action_callback`
+        // for the native macOS panel case (where this JS listener may not be
+        // alive). This JS branch remains for the webview notification panel.
+        // Routing is on URL scheme, not the declared type, so a mislabeled
+        // payload still works.
+        if ((action.type === "link" || action.type === "deeplink") && action.url) {
+          if (typeof action.url === "string" && action.url.startsWith("screenpipe://")) {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("show_window_activated", { window: "Main" });
+            await new Promise((r) => setTimeout(r, 150));
             const { emit } = await import("@tauri-apps/api/event");
             await emit("deep-link-received", action.url);
           } else {
@@ -182,12 +204,15 @@ const NotificationHandler: React.FC = () => {
           return;
         }
 
-        // Legacy string actions
+        // Legacy string actions. Use `show_window_activated` rather than
+        // `show_window` — notifications can be clicked from outside the app's
+        // active space, and the NonActivating panel style prevents NSApp
+        // activation otherwise.
         const { invoke } = await import("@tauri-apps/api/core");
         if (action.action === "open_timeline") {
-          await invoke("show_window", { window: "Main" });
+          await invoke("show_window_activated", { window: "Main" });
         } else if (action.action === "open_chat") {
-          await invoke("show_window", { window: "Chat" });
+          await invoke("show_window_activated", { window: "Chat" });
         } else if (action.action === "open_pipe_suggestions") {
           await showChatWithPrefill({
             context: PIPE_SUGGESTION_PROMPT,
@@ -204,7 +229,7 @@ const NotificationHandler: React.FC = () => {
             for (let i = 0; i < 15; i++) {
               await new Promise((r) => setTimeout(r, 1000));
               try {
-                const res = await fetch("http://localhost:3030/health");
+                const res = await localFetch("/health");
                 if (res.ok) break;
               } catch {}
             }

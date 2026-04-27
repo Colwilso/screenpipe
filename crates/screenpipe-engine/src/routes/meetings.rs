@@ -216,7 +216,9 @@ pub(crate) async fn meeting_status_handler(
         state.db.has_active_meeting().await.unwrap_or(false)
     };
 
-    Ok(JsonResponse(json!({ "active": any_active })))
+    Ok(JsonResponse(
+        json!({ "active": any_active, "manual": manual_active }),
+    ))
 }
 
 #[oasgen]
@@ -246,6 +248,14 @@ pub(crate) async fn start_meeting_handler(
         *lock = Some(id);
     }
 
+    // Emit event so triggered pipes can react
+    if let Err(e) = screenpipe_events::send_event(
+        "meeting_started",
+        serde_json::json!({ "meeting_id": id, "app": app, "title": body.title }),
+    ) {
+        tracing::warn!("failed to emit meeting_started event: {}", e);
+    }
+
     let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {
         (
             StatusCode::NOT_FOUND,
@@ -265,25 +275,54 @@ pub(crate) async fn stop_meeting_handler(
         *lock
     };
 
-    let id = id.ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            JsonResponse(json!({"error": "no active manual meeting"})),
-        )
-    })?;
+    // If no manual meeting, find any active meeting (auto-detected) and end it.
+    // This lets users stop auto-detected meetings (Google Meet, Zoom, etc.)
+    // from the overlay button.
+    let id = match id {
+        Some(id) => id,
+        None => {
+            let active_id = state
+                .db
+                .get_most_recent_active_meeting_id()
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        JsonResponse(json!({"error": e.to_string()})),
+                    )
+                })?;
+            active_id.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    JsonResponse(json!({"error": "no active meeting"})),
+                )
+            })?
+        }
+    };
 
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    state.db.end_meeting(id, &now).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            JsonResponse(json!({"error": e.to_string()})),
-        )
-    })?;
+    state
+        .db
+        .end_meeting_with_typed_text(id, &now, true)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?;
 
     {
         let mut lock = state.manual_meeting.write().await;
         *lock = None;
+    }
+
+    // Emit event so triggered pipes can react
+    if let Err(e) =
+        screenpipe_events::send_event("meeting_ended", serde_json::json!({ "meeting_id": id }))
+    {
+        tracing::warn!("failed to emit meeting_ended event: {}", e);
     }
 
     let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Global cache for video metadata (FPS, duration) to avoid repeated ffprobe calls.
@@ -27,28 +27,51 @@ use uuid::Uuid;
 static VIDEO_METADATA_CACHE: LazyLock<RwLock<HashMap<String, (f64, f64)>>> =
     LazyLock::new(|| RwLock::new(HashMap::with_capacity(100)));
 
-/// Get ffprobe path from ffmpeg path, handling Windows .exe extension
-/// Tries with .exe first on Windows, falls back to without
+/// Get ffprobe path from ffmpeg path, handling Windows .exe extension.
+/// Falls back to searching PATH via `which` if ffprobe isn't alongside ffmpeg.
 fn get_ffprobe_path(ffmpeg_path: &Path) -> PathBuf {
     #[cfg(windows)]
-    {
-        // Try with .exe first (standard Windows executable)
-        let with_exe = ffmpeg_path.with_file_name("ffprobe.exe");
-        if with_exe.exists() {
-            return with_exe;
-        }
-        // Fall back to without .exe (some Windows configs find it anyway)
-        let without_exe = ffmpeg_path.with_file_name("ffprobe");
-        if without_exe.exists() {
-            return without_exe;
-        }
-        // Default to .exe version even if not found (let the error happen later)
-        with_exe
-    }
+    let candidates = [
+        ffmpeg_path.with_file_name("ffprobe.exe"),
+        ffmpeg_path.with_file_name("ffprobe"),
+    ];
     #[cfg(not(windows))]
-    {
-        ffmpeg_path.with_file_name("ffprobe")
+    let candidates = [ffmpeg_path.with_file_name("ffprobe")];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return candidate.clone();
+        }
     }
+
+    // ffprobe not alongside ffmpeg — try PATH
+    #[cfg(unix)]
+    if let Ok(output) = std::process::Command::new("which").arg("ffprobe").output() {
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                return PathBuf::from(path_str);
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(output) = std::process::Command::new("where").arg("ffprobe").output() {
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Some(first_line) = path_str.lines().next() {
+                if !first_line.is_empty() {
+                    return PathBuf::from(first_line);
+                }
+            }
+        }
+    }
+
+    warn!(
+        "ffprobe not found alongside ffmpeg ({}) or in PATH — frame extraction from MP4 will fail",
+        ffmpeg_path.display()
+    );
+    // Return the default path so callers get a clear "not found" error
+    candidates[0].clone()
 }
 
 #[derive(Debug, Deserialize)]
@@ -730,15 +753,23 @@ pub async fn extract_frame_from_video(
             Err(e) => {
                 // Check if this is a corrupted video (moov atom missing, invalid data, etc)
                 let err_str = e.to_string().to_lowercase();
-                if err_str.contains("moov")
-                    || err_str.contains("invalid data")
-                    || err_str.contains("no such file")
-                {
+                if err_str.contains("moov") || err_str.contains("invalid data") {
                     return Err(anyhow::anyhow!(
                         "VIDEO_CORRUPTED: cannot read metadata from {} - {}",
                         file_path,
                         e
                     ));
+                }
+                // "no such file" from cmd.output() means ffprobe binary not found,
+                // not the video file (we already checked that above). Don't misreport
+                // as VIDEO_CORRUPTED — surface the real cause so it can be fixed.
+                if err_str.contains("no such file") || err_str.contains("os error 2") {
+                    return Err(anyhow::anyhow!(
+                    "FFPROBE_NOT_FOUND: cannot extract frame from {} - ffprobe binary not found. \
+                         Ensure ffprobe is installed alongside ffmpeg. Error: {}",
+                    file_path,
+                    e
+                ));
                 }
                 error!("failed to get video metadata, using defaults: {}", e);
                 (1.0, f64::MAX) // Use MAX duration to disable validation on error
@@ -844,7 +875,9 @@ pub async fn extract_frame_from_video(
 async fn cleanup_old_frames(frames_dir: &PathBuf) -> Result<()> {
     use std::time::{Duration, SystemTime};
 
-    let one_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    let one_hour_ago = SystemTime::now()
+        .checked_sub(Duration::from_secs(3600))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut read_dir = tokio::fs::read_dir(frames_dir).await?;
 
     while let Some(entry) = read_dir.next_entry().await? {

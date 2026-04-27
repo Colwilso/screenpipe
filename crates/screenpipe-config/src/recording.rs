@@ -70,6 +70,24 @@ pub struct RecordingSettings {
     #[serde(rename = "useSystemDefaultAudio")]
     pub use_system_default_audio: bool,
 
+    /// Experimental: capture System Audio via the CoreAudio Process Tap API
+    /// (macOS 14.4+) instead of ScreenCaptureKit. Avoids SCK's display
+    /// enumeration failures after sleep/wake, the GPU/compositor wake
+    /// overhead, and — most importantly — captures audio that's been
+    /// routed to a Bluetooth headset via HFP (which SCK can't see; see
+    /// Ruark Ferreira's 2026-04-24 Zoom call where AirPods-as-input
+    /// silently routed output away from the SCK-visible mixer).
+    ///
+    /// Default `true`: if tap creation fails for any reason (permission,
+    /// macOS <14.4, OS quirk), stream.rs falls back to the SCK path
+    /// automatically — so flipping the default on can't regress anyone.
+    /// Ignored on non-macOS platforms.
+    #[serde(
+        rename = "experimentalCoreaudioSystemAudio",
+        default = "default_experimental_coreaudio_system_audio"
+    )]
+    pub experimental_coreaudio_system_audio: bool,
+
     /// Duration of each audio chunk in seconds before transcription.
     /// Stored as i32 to match existing store.bin schema (cast to u64 by engine).
     #[serde(rename = "audioChunkDuration")]
@@ -117,6 +135,12 @@ pub struct RecordingSettings {
     #[serde(rename = "videoQuality")]
     pub video_quality: String,
 
+    /// Maximum width for stored snapshots. Images wider than this are downscaled
+    /// (preserving aspect ratio) before JPEG encoding. 0 = no limit (store at
+    /// native resolution). Default: 1920.
+    #[serde(rename = "maxSnapshotWidth", default = "default_max_snapshot_width")]
+    pub max_snapshot_width: u32,
+
     // ── Filters ────────────────────────────────────────────────────────
     /// Window titles to exclude from capture.
     #[serde(rename = "ignoredWindows")]
@@ -134,9 +158,23 @@ pub struct RecordingSettings {
     #[serde(rename = "ignoreIncognitoWindows")]
     pub ignore_incognito_windows: bool,
 
-    /// Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
-    #[serde(rename = "pauseOnDrmContent", default = "default_true")]
+    /// Experimental: pause screen capture when a DRM-protected streaming app
+    /// (Netflix, Disney+, etc.) or a remote-desktop client (Omnissa/VMware
+    /// Horizon) is focused. These apps blank their windows while screen
+    /// recording is active.
+    /// Off by default; engine-only pause (no full app shutdown).
+    #[serde(rename = "pauseOnDrmContent", default)]
     pub pause_on_drm_content: bool,
+
+    /// Continue recording audio when the screen is locked.
+    /// Default: false (audio pauses when screen is locked to save resources).
+    #[serde(rename = "recordWhileLocked", default)]
+    pub record_while_locked: bool,
+
+    /// Automatically append text typed during a meeting to the meeting's note
+    /// when the meeting ends. Groups typed text by app/window context.
+    #[serde(rename = "appendTypedTextToMeetingNotes", default = "default_true")]
+    pub append_typed_text_to_meeting_notes: bool,
 
     /// Languages for transcription (ISO 639-1 codes).
     pub languages: Vec<String>,
@@ -241,6 +279,23 @@ pub struct RecordingSettings {
     /// Per-day schedule rules (only used when schedule_enabled is true)
     #[serde(rename = "scheduleRules", default)]
     pub schedule_rules: Vec<ScheduleRule>,
+
+    /// Require authentication for remote (non-localhost) API access.
+    #[serde(rename = "apiAuth", default = "default_true")]
+    pub api_auth: bool,
+
+    /// Custom API key for remote authentication. If empty, a key is auto-generated.
+    #[serde(rename = "apiKey", default)]
+    pub api_key: String,
+
+    /// When true, the HTTP server binds to `0.0.0.0` so other devices on the
+    /// LAN can reach the screenpipe API. Off by default — the server binds
+    /// `127.0.0.1` (localhost only) which is the safe choice.
+    ///
+    /// `api_auth` is force-enabled whenever this is true; [`RecordingConfig::from_settings`]
+    /// overrides it, so a user can't accidentally expose the API unauthenticated on their network.
+    #[serde(rename = "listenOnLan", default)]
+    pub listen_on_lan: bool,
 }
 
 impl RecordingSettings {
@@ -270,14 +325,12 @@ impl Default for RecordingSettings {
     fn default() -> Self {
         Self {
             disable_audio: false,
-            audio_transcription_engine: if cfg!(target_os = "macos") {
-                "whisper-large-v3-turbo-quantized".to_string()
-            } else {
-                "parakeet".to_string()
-            },
+            audio_transcription_engine: crate::best_engine_for_platform(crate::detect_tier())
+                .to_string(),
             transcription_mode: "batch".to_string(),
             audio_devices: vec![],
             use_system_default_audio: true,
+            experimental_coreaudio_system_audio: false,
             audio_chunk_duration: 30,
             deepgram_api_key: String::new(),
             vad_sensitivity: "high".to_string(),
@@ -288,11 +341,14 @@ impl Default for RecordingSettings {
             monitor_ids: vec![],
             use_all_monitors: true,
             video_quality: "balanced".to_string(),
+            max_snapshot_width: default_max_snapshot_width(),
             ignored_windows: vec![],
             included_windows: vec![],
             ignored_urls: vec![],
             ignore_incognito_windows: true,
-            pause_on_drm_content: true,
+            pause_on_drm_content: false,
+            record_while_locked: false,
+            append_typed_text_to_meeting_notes: true,
             languages: vec![],
             use_pii_removal: false,
             user_id: String::new(),
@@ -315,12 +371,30 @@ impl Default for RecordingSettings {
             device_tier: None,
             schedule_enabled: false,
             schedule_rules: vec![],
+            api_auth: true,
+            api_key: String::new(),
+            listen_on_lan: false,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Default `false` — the Process Tap can't see audio rendered through
+/// VoiceProcessing AudioUnits (Zoom / Google Meet / Microsoft Teams all
+/// use one for echo cancellation), so for meeting audio it silently
+/// captures zeroed buffers even though the tap creation succeeds. SCK
+/// captures at the display compositor which *does* see VoiceProcessing
+/// output, so it's the right default for every user who uses call apps.
+/// Users who hit SCK's sleep/wake display-enumeration bug can still opt in.
+fn default_experimental_coreaudio_system_audio() -> bool {
+    false
+}
+
+fn default_max_snapshot_width() -> u32 {
+    1920
 }
 
 #[cfg(test)]

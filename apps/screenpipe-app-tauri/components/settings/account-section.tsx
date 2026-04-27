@@ -22,6 +22,7 @@ import { Card } from "../ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { localFetch } from "@/lib/api";
 import { listen } from "@tauri-apps/api/event";
 import { PricingToggle } from "./pricing-toggle";
 import { ReferralCard } from "./referral-card";
@@ -188,7 +189,7 @@ export function AccountSection() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => openUrl("https://screenpi.pe/user-dashboard")}
+                onClick={() => openUrl("https://screenpi.pe/account")}
               >
                 <UserCog className="w-4 h-4 mr-1.5" />
                 manage
@@ -197,7 +198,7 @@ export function AccountSection() {
                 variant="outline"
                 size="sm"
                 onClick={async () => {
-                  updateSettings({ user: undefined });
+                  updateSettings({ user: null as any });
                   // Restart Pi with null token so it stops using the old
                   // account's quota. Next message will auto-start as anonymous.
                   try {
@@ -296,8 +297,8 @@ export function AccountSection() {
                     onClick={async () => {
                       setPipeSyncing(true);
                       try {
-                        await fetch("http://localhost:3030/sync/pipes/pull", { method: "POST" });
-                        await fetch("http://localhost:3030/sync/pipes/push", { method: "POST" });
+                        await localFetch("/sync/pipes/pull", { method: "POST" });
+                        await localFetch("/sync/pipes/push", { method: "POST" });
                         toast({ title: "pipes synced" });
                       } catch (e: any) {
                         toast({ title: "sync failed", description: e.message, variant: "destructive" });

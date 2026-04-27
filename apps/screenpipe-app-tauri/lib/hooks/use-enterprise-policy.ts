@@ -6,16 +6,33 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useIsEnterpriseBuild } from "./use-is-enterprise-build";
 import { commands } from "@/lib/utils/tauri";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { getStore } from "./use-settings";
+import { getVersion } from "@tauri-apps/api/app";
+import { localFetch } from "@/lib/api";
+import { platform as getPlatform } from "@tauri-apps/plugin-os";
+
+import { syncManagedPipes, gatherPipeStatuses, type ManagedPipe } from "./use-enterprise-pipes";
+
+interface ManagedAiPreset {
+  provider: string;
+  url: string;
+  model: string;
+  api_key: string;
+}
 
 interface EnterprisePolicy {
   hiddenSections: string[];
   lockedSettings: Record<string, unknown>;
+  managedAiPreset: ManagedAiPreset | null;
+  managedPipes: ManagedPipe[];
   orgName: string;
 }
 
 const EMPTY_POLICY: EnterprisePolicy = {
   hiddenSections: [],
   lockedSettings: {},
+  managedAiPreset: null,
+  managedPipes: [],
   orgName: "",
 };
 
@@ -26,6 +43,57 @@ const ENTERPRISE_DEFAULT_HIDDEN = ["account", "referral"];
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
 
 const CACHE_KEY = "enterprise-policy-cache";
+
+/**
+ * Fire-and-forget heartbeat to report device status to the enterprise API.
+ * Called after a successful policy fetch. Never throws, never blocks.
+ */
+async function sendHeartbeat(licenseKey: string): Promise<void> {
+  try {
+    const store = await getStore();
+    const settings = (await store.get<Record<string, unknown>>("settings")) || {};
+    const deviceId = (settings.deviceId as string) || "unknown";
+    const appVersion = await getVersion().catch(() => "unknown");
+    const devicePlatform = getPlatform();
+
+    let frameStatus = "unknown";
+    let audioStatus = "unknown";
+    let hostname = "unknown";
+    try {
+      const healthRes = await localFetch("/health", {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (healthRes.ok) {
+        const health = await healthRes.json();
+        frameStatus = health.frame_status || "unknown";
+        audioStatus = health.audio_status || "unknown";
+        hostname = health.hostname || "unknown";
+      }
+    } catch {}
+
+    // Gather enterprise pipe statuses for heartbeat
+    let pipeStatuses: unknown[] = [];
+    try {
+      pipeStatuses = await gatherPipeStatuses();
+    } catch {}
+
+    await tauriFetch("https://screenpi.pe/api/enterprise/heartbeat", {
+      method: "POST",
+      headers: {
+        "X-License-Key": licenseKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        device_id: deviceId,
+        hostname,
+        platform: devicePlatform,
+        app_version: appVersion,
+        recording_status: { frame_status: frameStatus, audio_status: audioStatus },
+        pipe_statuses: pipeStatuses,
+      }),
+    });
+  } catch {}
+}
 
 function cachePolicy(policy: EnterprisePolicy) {
   try {
@@ -70,9 +138,17 @@ export function useEnterprisePolicy() {
 
   const fetchPolicy = useCallback(async (licenseKey: string): Promise<FetchResult> => {
     try {
+      // Include device ID for pipe targeting
+      let deviceId = "unknown";
+      try {
+        const store = await getStore();
+        const settings = (await store.get<Record<string, unknown>>("settings")) || {};
+        deviceId = (settings.deviceId as string) || "unknown";
+      } catch {}
+
       const res = await tauriFetch("https://screenpi.pe/api/enterprise/policy", {
         method: "GET",
-        headers: { "X-License-Key": licenseKey },
+        headers: { "X-License-Key": licenseKey, "X-Device-Id": deviceId },
       });
       if (res.status === 401 || res.status === 402) {
         console.error(`[enterprise] policy fetch: key rejected (${res.status})`);
@@ -92,12 +168,74 @@ export function useEnterprisePolicy() {
       const result: EnterprisePolicy = {
         hiddenSections: [...new Set(allHidden)],
         lockedSettings: data.lockedSettings || {},
+        managedAiPreset: data.managedAiPreset || null,
+        managedPipes: data.managedPipes || [],
         orgName: data.orgName || "",
       };
       console.log(
         `[enterprise] policy loaded: org=${result.orgName}, hidden=[${result.hiddenSections.join(",")}], locked=[${lockedKeys.join(",")}]`
       );
       cachePolicy(result);
+
+      // Fire-and-forget heartbeat
+      sendHeartbeat(licenseKey);
+
+      // Apply managed AI preset to settings store if configured
+      if (result.managedAiPreset) {
+        try {
+          const store = await getStore();
+          const settings = (await store.get<Record<string, unknown>>("settings")) || {};
+          const presets = (settings.aiPresets as any[]) || [];
+          const managedId = "enterprise-managed";
+          const mp = result.managedAiPreset;
+
+          // Map provider string to AIProviderType
+          const providerMap: Record<string, string> = {
+            openai: "openai",
+            anthropic: "anthropic",
+            "native-ollama": "native-ollama",
+            custom: "custom",
+          };
+
+          const managedPreset = {
+            id: managedId,
+            prompt: "",
+            provider: providerMap[mp.provider] || "openai",
+            url: mp.url || "",
+            model: mp.model || "",
+            defaultPreset: true,
+            apiKey: mp.api_key || undefined,
+            maxContextChars: 512000,
+            maxTokens: 4096,
+          };
+
+          // Replace existing managed preset or prepend
+          const filtered = presets.filter((p: any) => p.id !== managedId);
+          // Unset defaultPreset on all others
+          const updated = filtered.map((p: any) => ({ ...p, defaultPreset: false }));
+          const newPresets = [managedPreset, ...updated];
+
+          await store.set("settings", { ...settings, aiPresets: newPresets });
+          await store.save();
+          console.log(`[enterprise] applied managed AI preset: ${mp.provider}/${mp.model}`);
+        } catch (e) {
+          console.warn("[enterprise] failed to apply managed AI preset:", e);
+        }
+      }
+
+      // Sync managed pipes to local filesystem
+      if (result.managedPipes.length > 0) {
+        syncManagedPipes(result.managedPipes).catch((e) =>
+          console.warn("[enterprise] failed to sync managed pipes:", e)
+        );
+      }
+
+      // Push hidden sections to Rust so tray menu can use them
+      try {
+        await commands.setEnterprisePolicy(result.hiddenSections);
+      } catch (e) {
+        console.warn("[enterprise] failed to push policy to Rust:", e);
+      }
       return { ok: true, policy: result };
     } catch (e) {
       console.error("[enterprise] policy fetch error:", e);
@@ -222,17 +360,32 @@ export function useEnterprisePolicy() {
     };
   }, [isEnterprise, initWithKey, stopPolling]);
 
-  // Consumer builds: stable no-op function (no re-renders)
+  // Consumer builds: stable no-op functions (no network calls, no re-renders)
   const noop = useCallback(() => false, []);
-  const check = useCallback(
+  const noopGet = useCallback((): undefined => undefined, []);
+
+  const checkHidden = useCallback(
     (sectionId: string) => policy.hiddenSections.includes(sectionId),
     [policy.hiddenSections]
+  );
+  const checkLocked = useCallback(
+    (settingKey: string) => settingKey in policy.lockedSettings,
+    [policy.lockedSettings]
+  );
+  const getManagedValue = useCallback(
+    (settingKey: string): string | undefined => {
+      const val = policy.lockedSettings[settingKey];
+      return typeof val === "string" ? val : undefined;
+    },
+    [policy.lockedSettings]
   );
 
   return {
     policy: isEnterprise ? policy : EMPTY_POLICY,
     isEnterprise,
-    isSectionHidden: isEnterprise ? check : noop,
+    isSectionHidden: isEnterprise ? checkHidden : noop,
+    isSettingLocked: isEnterprise ? checkLocked : noop,
+    getManagedValue: isEnterprise ? getManagedValue : noopGet,
     needsLicenseKey: isEnterprise ? needsLicenseKey : false,
     submitLicenseKey,
   };

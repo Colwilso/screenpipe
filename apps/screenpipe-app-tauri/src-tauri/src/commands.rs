@@ -11,14 +11,43 @@ use crate::{
 use tauri::{Emitter, Manager};
 use tracing::{debug, error, info, warn};
 
-use std::sync::OnceLock;
+/// Log a `WebviewWindowBuilder::build()` failure with structured context.
+///
+/// Why: Sentry events for webview build failures currently say only
+/// "failed to create webview: WebView2 error: …". Without knowing which
+/// window was being built (pipe-store, login, notifications, etc.) we
+/// can't triage.
+///
+/// Tracing's `sentry` layer (see `main.rs`) maps structured fields to
+/// Sentry tags, so `webview_label` and `webview_url` become filterable
+/// tags in the Sentry dashboard.
+///
+/// Call at every `WebviewWindowBuilder::build()` error site instead of
+/// a bare `error!(...)`. Return the error unchanged — this function is
+/// purely observability.
+fn log_webview_build_failure(
+    label: &str,
+    url_hint: &str,
+    err: &(impl std::fmt::Display + ?Sized),
+) {
+    tracing::error!(
+        webview_label = label,
+        webview_url = url_hint,
+        "failed to create webview (label={}, url={}): {}",
+        label,
+        url_hint,
+        err
+    );
+}
 
 /// Global app handle stored so the native notification action callback can emit events.
-static GLOBAL_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static GLOBAL_APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 
 /// Callback invoked from Swift when user clicks a notification action.
 /// Handles "manage" directly in Rust (opens home window to notifications settings).
 /// Other actions are forwarded as Tauri events to JS.
+#[cfg(target_os = "macos")]
 extern "C" fn native_notif_action_callback(json_ptr: *const std::os::raw::c_char) {
     if json_ptr.is_null() {
         return;
@@ -28,35 +57,96 @@ extern "C" fn native_notif_action_callback(json_ptr: *const std::os::raw::c_char
         .to_string();
     info!("native notification action: {}", json);
 
-    if let Some(app) = GLOBAL_APP_HANDLE.get() {
-        // Handle "manage" directly in Rust — opens the Home window to notifications section.
-        // This avoids relying on JS event listeners which may not be active.
-        if json.contains("\"type\":\"manage\"") {
-            let app_clone = app.clone();
-            // Spawn a thread so we don't block the Swift main thread
-            std::thread::spawn(move || {
-                // Show the home window (needs main thread on macOS)
+    let Some(app) = GLOBAL_APP_HANDLE.get() else {
+        return;
+    };
+
+    // Parse once so downstream branches can dispatch on structured fields
+    // instead of doing fragile substring matches on the JSON string.
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&json).ok();
+    let action_type = parsed
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str());
+
+    // "manage" — open the Home window to notifications settings. Handled in
+    // Rust rather than via JS emit so it works even when no React window is
+    // currently mounted.
+    if action_type == Some("manage") {
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            let app_for_show = app_clone.clone();
+            let _ = app_clone.run_on_main_thread(move || {
+                if let Err(e) = (ShowRewindWindow::Home { page: None }).show(&app_for_show) {
+                    error!("failed to show home window for manage: {}", e);
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = app_clone.emit(
+                "navigate",
+                serde_json::json!({ "url": "/home?section=notifications" }),
+            );
+        });
+        return;
+    }
+
+    // URL-opening actions. Two distinct semantics, explicit types so senders
+    // can't conflate them:
+    //   "link"      → external URL, opened in the user's default browser
+    //   "deeplink"  → screenpipe:// in-app route, dispatched to DeeplinkHandler
+    //
+    // Both are handled in Rust rather than via JS emit so clicks work even
+    // when the overlay window (which hosts the JS listener in
+    // `components/notification-handler.tsx`) isn't mounted. Previous
+    // implementation relied on that listener and silently did nothing when
+    // overlay wasn't running — which is the common case for a native
+    // notification shown over the desktop.
+    if action_type == Some("link") || action_type == Some("deeplink") {
+        let url = parsed
+            .as_ref()
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let Some(url) = url else {
+            warn!("{} notification action has no url: {}", action_type.unwrap(), json);
+            return;
+        };
+
+        // Guard against senders putting a browser URL into "deeplink" or a
+        // screenpipe:// URL into "link". We route on actual scheme, not on
+        // the declared type, so a typo doesn't break the click.
+        let is_in_app = url.starts_with("screenpipe://");
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            if is_in_app {
+                // Show Main first so DeeplinkHandler is mounted, then emit.
                 let app_for_show = app_clone.clone();
                 let _ = app_clone.run_on_main_thread(move || {
-                    if let Err(e) = (ShowRewindWindow::Home { page: None }).show(&app_for_show) {
-                        error!("failed to show home window for manage: {}", e);
+                    if let Err(e) = ShowRewindWindow::Main.show(&app_for_show) {
+                        error!("failed to show Main window for deeplink: {}", e);
                     }
                 });
-                // Give the window time to mount its React listener
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = app_clone.emit(
-                    "navigate",
-                    serde_json::json!({ "url": "/home?section=notifications" }),
-                );
-            });
-            return;
-        }
-
-        let _ = app.emit("native-notification-action", &json);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = app_clone.emit("deep-link-received", url);
+            } else {
+                // External URL — hand off to the opener plugin.
+                use tauri_plugin_opener::OpenerExt;
+                if let Err(e) = app_clone.opener().open_url(&url, None::<&str>) {
+                    error!("failed to open url '{}' from notification: {}", url, e);
+                }
+            }
+        });
+        return;
     }
+
+    // Everything else (pipe, api, mute, dismiss, auto_dismiss, legacy string
+    // actions) still goes to the JS handler. The overlay window owns those
+    // because they need access to posthog / localforage / chat prefill.
+    let _ = app.emit("native-notification-action", &json);
 }
 
 /// Callback invoked from Swift when user clicks a shortcut reminder action.
+#[cfg(target_os = "macos")]
 extern "C" fn native_shortcut_action_callback(action_ptr: *const std::os::raw::c_char) {
     if action_ptr.is_null() {
         return;
@@ -92,6 +182,38 @@ extern "C" fn native_shortcut_action_callback(action_ptr: *const std::os::raw::c
                     native_shortcut_reminder::hide();
                 }
                 "toggle_meeting" => {
+                    // Directly call the meetings API instead of relying on JS
+                    // (the Main window may not be loaded when using the Swift overlay)
+                    use crate::recording::local_api_context_from_app;
+                    let api = local_api_context_from_app(&app_clone);
+                    let client = reqwest::blocking::Client::new();
+                    let status_req =
+                        api.apply_auth_blocking(client.get(api.url("/meetings/status")));
+                    let status: Option<bool> = status_req
+                        .send()
+                        .ok()
+                        .and_then(|r| r.json::<serde_json::Value>().ok())
+                        .and_then(|v| v["active"].as_bool());
+                    match status {
+                        Some(true) => {
+                            let req =
+                                api.apply_auth_blocking(client.post(api.url("/meetings/stop")));
+                            let _ = req.send();
+                        }
+                        Some(false) => {
+                            let req = api.apply_auth_blocking(
+                                client
+                                    .post(api.url("/meetings/start"))
+                                    .header("Content-Type", "application/json")
+                                    .body(r#"{"app":"manual"}"#),
+                            );
+                            let _ = req.send();
+                        }
+                        None => {
+                            warn!("failed to check meeting status");
+                        }
+                    }
+                    // Also emit to JS so the home page UI updates immediately if open
                     let _ = app_clone.emit("native-shortcut-toggle-meeting", "");
                 }
                 _ => {}
@@ -104,6 +226,49 @@ extern "C" fn native_shortcut_action_callback(action_ptr: *const std::os::raw::c
 #[specta::specta]
 pub fn is_enterprise_build_cmd(app_handle: tauri::AppHandle) -> bool {
     is_enterprise_build(&app_handle)
+}
+
+/// Get the local API auth key and port for the frontend to use.
+/// Returns the local API config (key, port, auth flag).
+///
+/// IMPORTANT: This is `async` so it runs on the tokio thread pool, NOT the
+/// main thread. The webview calls this via IPC during early init — if it ran
+/// on the main thread it would deadlock with tray/window setup that also
+/// needs the main thread, causing a 5-second blank screen.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_local_api_config(app_handle: tauri::AppHandle) -> serde_json::Value {
+    use crate::recording::RecordingState;
+    if let Some(state) = app_handle.try_state::<RecordingState>() {
+        // Must await the lock: `try_lock` often failed while server_core held the mutex
+        // during startup, returning key:null to the webview. JS then cached "no API key" and
+        // opened WebSockets without ?token= → endless 403 / abnormal close (1006).
+        let guard = state.server.lock().await;
+        if let Some(ref core) = *guard {
+            return serde_json::json!({
+                "key": core.local_api_key,
+                "port": core.port,
+                "auth_enabled": core.local_api_key.is_some(),
+            });
+        }
+    }
+    serde_json::json!({
+        "key": null,
+        "port": 3030,
+        "auth_enabled": false,
+    })
+}
+
+/// Wipe the persisted API auth key and write a fresh `sp-<uuid8>` to the
+/// secret store. Returns the new key. The running server keeps its old key
+/// in memory until restart — the UI should prompt the user to apply & restart.
+#[tauri::command]
+#[specta::specta]
+pub async fn regenerate_api_auth_key() -> Result<String, String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    screenpipe_engine::auth_key::regenerate_api_auth_key(&data_dir)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Read the enterprise license key from `enterprise.json`.
@@ -122,7 +287,10 @@ pub fn get_enterprise_license_key() -> Option<String> {
     // Fallback: ~/.screenpipe/enterprise.json (manually entered by employee)
     let user_path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
     if user_path.exists() {
-        info!("enterprise: checking user config at {}", user_path.display());
+        info!(
+            "enterprise: checking user config at {}",
+            user_path.display()
+        );
         return read_enterprise_key_from_path(&user_path);
     }
 
@@ -150,7 +318,10 @@ fn read_enterprise_key_from_exe_dir() -> Option<String> {
     };
 
     if !config_path.exists() {
-        info!("enterprise: no enterprise.json at {}", config_path.display());
+        info!(
+            "enterprise: no enterprise.json at {}",
+            config_path.display()
+        );
         return None;
     }
 
@@ -180,7 +351,10 @@ fn read_enterprise_key_from_path(path: &std::path::Path) -> Option<String> {
         .map(|s| s.to_string());
 
     match &key {
-        Some(k) => info!("enterprise: license key loaded ({}...)", &k[..k.len().min(8)]),
+        Some(k) => info!(
+            "enterprise: license key loaded ({}...)",
+            &k[..k.len().min(8)]
+        ),
         None => warn!("enterprise: enterprise.json missing 'license_key' field"),
     }
 
@@ -278,6 +452,7 @@ pub fn set_tray_health_icon(app_handle: tauri::AppHandle) {
 #[specta::specta]
 pub fn show_main_window(app_handle: &tauri::AppHandle, _overlay: bool) {
     info!("show_main_window called");
+    set_main_close_in_progress(false);
     let window_to_show = ShowRewindWindow::Main;
 
     match window_to_show.show(app_handle) {
@@ -299,10 +474,13 @@ pub fn show_main_window(app_handle: &tauri::AppHandle, _overlay: bool) {
             // already "focused" or never lost focus) wouldn't trigger a re-fetch.
             let _ = app_handle.emit("window-focused", true);
 
-            // NOTE: Window shortcuts (Escape) are registered by the focus-gain
-            // handler in window/show.rs. Do NOT also register them here — doing
-            // so races with the focus handler and causes duplicate
-            // RegisterEventHotKey calls that fail on macOS.
+            // NOTE: On macOS, Escape is registered only from the focus-gain handler
+            // in window/show.rs (duplicate RegisterEventHotKey fails there).
+            // On Windows/Linux, set_focus can succeed without delivering a new
+            // Focused(true) event when Home already had focus — then Escape never
+            // re-registers until another focus cycle. Sync once after show.
+            #[cfg(not(target_os = "macos"))]
+            register_window_shortcuts_if_main_visible(app_handle.clone());
         }
         Err(e) => {
             error!("ShowRewindWindow::Main.show failed: {}", e);
@@ -476,12 +654,13 @@ pub async fn open_pipe_window(
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
+    let url = format!("http://localhost:{}", port);
     let window = match tauri::WebviewWindowBuilder::new(
         &app_handle,
         &title,
-        tauri::WebviewUrl::External(format!("http://localhost:{}", port).parse().unwrap()),
+        tauri::WebviewUrl::External(url.parse().unwrap()),
     )
-    .title(title)
+    .title(title.clone())
     .inner_size(1200.0, 850.0)
     .min_inner_size(600.0, 400.0)
     .focused(true)
@@ -491,7 +670,7 @@ pub async fn open_pipe_window(
     {
         Ok(window) => window,
         Err(e) => {
-            error!("failed to create window: {}", e);
+            log_webview_build_failure(&title, &url, &e);
             return Err(format!("failed to create window: {}", e));
         }
     };
@@ -597,10 +776,11 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
 
         let app_for_nav = app_handle.clone();
 
+        const LOGIN_URL: &str = "https://screenpi.pe/login";
         WebviewWindowBuilder::new(
             &app_handle,
             label,
-            WebviewUrl::External("https://screenpi.pe/login".parse().unwrap()),
+            WebviewUrl::External(LOGIN_URL.parse().unwrap()),
         )
         .title("sign in to screenpipe")
         .inner_size(460.0, 700.0)
@@ -621,7 +801,10 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
         })
         .build()
         .map(crate::window::finalize_webview_window)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            log_webview_build_failure(label, LOGIN_URL, &e);
+            e.to_string()
+        })?;
 
         Ok(())
     }
@@ -650,10 +833,13 @@ pub async fn open_google_calendar_auth_window(
 
     let app_for_nav = app_handle.clone();
 
+    let parsed_url = auth_url
+        .parse()
+        .map_err(|e| format!("invalid url: {e}"))?;
     WebviewWindowBuilder::new(
         &app_handle,
         label,
-        WebviewUrl::External(auth_url.parse().map_err(|e| format!("invalid url: {e}"))?),
+        WebviewUrl::External(parsed_url),
     )
     .title("connect google calendar")
     .inner_size(500.0, 700.0)
@@ -672,7 +858,10 @@ pub async fn open_google_calendar_auth_window(
     })
     .build()
     .map(crate::window::finalize_webview_window)
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        log_webview_build_failure(label, &auth_url, &e);
+        e.to_string()
+    })?;
 
     Ok(())
 }
@@ -707,19 +896,56 @@ pub async fn show_window(
     Ok(())
 }
 
+/// Like `show_window` but forces macOS app activation first, so the target
+/// window actually comes to the foreground when the caller is a
+/// `NSNonactivatingPanelMask` panel (notifications, tray, etc.).
+///
+/// Without this, clicking "Open" in the notification panel on macOS often
+/// appears to do nothing: the non-activating panel style prevents the app
+/// from becoming active, and overlay/fullscreen main modes rely on an
+/// activate-aware `show_panel_visible(activate_app=true)` path that only
+/// fires for `overlay_mode == "window"`. The window technically shows but
+/// stays behind whatever app the user was in.
+///
+/// Callers that represent explicit user intent (clicking Open on a
+/// notification) should use this variant. Passive show-surface callers
+/// should keep using `show_window` to avoid stealing focus unnecessarily.
+#[tauri::command]
+#[specta::specta]
+pub async fn show_window_activated(
+    app_handle: tauri::AppHandle,
+    window: ShowRewindWindow,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        app_handle
+            .run_on_main_thread(|| {
+                use objc::{msg_send, sel, sel_impl};
+                use tauri_nspanel::cocoa::base::id;
+                unsafe {
+                    let ns_app: id =
+                        msg_send![objc::class!(NSApplication), sharedApplication];
+                    let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+                }
+            })
+            .map_err(|e| format!("failed to activate app: {}", e))?;
+    }
+    show_window(app_handle, window).await
+}
+
 /// Re-assert the WKWebView as first responder for the current key panel.
 /// Called from JS on pointer enter / window focus to ensure trackpad pinch
 /// gestures (magnifyWithEvent:) reach the WKWebView for zoom handling.
 #[tauri::command]
 #[specta::specta]
-pub async fn ensure_webview_focus(app_handle: tauri::AppHandle) -> Result<(), String> {
+pub async fn ensure_webview_focus(_app_handle: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         use crate::window::run_on_main_thread_safe;
         use tauri_nspanel::ManagerExt;
 
-        let app = app_handle.clone();
-        run_on_main_thread_safe(&app_handle, move || {
+        let app = _app_handle.clone();
+        run_on_main_thread_safe(&_app_handle, move || {
             for label in &["main", "main-window"] {
                 if let Ok(panel) = app.get_webview_panel(label) {
                     unsafe {
@@ -851,10 +1077,22 @@ pub async fn close_window(
     // If closing the main window, also unregister window-specific shortcuts
     // (Escape, search shortcut) so they don't interfere with other apps
     if matches!(window, ShowRewindWindow::Main) {
+        set_main_close_in_progress(true);
+        info!("shortcut-sync: scheduling unregister (reason=close_window_main)");
+        let expected_gen =
+            WINDOW_SHORTCUTS_GEN.load(std::sync::atomic::Ordering::SeqCst);
         let app_clone = app_handle.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            let _ = unregister_window_shortcuts(app_clone);
+            info!("shortcut-sync: unregister execute (reason=close_window_main)");
+            let _ = unregister_window_shortcuts_if_generation_unchanged(
+                app_clone,
+                expected_gen,
+                "close_window_main",
+            );
+            // Allow register_if_visible on Home focus again; stale blur debounce paths
+            // still skip extra unregister while this was true (see show.rs guards).
+            set_main_close_in_progress(false);
         });
     }
 
@@ -931,7 +1169,7 @@ pub async fn complete_onboarding(app_handle: tauri::AppHandle) -> Result<(), Str
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     close_window(app_handle.clone(), ShowRewindWindow::Onboarding).await?;
-    show_window(app_handle.clone(), ShowRewindWindow::Main).await?;
+    show_window(app_handle.clone(), ShowRewindWindow::Home { page: None }).await?;
 
     Ok(())
 }
@@ -972,6 +1210,88 @@ pub async fn show_onboarding_window(app_handle: tauri::AppHandle) -> Result<(), 
         .show(&app_handle)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// Keychain / secure storage commands
+
+#[derive(serde::Serialize, specta::Type)]
+pub struct KeychainStatus {
+    pub state: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_keychain_status() -> Result<KeychainStatus, String> {
+    // Check if encryption is enabled WITHOUT accessing keychain.
+    // We only touch keychain when the user explicitly opts in via enable_keychain_encryption().
+    // This prevents prompts during onboarding permission checks.
+    let is_enabled = crate::secrets::is_encryption_enabled();
+
+    let state = if !is_enabled {
+        // Encryption not enabled in settings — definitely disabled
+        "disabled"
+    } else {
+        // Encryption is enabled, but only check keychain key if we actually need it
+        // (e.g., when loading secrets). Don't touch keychain just to report status.
+        match crate::secrets::get_key() {
+            crate::secrets::KeyResult::Found(_) => "enabled",
+            crate::secrets::KeyResult::NotFound => "disabled",
+            crate::secrets::KeyResult::AccessDenied => "disabled",
+            crate::secrets::KeyResult::Unavailable => "unavailable",
+        }
+    };
+
+    Ok(KeychainStatus {
+        state: state.to_string(),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
+    let key = crate::secrets::get_or_create_key().ok_or_else(|| {
+        "Keychain access denied or unavailable. Credentials will remain unencrypted.".to_string()
+    })?;
+
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    if let Err(e) = screenpipe_secrets::mark_encryption_enabled(&data_dir) {
+        tracing::warn!("failed to write .encrypt-store flag: {}", e);
+    }
+
+    let db_path = data_dir.join("db.sqlite");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    if let Ok(pool) = sqlx::SqlitePool::connect(&db_url).await {
+        if let Ok(store) = screenpipe_secrets::SecretStore::new(pool, Some(key)).await {
+            match store.reencrypt_unencrypted_secrets(&key).await {
+                Ok(count) if count > 0 => {
+                    tracing::info!("re-encrypted {} secrets after keychain opt-in", count);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to re-encrypt secrets: {}", e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(KeychainStatus {
+        state: "enabled".to_string(),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn disable_keychain_encryption() -> Result<KeychainStatus, String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    screenpipe_secrets::mark_encryption_disabled(&data_dir)
+        .map_err(|e| format!("failed to remove .encrypt-store flag: {e}"))?;
+    if let Err(e) = crate::secrets::delete_key() {
+        tracing::warn!("failed to delete keychain key on opt-out: {}", e);
+    }
+    Ok(KeychainStatus {
+        state: "disabled".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -1023,7 +1343,76 @@ pub async fn show_shortcut_reminder(
 
         if native_shortcut_reminder::is_available() {
             info!("Using native SwiftUI shortcut reminder");
-            if native_shortcut_reminder::show(Some(&shortcut)) {
+            use crate::recording::RecordingState;
+            use std::time::Duration;
+
+            // Startup runs before the engine binds :3030. Without waiting, Swift gets no
+            // `metrics_ws_url` and retries /ws/metrics without ?token= when API auth is on.
+            // Wait for server **core** (not only API key): when auth is disabled, key may stay
+            // None and we must not spin until the 90s timeout.
+            {
+                const MAX_WAIT: Duration = Duration::from_secs(90);
+                const STEP: Duration = Duration::from_millis(250);
+                let mut waited = Duration::ZERO;
+                loop {
+                    let ready = if let Some(state) = app_handle.try_state::<RecordingState>() {
+                        let guard = state.server.lock().await;
+                        guard.is_some()
+                    } else {
+                        false
+                    };
+                    if ready {
+                        break;
+                    }
+                    if waited >= MAX_WAIT {
+                        warn!(
+                            "native shortcut reminder: server core not ready after {:?} — pass authenticated metrics URLs to Swift after overlay is reopened",
+                            MAX_WAIT
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(STEP).await;
+                    waited += STEP;
+                }
+            }
+
+            let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+            match serde_json::from_str::<serde_json::Value>(&shortcut) {
+                Ok(serde_json::Value::Object(o)) => {
+                    for (k, v) in o {
+                        map.insert(k, v);
+                    }
+                }
+                _ => {
+                    map.insert(
+                        "overlay".to_string(),
+                        serde_json::Value::String(shortcut.clone()),
+                    );
+                }
+            }
+            if let Some(state) = app_handle.try_state::<RecordingState>() {
+                let guard = state.server.lock().await;
+                if let Some(ref core) = *guard {
+                    let mut metrics_ws_url = format!("ws://127.0.0.1:{}/ws/metrics", core.port);
+                    let mut meetings_status_url =
+                        format!("http://127.0.0.1:{}/meetings/status", core.port);
+                    if let Some(ref key) = core.local_api_key {
+                        let enc = urlencoding::encode(key);
+                        metrics_ws_url = format!("{}?token={}", metrics_ws_url, enc);
+                        meetings_status_url = format!("{}?token={}", meetings_status_url, enc);
+                    }
+                    map.insert(
+                        "metrics_ws_url".to_string(),
+                        serde_json::json!(metrics_ws_url),
+                    );
+                    map.insert(
+                        "meetings_status_url".to_string(),
+                        serde_json::json!(meetings_status_url),
+                    );
+                }
+            }
+            let native_payload = serde_json::Value::Object(map).to_string();
+            if native_shortcut_reminder::show(Some(&native_payload)) {
                 return Ok(());
             }
             warn!("Native shortcut reminder failed, falling back to webview");
@@ -1031,9 +1420,19 @@ pub async fn show_shortcut_reminder(
     }
 
     // Window dimensions: 2-row grid (3 shortcuts + activity viz)
-    // 3 columns: timeline, chat, search. Auto-sized columns shrink to content.
-    let window_width = 160.0;
-    let window_height = 40.0;
+    // Scale based on overlay size setting
+    let scale = match crate::store::SettingsStore::get(&app_handle)
+        .unwrap_or_default()
+        .unwrap_or_default()
+        .shortcut_overlay_size
+        .as_str()
+    {
+        "large" => 2.0_f64,
+        "medium" => 1.5,
+        _ => 1.0,
+    };
+    let window_width = 160.0 * scale;
+    let window_height = 40.0 * scale;
 
     // Position at top center of the screen where the cursor is
     let (x, y) = {
@@ -1077,9 +1476,13 @@ pub async fn show_shortcut_reminder(
         }
     };
 
-    // If window exists, reposition to current screen and show
+    // If window exists, resize, reposition to current screen, and show
     if let Some(window) = app_handle.get_webview_window(label) {
-        info!("shortcut-reminder window exists, repositioning and showing");
+        info!("shortcut-reminder window exists, resizing/repositioning and showing");
+        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+            window_width,
+            window_height,
+        )));
         let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
         let _ = app_handle.emit_to(label, "shortcut-reminder-update", &shortcut);
         let _ = window.show();
@@ -1135,7 +1538,10 @@ pub async fn show_shortcut_reminder(
     let window = builder
         .build()
         .map(crate::window::finalize_webview_window)
-        .map_err(|e| format!("Failed to create shortcut reminder window: {}", e))?;
+        .map_err(|e| {
+            log_webview_build_failure(label, "shortcut-reminder", &e);
+            format!("Failed to create shortcut reminder window: {}", e)
+        })?;
 
     info!("shortcut-reminder window created");
 
@@ -1417,7 +1823,10 @@ pub async fn show_notification_panel(
     let window = builder
         .build()
         .map(crate::window::finalize_webview_window)
-        .map_err(|e| format!("Failed to create notification panel window: {}", e))?;
+        .map_err(|e| {
+            log_webview_build_failure(label, "notification-panel", &e);
+            format!("Failed to create notification panel window: {}", e)
+        })?;
 
     info!("notification-panel window created");
 
@@ -1553,7 +1962,24 @@ pub fn register_window_shortcuts(app_handle: tauri::AppHandle) -> Result<(), Str
         if matches!(event.state, ShortcutState::Pressed) {
             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 info!("Escape pressed, emitting escape-pressed event");
-                let _ = app.emit("escape-pressed", ());
+                // Target the Main overlay webview explicitly. `app.emit` can be
+                // delivered only to the focused Tauri window; when Home stays
+                // focused while the fullscreen overlay is visible on top, the
+                // overlay never saw escape-pressed (and no keydown reaches it),
+                // so Esc looked broken until a focus change re-routed events.
+                let mut delivered = false;
+                for label in [RewindWindowId::Main.label(), "main-window"] {
+                    if let Some(w) = app.get_webview_window(label) {
+                        if w.is_visible().unwrap_or(false) {
+                            let _ = app.emit_to(label, "escape-pressed", ());
+                            delivered = true;
+                            break;
+                        }
+                    }
+                }
+                if !delivered {
+                    let _ = app.emit("escape-pressed", ());
+                }
             })) {
                 tracing::error!("panic in escape handler: {:?}", e);
             }
@@ -1577,6 +2003,11 @@ pub fn register_window_shortcuts(app_handle: tauri::AppHandle) -> Result<(), Str
     Ok(())
 }
 
+static WINDOW_SHORTCUTS_GEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MAIN_CLOSE_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Unregister window-specific shortcuts when main window is hidden.
 /// Only unregisters Escape and arrow keys. Global shortcuts (search, show, chat)
 /// are NOT touched here — they must persist across window show/hide cycles.
@@ -1598,6 +2029,82 @@ pub fn unregister_window_shortcuts(app_handle: tauri::AppHandle) -> Result<(), S
 
     info!("Window-specific shortcuts unregistered");
     Ok(())
+}
+
+/// Register Escape and return the current generation token. Any delayed
+/// unregister should check this token before unregistering to avoid races.
+pub(crate) fn register_window_shortcuts_with_generation(
+    app_handle: tauri::AppHandle,
+) -> Result<u64, String> {
+    register_window_shortcuts(app_handle.clone())?;
+    let gen = WINDOW_SHORTCUTS_GEN
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .saturating_add(1);
+    info!("shortcut-sync: register generation bumped to {}", gen);
+    Ok(gen)
+}
+
+pub(crate) fn current_window_shortcuts_generation() -> u64 {
+    WINDOW_SHORTCUTS_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(crate) fn set_main_close_in_progress(in_progress: bool) {
+    MAIN_CLOSE_IN_PROGRESS.store(in_progress, std::sync::atomic::Ordering::SeqCst);
+    info!("shortcut-sync: main_close_in_progress={}", in_progress);
+}
+
+pub(crate) fn is_main_close_in_progress() -> bool {
+    MAIN_CLOSE_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Unregister only if no newer register happened after `expected_gen`.
+pub(crate) fn unregister_window_shortcuts_if_generation_unchanged(
+    app_handle: tauri::AppHandle,
+    expected_gen: u64,
+    reason: &str,
+) -> Result<(), String> {
+    let current = WINDOW_SHORTCUTS_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    if current != expected_gen {
+        info!(
+            "shortcut-sync: skip unregister (reason={}, expected_gen={}, current_gen={})",
+            reason, expected_gen, current
+        );
+        return Ok(());
+    }
+    unregister_window_shortcuts(app_handle)
+}
+
+/// True if any Tauri webview in this process currently holds keyboard focus.
+/// Used on Windows/Linux to tell "focus left Main for another app" from
+/// "focus moved to Home while overlay stays visible".
+pub(crate) fn any_screenpipe_webview_has_focus(app: &tauri::AppHandle) -> bool {
+    app.webview_windows()
+        .values()
+        .any(|w| w.is_focused().unwrap_or(false))
+}
+
+pub(crate) fn main_overlay_is_visible(app: &tauri::AppHandle) -> bool {
+    for label in [RewindWindowId::Main.label(), "main-window"] {
+        if let Some(w) = app.get_webview_window(label) {
+            if w.is_visible().unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Re-register Escape when a non-Main window (e.g. Home) gains focus while the
+/// overlay is still shown — otherwise Main's blur path unregisters Escape and
+/// Esc stops working until Main is focused again.
+pub(crate) fn register_window_shortcuts_if_main_visible(app: tauri::AppHandle) {
+    if is_main_close_in_progress() {
+        info!("shortcut-sync: skip register_if_visible (reason=main_close_in_progress)");
+        return;
+    }
+    if main_overlay_is_visible(&app) {
+        let _ = register_window_shortcuts_with_generation(app);
+    }
 }
 
 /// Install a specific older version from R2. Downloads and installs via Tauri updater,
@@ -1696,9 +2203,14 @@ pub async fn perform_ocr_on_image(
 /// Fetches the frame from the local server and uses arboard for clipboard access.
 #[tauri::command]
 #[specta::specta]
-pub async fn copy_frame_to_clipboard(frame_id: i64) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:3030/frames/{}", frame_id);
-    let bytes = reqwest::get(&url)
+pub async fn copy_frame_to_clipboard(app: tauri::AppHandle, frame_id: i64) -> Result<(), String> {
+    use crate::recording::local_api_context_from_app;
+
+    let api = local_api_context_from_app(&app);
+    let client = reqwest::Client::new();
+    let bytes = api
+        .apply_auth(client.get(api.url(&format!("/frames/{}", frame_id))))
+        .send()
         .await
         .map_err(|e| format!("failed to fetch frame: {}", e))?
         .bytes()
@@ -1743,6 +2255,53 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<(), String> {
         .set_text(text)
         .map_err(|e| format!("failed to set clipboard: {}", e))?;
     Ok(())
+}
+
+/// Open a local markdown note in Obsidian (if available), then fallback to OS default app.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_note_path(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let obsidian_uri = format!("obsidian://open?path={}", urlencoding::encode(&path));
+        // Treat successful process launch as success. `open` can return
+        // non-zero even when LaunchServices still opens the target app.
+        if Command::new("open").arg(&obsidian_uri).spawn().is_ok()
+            || Command::new("open").arg(&path).spawn().is_ok()
+        {
+            Ok(())
+        } else {
+            Err(format!("failed to open note path: {}", path))
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let obsidian_uri = format!("obsidian://open?path={}", urlencoding::encode(&path));
+        if Command::new("cmd")
+            .args(["/C", "start", "", &obsidian_uri])
+            .spawn()
+            .is_ok()
+            || Command::new("cmd")
+                .args(["/C", "start", "", &path])
+                .spawn()
+                .is_ok()
+        {
+            Ok(())
+        } else {
+            Err(format!("failed to open note path: {}", path))
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        use std::process::Command;
+        if Command::new("xdg-open").arg(&path).spawn().is_ok() {
+            Ok(())
+        } else {
+            Err(format!("failed to open note path: {}", path))
+        }
+    }
 }
 
 #[tauri::command]

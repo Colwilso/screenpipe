@@ -344,7 +344,69 @@ export function AIProviderConfig({
           />
         </div>
 
-        <div className="grid gap-2 grid-cols-2">
+        <div className={cn(
+          "grid gap-2",
+          piAvailable ? "grid-cols-3" : "grid-cols-4"
+        )}>
+          {piAvailable && (
+            <Button
+              type="button"
+              disabled={!settings?.user?.token}
+              variant={selectedProvider === "screenpipe-cloud" ? "default" : "outline"}
+              className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+              onClick={() => {
+                setSelectedProvider("screenpipe-cloud");
+                setFormData({
+                  ...formData,
+                  provider: "screenpipe-cloud",
+                  url: "",
+                  model: "auto",
+                });
+              }}
+            >
+              <Icons.terminal className="h-3.5 w-3.5" />
+              <span>screenpipe cloud</span>
+            </Button>
+          )}
+
+          <Button
+            type="button"
+            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+            onClick={() => {
+              setSelectedProvider("openai-chatgpt");
+              setFormData({
+                ...formData,
+                provider: "openai-chatgpt",
+                url: "https://api.openai.com/v1",
+                model: "gpt-5.4",
+              });
+            }}
+          >
+            <Icons.openai className="h-3.5 w-3.5" />
+            <span>chatgpt</span>
+          </Button>
+
+          <Button
+            type="button"
+            variant={
+              selectedProvider === "native-ollama" ? "default" : "outline"
+            }
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+            onClick={() => {
+              setSelectedProvider("native-ollama");
+              setFormData({
+                ...formData,
+                provider: "native-ollama",
+                url: "http://localhost:11434/v1",
+                model: "",
+              });
+            }}
+          >
+            <Icons.terminal className="h-3.5 w-3.5" />
+            <span>ollama</span>
+          </Button>
+
           <Button
             type="button"
             variant={(selectedProvider as string) === "bedrock" ? "default" : "outline"}
@@ -379,6 +441,27 @@ export function AIProviderConfig({
           >
             <Icons.settings className="h-3.5 w-3.5" />
             <span>custom</span>
+          </Button>
+
+          <Button
+            type="button"
+            variant={(selectedProvider as string) === "anthropic" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+            onClick={() => {
+              if ((selectedProvider as string) !== "anthropic") {
+                setSelectedProvider("anthropic");
+                setFormData({
+                  ...formData,
+                  provider: "anthropic",
+                  url: "",
+                  model: "claude-sonnet-4-6",
+                });
+              }
+            }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/images/claude-ai.svg" alt="Claude API" className="h-3.5 w-3.5 rounded-sm" />
+            <span>claude api</span>
           </Button>
         </div>
 
@@ -506,6 +589,7 @@ export function AIProviderConfig({
 
         {showAdvanced && (
           <div className="space-y-1.5">
+            {selectedProvider !== "screenpipe-cloud" && (
             <div className="space-y-1">
               <Label htmlFor="maxTokens" className="text-xs">max output tokens</Label>
               <Input
@@ -521,6 +605,7 @@ export function AIProviderConfig({
                 className="h-6 text-[10px]"
               />
             </div>
+            )}
             <div className="space-y-1">
               <Label htmlFor="prompt" className="text-xs">prompt</Label>
               <Textarea
@@ -596,9 +681,14 @@ export const AIPresetDialog = ({
       model: providerData.model,  // Fixed: was providerData.modelName
       id: providerData.id,
       maxContextChars: providerData.maxContextChars,
-      maxTokens: (providerData as any).maxTokens ?? 4096,
       prompt: providerData.prompt,
     };
+
+    // Screenpipe Cloud: max output is defined per model in the gateway catalog (see screenpipe_cloud_models in Rust).
+    // Do not persist or override maxTokens from this dialog — avoids defaulting to 4096 and matches Settings.
+    if (providerData.provider !== "screenpipe-cloud") {
+      (newPreset as any).maxTokens = (providerData as any).maxTokens ?? 4096;
+    }
 
     // Add apiKey for providers that require it
     if (
@@ -625,7 +715,9 @@ export const AIPresetDialog = ({
         url: preset.url,
         model: preset.model,
         maxContextChars: preset.maxContextChars,
-        maxTokens: (preset as any).maxTokens ?? 4096,
+        ...(preset.provider !== "screenpipe-cloud"
+          ? { maxTokens: (preset as any).maxTokens ?? 4096 }
+          : {}),
         prompt: preset.prompt,
         defaultPreset: preset.defaultPreset,
         apiKey: preset.apiKey || null,

@@ -10,6 +10,7 @@
 //! parses configs, runs the scheduler, and delegates execution to an
 //! [`AgentExecutor`].
 
+pub mod favorites;
 pub mod permissions;
 pub mod preset_fallback;
 pub mod sync;
@@ -144,6 +145,24 @@ pub struct PipeConfig {
     /// SHA-256 hash of source_md at install time (to detect local edits).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
+
+    /// Enable sub-agent spawning. Default: false.
+    /// When true, the pipe's agent can spawn parallel sub-agents via
+    /// `sub-agent run "prompt"` bash commands.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub subagent: bool,
+
+    /// When true, the pipe's agent has `SCREENPIPE_FILTER_PII=1` in its
+    /// env so the BASH_ENV shim rewrites every `curl .../search` call to
+    /// append `filter_pii=1` — PII is redacted server-side before the
+    /// agent ever sees it. Use for pipes that forward results to third
+    /// parties (Slack, Notion, Google Docs, etc.).
+    ///
+    /// NOTE: the front-matter field parses but the pipe runner does NOT
+    /// yet read it into the spawned Pi env. Wire-up is pending — tracked
+    /// separately from the chat-side feature which is already live.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub privacy_filter: bool,
 
     /// Catches any extra fields from front-matter (backwards compat).
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
@@ -320,6 +339,9 @@ fn is_default_agent(s: &String) -> bool {
 fn is_default_model(s: &String) -> bool {
     s == "auto" || s == "claude-haiku-4-5" || s == "claude-haiku-4-5@20251001"
 }
+fn is_false(b: &bool) -> bool {
+    !b
+}
 /// Simple FNV-1a 64-bit hash, sufficient for change detection.
 fn simple_hash(content: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -442,6 +464,91 @@ fn remove_local_override(pipes_dir: &Path, pipe_name: &str) -> Result<()> {
         save_local_overrides(pipes_dir, &overrides)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PID file helpers — defense-in-depth against duplicate pipe spawns.
+// The PID file is the OS-level truth for "is this pipe running?"
+// ---------------------------------------------------------------------------
+
+const PID_FILE_NAME: &str = "run.pid";
+
+/// Write the child PID to `{pipes_dir}/{pipe_name}/run.pid`.
+fn write_pid_file(pipes_dir: &Path, pipe_name: &str, pid: u32) {
+    let path = pipes_dir.join(pipe_name).join(PID_FILE_NAME);
+    let _ = std::fs::write(&path, pid.to_string());
+}
+
+/// Read and parse the PID from `{pipes_dir}/{pipe_name}/run.pid`.
+fn read_pid_file(pipes_dir: &Path, pipe_name: &str) -> Option<u32> {
+    let path = pipes_dir.join(pipe_name).join(PID_FILE_NAME);
+    std::fs::read_to_string(&path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Remove the PID file for a pipe.
+fn remove_pid_file(pipes_dir: &Path, pipe_name: &str) {
+    let path = pipes_dir.join(pipe_name).join(PID_FILE_NAME);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Check if a process with the given PID is still alive.
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) checks existence without sending a signal
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use std::ptr;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        unsafe {
+            let handle = windows_sys::Win32::System::Threading::OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                0, // FALSE
+                pid,
+            );
+            if handle.is_null() || handle == ptr::null_mut() {
+                false
+            } else {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+                true
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// On startup, remove any PID files whose processes are no longer alive.
+fn cleanup_orphaned_pid_files(pipes_dir: &Path) {
+    let entries = match std::fs::read_dir(pipes_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let pipe_name = entry.file_name().to_string_lossy().to_string();
+        if let Some(pid) = read_pid_file(pipes_dir, &pipe_name) {
+            if is_process_alive(pid) {
+                info!(
+                    "startup: killing orphaned pipe '{}' process {}",
+                    pipe_name, pid
+                );
+                let _ = crate::agents::pi::kill_process_group(pid);
+            }
+            remove_pid_file(pipes_dir, &pipe_name);
+        }
+    }
 }
 
 /// Result of a single pipe run.
@@ -591,6 +698,173 @@ struct ResolvedPreset {
     prompt: Option<String>,
 }
 
+/// Read the ChatGPT OAuth access token, with auto-refresh if expired.
+///
+/// Primary source: secrets store (`oauth:chatgpt` key in encrypted SQLite DB).
+/// Fallback: legacy `chatgpt-oauth.json` file for pre-migration installs.
+fn read_chatgpt_oauth_token() -> Option<String> {
+    // Try secrets store first (current path)
+    #[cfg(feature = "secrets")]
+    {
+        if let Some(token) = read_chatgpt_token_from_secrets() {
+            return Some(token);
+        }
+    }
+
+    // Fallback: legacy file
+    read_chatgpt_token_from_legacy_file()
+}
+
+/// Read and refresh ChatGPT token from the legacy `chatgpt-oauth.json` file.
+fn read_chatgpt_token_from_legacy_file() -> Option<String> {
+    let path = crate::paths::default_screenpipe_data_dir().join("chatgpt-oauth.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut token_data: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = token_data
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if now >= expires_at.saturating_sub(60) {
+        refresh_chatgpt_token(&mut token_data, now);
+        if let Ok(updated) = serde_json::to_string_pretty(&token_data) {
+            let _ = std::fs::write(&path, updated);
+        }
+    }
+
+    token_data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Read and refresh ChatGPT token from the encrypted secrets store.
+#[cfg(feature = "secrets")]
+fn read_chatgpt_token_from_secrets() -> Option<String> {
+    use screenpipe_secrets::keychain::{get_key, KeyResult};
+
+    let data_dir = crate::paths::default_screenpipe_data_dir();
+    let db_path = data_dir.join("db.sqlite");
+    if !db_path.exists() {
+        return None;
+    }
+
+    let secret_key = match get_key() {
+        KeyResult::Found(k) => Some(k),
+        _ => None,
+    };
+
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // We're in a sync context but need async for sqlx. Use block_in_place
+    // since the caller is always on a tokio runtime.
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let pool = sqlx::SqlitePool::connect(&db_url).await.ok()?;
+            let store = screenpipe_secrets::SecretStore::new(pool, secret_key)
+                .await
+                .ok()?;
+            let bytes = store.get("oauth:chatgpt").await.ok()??;
+            let mut token_data: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let expires_at = token_data
+                .get("expires_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            if now >= expires_at.saturating_sub(60) {
+                refresh_chatgpt_token(&mut token_data, now);
+                // Write refreshed token back to secrets store
+                if let Ok(updated_bytes) = serde_json::to_vec(&token_data) {
+                    if let Err(e) = store.set("oauth:chatgpt", &updated_bytes).await {
+                        tracing::warn!("failed to write refreshed ChatGPT token to secrets: {}", e);
+                    }
+                }
+            }
+
+            token_data
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+    });
+
+    if result.is_none() {
+        tracing::debug!("ChatGPT OAuth token not found in secrets store");
+    }
+
+    result
+}
+
+/// Refresh an expired ChatGPT OAuth token using the refresh_token grant.
+/// Mutates `token_data` in place with the new access_token, refresh_token, and expires_at.
+fn refresh_chatgpt_token(token_data: &mut serde_json::Value, now: u64) {
+    let refresh_token = match token_data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        Some(t) => t,
+        None => return,
+    };
+
+    tracing::info!("ChatGPT OAuth token expired, refreshing...");
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let refresh_res = client
+        .post("https://auth.openai.com/oauth/token")
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email offline_access",
+        }))
+        .send();
+
+    match refresh_res {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(v) = resp.json::<serde_json::Value>() {
+                if let Some(new_token) = v.get("access_token").and_then(|t| t.as_str()) {
+                    let new_refresh = v
+                        .get("refresh_token")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or(refresh_token.as_str());
+                    let new_expires_in =
+                        v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
+
+                    token_data["access_token"] = serde_json::Value::String(new_token.to_string());
+                    token_data["refresh_token"] =
+                        serde_json::Value::String(new_refresh.to_string());
+                    token_data["expires_at"] = serde_json::json!(now + new_expires_in);
+                    tracing::info!("ChatGPT token refreshed successfully");
+                }
+            }
+        }
+        Ok(resp) => {
+            tracing::error!("ChatGPT token refresh failed ({})", resp.status());
+        }
+        Err(e) => {
+            tracing::error!("ChatGPT token refresh request failed: {}", e);
+        }
+    }
+}
+
 /// Read `~/.screenpipe/store.bin` and find the preset by id.
 /// Falls back to the default preset if `preset_id` is `"default"`.
 /// Creates store.bin with a default preset if it doesn't exist (CLI mode).
@@ -601,20 +875,38 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
     if !store_path.exists() {
         // Bootstrap for CLI users who don't have the app.
         // Default to screenpipe cloud — user needs SCREENPIPE_API_KEY env var.
+        // Mirrors the app's first-install seed (use-settings.tsx makeDefaultPresets):
+        // non-pro Sonnet for chat, Haiku for pipes. Users can swap to Opus 4.7 later.
         let default_store = serde_json::json!({
             "settings": {
-                "aiPresets": [{
-                    "id": "default",
-                    "model": "auto",
-                    "provider": "screenpipe-cloud",
-                    "defaultPreset": true,
-                    "maxContextChars": 200000
-                }]
+                "aiPresets": [
+                    {
+                        "id": "chat",
+                        "model": "claude-sonnet-4-5",
+                        "provider": "screenpipe-cloud",
+                        "defaultPreset": true,
+                        "maxContextChars": 200000
+                    },
+                    {
+                        "id": "pipes",
+                        "model": "claude-haiku-4-5",
+                        "provider": "screenpipe-cloud",
+                        "defaultPreset": false,
+                        "maxContextChars": 200000
+                    }
+                ]
             }
         });
         if let Ok(json) = serde_json::to_string_pretty(&default_store) {
-            let _ = std::fs::write(&store_path, json);
-            info!("created store.bin with default preset (screenpipe cloud)");
+            let _ = std::fs::write(&store_path, &json);
+            // Restrict permissions — file contains API keys and credentials
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o600));
+            }
+            info!("created store.bin with default presets (chat: sonnet, pipes: haiku)");
         }
     }
 
@@ -678,20 +970,10 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    // ChatGPT OAuth: read token from stored file (no apiKey in preset)
+    // ChatGPT OAuth: read token from secrets store (primary) or legacy file (fallback),
+    // auto-refreshing if expired.
     if provider.as_deref() == Some("openai-chatgpt") && api_key.is_none() {
-        let token_path =
-            Some(crate::paths::default_screenpipe_data_dir().join("chatgpt-oauth.json"));
-        if let Some(path) = token_path {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(token_data) = serde_json::from_str::<serde_json::Value>(&content) {
-                    api_key = token_data
-                        .get("access_token")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-            }
-        }
+        api_key = read_chatgpt_oauth_token();
     }
 
     let prompt = preset
@@ -781,8 +1063,21 @@ pub type OnPipeRunComplete = Arc<dyn Fn(&str, bool, f64, Option<&str>) + Send + 
 /// Args: (pipe_name, execution_id, line)
 pub type OnPipeOutputLine = Arc<dyn Fn(&str, i64, &str) + Send + Sync>;
 
-/// Default execution timeout: 5 minutes.
-const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Async predicate: given a pipe's required connections, return the
+/// subset that is NOT yet configured (`enabled && credentials present`).
+/// Returning an empty vec means "all connections are ready, pipe may run".
+///
+/// Injected from the engine layer (which owns the SecretStore + screenpipe
+/// dir) to keep the scheduler in `screenpipe-core` free of a
+/// `screenpipe-connect` dep — that crate already depends on us.
+pub type ConnectionCheck = Arc<
+    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Default execution timeout: 10 minutes.
+const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 /// Set up permissions for a Pi pipe: install extension, filtered skills,
 /// write the permissions JSON file, and register the token with the server.
@@ -805,6 +1100,9 @@ async fn setup_pipe_permissions(
     }
     if let Err(e) = PiExecutor::ensure_orphan_guard_extension(pipe_dir) {
         warn!("failed to install orphan-guard extension: {}", e);
+    }
+    if let Err(e) = PiExecutor::ensure_subagent_extension(pipe_dir, config.subagent) {
+        warn!("failed to install sub-agent extension: {}", e);
     }
     if let Err(e) = PiExecutor::ensure_screenpipe_skill_filtered(pipe_dir, config) {
         warn!("failed to install filtered skills: {}", e);
@@ -831,9 +1129,10 @@ async fn setup_pipe_permissions(
     }
 
     let mut perms = permissions::PipePermissions::from_config(config);
+    perms.pipe_dir = Some(pipe_dir.to_string_lossy().to_string());
 
-    // In offline mode, force restrictions so the permissions JSON is always written
-    let force_write = offline;
+    // In offline mode or with filesystem sandbox, force restrictions so the permissions JSON is always written
+    let force_write = offline || perms.pipe_dir.is_some();
 
     if perms.has_any_restrictions() || force_write {
         // Generate a unique pipe token for server-side enforcement
@@ -907,6 +1206,10 @@ pub struct PipeManager {
     on_run_complete: Option<OnPipeRunComplete>,
     /// Optional callback fired for each stdout line from a running pipe.
     on_output_line: Option<OnPipeOutputLine>,
+    /// Optional async predicate that returns the missing connections for a
+    /// pipe. If set, the scheduler skips any enabled pipe whose required
+    /// connections aren't all configured ("setup mode").
+    connection_check: Option<ConnectionCheck>,
     /// Optional persistence store (None in CLI mode).
     store: Option<Arc<dyn PipeStore>>,
     /// API port for prompt rendering (default 3030).
@@ -917,6 +1220,9 @@ pub struct PipeManager {
     token_registry: Option<Arc<dyn permissions::PipeTokenRegistry>>,
     /// Extra context appended to every pipe prompt (e.g. connected integrations).
     extra_context: Option<String>,
+    /// Local API auth key — injected into pipe subprocesses as SCREENPIPE_LOCAL_API_KEY
+    /// so pipes can authenticate to localhost:3030 when API auth is enabled.
+    local_api_key: Option<String>,
     /// Circuit breaker registry for AI preset fallback.
     fallback_registry: Arc<preset_fallback::PresetFallbackRegistry>,
 }
@@ -945,13 +1251,17 @@ impl PipeManager {
             scheduler_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             on_run_complete: None,
             on_output_line: None,
+            connection_check: None,
             store,
             api_port,
             last_reload: Arc::new(Mutex::new(
-                Instant::now() - std::time::Duration::from_secs(10),
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or(Instant::now()),
             )),
             token_registry: None,
             extra_context: None,
+            local_api_key: None,
             fallback_registry: registry,
         }
     }
@@ -981,6 +1291,20 @@ impl PipeManager {
         self.extra_context = None;
     }
 
+    /// Set the local API auth key. Injected into pipe subprocesses as
+    /// `SCREENPIPE_LOCAL_API_KEY` so they can authenticate to localhost.
+    ///
+    /// Sets it as a process-level env var so child processes inherit it
+    /// automatically via cmd.spawn(). Called once during initialization
+    /// before any async tasks are spawned.
+    pub fn set_local_api_key(&mut self, key: Option<String>) {
+        self.local_api_key = key.clone();
+        if let Some(ref k) = key {
+            // SAFETY: called during single-threaded init before scheduler starts
+            unsafe { std::env::set_var("SCREENPIPE_LOCAL_API_KEY", k) };
+        }
+    }
+
     /// Set a token registry for server-side permission enforcement.
     pub fn set_token_registry(&mut self, registry: Arc<dyn permissions::PipeTokenRegistry>) {
         self.token_registry = Some(registry);
@@ -991,6 +1315,14 @@ impl PipeManager {
         self.on_run_complete = Some(cb);
     }
 
+    /// Set the async predicate used to gate scheduled runs on connection
+    /// readiness. Without this, pipes "in setup mode" (enabled but missing
+    /// required integrations) would still tick on their cron / event
+    /// trigger and run with broken credentials.
+    pub fn set_connection_check(&mut self, cb: ConnectionCheck) {
+        self.connection_check = Some(cb);
+    }
+
     /// Set a callback to be invoked for each stdout line from a running pipe.
     pub fn set_on_output_line(&mut self, cb: OnPipeOutputLine) {
         self.on_output_line = Some(cb);
@@ -999,6 +1331,9 @@ impl PipeManager {
     /// Mark orphaned 'running' executions as failed on startup,
     /// then prune old executions (keep 50 per pipe).
     pub async fn startup_recovery(&self) {
+        // Clean up orphaned PID files from previous crashes
+        cleanup_orphaned_pid_files(&self.pipes_dir);
+
         if let Some(ref store) = self.store {
             match store.mark_orphaned_running().await {
                 Ok(count) => {
@@ -1191,8 +1526,13 @@ impl PipeManager {
                     let locally_modified = config.source_hash.as_ref().map(|expected_hash| {
                         let pipe_path = self.pipes_dir.join(name).join("pipe.md");
                         if let Ok(content) = std::fs::read_to_string(&pipe_path) {
-                            let actual_hash = simple_hash(&content);
-                            actual_hash != *expected_hash
+                            // Hash only the body (prompt) so config changes (schedule,
+                            // preset, etc.) don't trigger locally_modified.
+                            if let Ok((_, file_body)) = parse_frontmatter(&content) {
+                                simple_hash(&file_body) != *expected_hash
+                            } else {
+                                simple_hash(&content) != *expected_hash
+                            }
                         } else {
                             false
                         }
@@ -1252,8 +1592,13 @@ impl PipeManager {
                 let locally_modified = config.source_hash.as_ref().map(|expected_hash| {
                     let pipe_path = self.pipes_dir.join(name).join("pipe.md");
                     if let Ok(content) = std::fs::read_to_string(&pipe_path) {
-                        let actual_hash = simple_hash(&content);
-                        actual_hash != *expected_hash
+                        // Hash only the body (prompt) so config changes don't
+                        // trigger locally_modified.
+                        if let Ok((_, file_body)) = parse_frontmatter(&content) {
+                            simple_hash(&file_body) != *expected_hash
+                        } else {
+                            simple_hash(&content) != *expected_hash
+                        }
                     } else {
                         false
                     }
@@ -1406,10 +1751,36 @@ impl PipeManager {
         {
             let mut running = self.running.lock().await;
             if running.contains_key(name) {
-                return Err(anyhow!("pipe '{}' is already running", name));
+                return Err(anyhow!(
+                    "pipe '{}' is already running — you may already be executing inside this pipe. \
+                     Do NOT run `screenpipe pipe run` from within a pipe.",
+                    name
+                ));
             }
             running.insert(name.to_string(), ExecutionHandle { pid: 0 });
         }
+
+        // Defense-in-depth: check PID file (cross-process lock)
+        if let Some(existing_pid) = read_pid_file(&self.pipes_dir, name) {
+            if is_process_alive(existing_pid) {
+                let mut running = self.running.lock().await;
+                running.remove(name);
+                return Err(anyhow!(
+                    "pipe '{}' is already running (pid {}) — another process is executing this pipe. \
+                     Do NOT run `screenpipe pipe run` from within a pipe.",
+                    name, existing_pid
+                ));
+            } else {
+                info!(
+                    "start_pipe_background: pipe '{}' has stale PID file (pid {}), cleaning up",
+                    name, existing_pid
+                );
+                remove_pid_file(&self.pipes_dir, name);
+            }
+        }
+
+        // Write a pre-emptive PID file to claim the lock before spawn
+        write_pid_file(&self.pipes_dir, name, std::process::id());
 
         // Resolve preset
         let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) =
@@ -1489,22 +1860,29 @@ impl PipeManager {
             let _ = store.set_execution_running(id, None).await;
         }
 
-        // PID channel
-        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
+        // Shared PID — set synchronously by the executor right after spawn
+        let shared_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let shared_pid_for_kill = shared_pid.clone();
 
         // Spawn PID watcher
         let running_for_pid = self.running.clone();
         let store_for_pid = self.store.clone();
         let name_for_pid = pipe_name.clone();
         let exec_id_for_pid = exec_id;
+        let shared_pid_watcher = shared_pid.clone();
+        let pipes_dir_for_pidfile = self.pipes_dir.clone();
+        let pipe_name_for_pidfile = pipe_name.clone();
         tokio::spawn(async move {
-            if let Ok(pid) = pid_rx.await {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let pid = shared_pid_watcher.load(std::sync::atomic::Ordering::SeqCst);
+            if pid != 0 {
                 {
                     let mut r = running_for_pid.lock().await;
                     if let Some(handle) = r.get_mut(&name_for_pid) {
                         handle.pid = pid;
                     }
                 }
+                write_pid_file(&pipes_dir_for_pidfile, &pipe_name_for_pidfile, pid);
                 if let (Some(ref store), Some(id)) = (&store_for_pid, exec_id_for_pid) {
                     let _ = store.set_execution_running(id, Some(pid)).await;
                 }
@@ -1520,7 +1898,9 @@ impl PipeManager {
                 run_provider.as_deref(),
                 Some(&run_model),
                 run_provider_url.as_deref(),
-            ) {
+            )
+            .await
+            {
                 warn!("failed to pre-configure pi provider: {}", e);
             }
 
@@ -1537,8 +1917,6 @@ impl PipeManager {
         let on_complete = self.on_run_complete.clone();
         let on_output = self.on_output_line.clone();
         let pipes_dir_for_log = self.pipes_dir.clone();
-        let executors = self.executors.clone();
-        let agent = config.agent.clone();
         let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         // Spawn the actual execution in a background task
@@ -1572,7 +1950,7 @@ impl PipeManager {
                     run_provider.as_deref(),
                     run_provider_url.as_deref(),
                     run_api_key.as_deref(),
-                    Some(pid_tx),
+                    Some(shared_pid.clone()),
                     line_tx,
                     history_enabled,
                     Some(&pipe_system_prompt),
@@ -1582,8 +1960,8 @@ impl PipeManager {
 
             let finished_at = Utc::now();
 
-            // Remove from running
-            let removed_handle = {
+            // Remove from running + clean up PID file
+            let _removed_handle = {
                 let mut r = running_ref.lock().await;
                 r.remove(&pipe_name)
             };
@@ -1591,6 +1969,7 @@ impl PipeManager {
                 let mut exec_ids = running_exec_ids_ref.lock().await;
                 exec_ids.remove(&pipe_name);
             }
+            remove_pid_file(&pipes_dir_for_log, &pipe_name);
 
             let (log, cb_error_type): (PipeRunLog, Option<String>) = match run_result {
                 Ok(Ok(output)) => {
@@ -1674,12 +2053,9 @@ impl PipeManager {
                     )
                 }
                 Err(_elapsed) => {
-                    if let Some(handle) = removed_handle {
-                        if handle.pid != 0 {
-                            if let Some(executor) = executors.get(&agent) {
-                                let _ = executor.kill(&handle);
-                            }
-                        }
+                    let real_pid = shared_pid_for_kill.load(std::sync::atomic::Ordering::SeqCst);
+                    if real_pid != 0 {
+                        let _ = crate::agents::pi::kill_process_group(real_pid);
                     }
                     if let (Some(ref store), Some(id)) = (&store_ref, exec_id) {
                         let _ = store
@@ -1803,11 +2179,38 @@ impl PipeManager {
             {
                 let mut running = self.running.lock().await;
                 if running.contains_key(name) {
-                    return Err(anyhow!("pipe '{}' is already running", name));
+                    return Err(anyhow!(
+                        "pipe '{}' is already running — you may already be executing inside this pipe. \
+                         Do NOT run `screenpipe pipe run` from within a pipe.",
+                        name
+                    ));
                 }
-                // Placeholder handle; real PID comes via pid_tx channel
+                // Placeholder handle; real PID comes via SharedPid
                 running.insert(name.to_string(), ExecutionHandle { pid: 0 });
             }
+
+            // Defense-in-depth: check PID file (cross-process lock)
+            if let Some(existing_pid) = read_pid_file(&self.pipes_dir, name) {
+                if is_process_alive(existing_pid) {
+                    // Undo the running insert since we're bailing out
+                    let mut running = self.running.lock().await;
+                    running.remove(name);
+                    return Err(anyhow!(
+                        "pipe '{}' is already running (pid {}) — another process is executing this pipe. \
+                         Do NOT run `screenpipe pipe run` from within a pipe.",
+                        name, existing_pid
+                    ));
+                } else {
+                    info!(
+                        "run_pipe: pipe '{}' has stale PID file (pid {}), cleaning up",
+                        name, existing_pid
+                    );
+                    remove_pid_file(&self.pipes_dir, name);
+                }
+            }
+
+            // Write a pre-emptive PID file to claim the lock before spawn
+            write_pid_file(&self.pipes_dir, name, std::process::id());
 
             let started_at = Utc::now();
             let pipe_dir = self.pipes_dir.join(name);
@@ -1927,29 +2330,34 @@ impl PipeManager {
                 render_pipe_system_prompt(&body, self.api_port, preset_prompt.as_deref());
             let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
 
-            // Create a channel so the executor can report PID immediately
-            let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
+            // Shared PID — set synchronously by the executor right after spawn
+            let shared_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let shared_pid_for_kill = shared_pid.clone();
 
             // Mark as running in DB
             if let (Some(ref store), Some(id)) = (&self.store, exec_id) {
                 let _ = store.set_execution_running(id, None).await;
             }
 
-            // Spawn PID watcher: when PID arrives, update running map + DB
+            // Spawn PID watcher: when PID arrives, update running map + DB + PID file
             let running_ref = self.running.clone();
             let store_for_pid = self.store.clone();
             let name_for_pid = name.to_string();
             let exec_id_for_pid = exec_id;
+            let shared_pid_watcher = shared_pid.clone();
+            let pipes_dir_for_pidfile = self.pipes_dir.clone();
+            let pipe_name_for_pidfile = name.to_string();
             tokio::spawn(async move {
-                if let Ok(pid) = pid_rx.await {
-                    // Update in-memory running map with real PID
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let pid = shared_pid_watcher.load(std::sync::atomic::Ordering::SeqCst);
+                if pid != 0 {
                     {
                         let mut r = running_ref.lock().await;
                         if let Some(handle) = r.get_mut(&name_for_pid) {
                             handle.pid = pid;
                         }
                     }
-                    // Update DB row with PID
+                    write_pid_file(&pipes_dir_for_pidfile, &pipe_name_for_pidfile, pid);
                     if let (Some(ref store), Some(id)) = (&store_for_pid, exec_id_for_pid) {
                         let _ = store.set_execution_running(id, Some(pid)).await;
                     }
@@ -1966,7 +2374,9 @@ impl PipeManager {
                     run_provider.as_deref(),
                     Some(&run_model),
                     run_provider_url.as_deref(),
-                ) {
+                )
+                .await
+                {
                     warn!("failed to pre-configure pi provider: {}", e);
                 }
 
@@ -2007,7 +2417,7 @@ impl PipeManager {
                     run_provider.as_deref(),
                     run_provider_url.as_deref(),
                     run_api_key.as_deref(),
-                    Some(pid_tx),
+                    Some(shared_pid.clone()),
                     line_tx,
                     history_enabled,
                     Some(&pipe_system_prompt),
@@ -2015,8 +2425,8 @@ impl PipeManager {
             )
             .await;
 
-            // Remove from running
-            let removed_handle = {
+            // Remove from running + clean up PID file
+            let _removed_handle = {
                 let mut running = self.running.lock().await;
                 running.remove(name)
             };
@@ -2024,6 +2434,7 @@ impl PipeManager {
                 let mut exec_ids = self.running_execution_ids.lock().await;
                 exec_ids.remove(name);
             }
+            remove_pid_file(&self.pipes_dir, name);
 
             let finished_at = Utc::now();
             let _duration_ms = (finished_at - started_at).num_milliseconds();
@@ -2122,12 +2533,9 @@ impl PipeManager {
                         "pipe '{}' timed out after {}s, killing process",
                         name, pipe_timeout
                     );
-                    if let Some(handle) = removed_handle {
-                        if handle.pid != 0 {
-                            if let Some(executor) = self.executors.get(&config.agent) {
-                                let _ = executor.kill(&handle);
-                            }
-                        }
+                    let real_pid = shared_pid_for_kill.load(std::sync::atomic::Ordering::SeqCst);
+                    if real_pid != 0 {
+                        let _ = crate::agents::pi::kill_process_group(real_pid);
                     }
 
                     if let (Some(ref store), Some(id)) = (&self.store, exec_id) {
@@ -2211,7 +2619,15 @@ impl PipeManager {
         let (mut config, body) = parse_frontmatter(&content)?;
         config.enabled = enabled;
         let new_content = serialize_pipe(&config, &body)?;
-        std::fs::write(&pipe_md, &new_content)?;
+        atomic_write(&pipe_md, &new_content)?;
+
+        // Persist to local overrides so reload_pipes() doesn't revert this
+        if let Err(e) = set_local_override(&self.pipes_dir, name, enabled) {
+            warn!(
+                "failed to save local enabled override for '{}': {}",
+                name, e
+            );
+        }
 
         // Update in-memory
         let mut pipes = self.pipes.lock().await;
@@ -2245,7 +2661,7 @@ impl PipeManager {
             // Validate it parses correctly
             let (mut config, body) = parse_frontmatter(raw)?;
             config.name = name.to_string(); // preserve directory name
-            std::fs::write(&pipe_md, raw)?;
+            atomic_write(&pipe_md, raw)?;
 
             // Update in-memory
             let mut pipes = self.pipes.lock().await;
@@ -2313,6 +2729,19 @@ impl PipeManager {
                             .collect();
                     }
                 }
+                "timeout" => {
+                    config.timeout = v.as_u64();
+                }
+                "trigger" => {
+                    if v.is_null() {
+                        config.trigger = None;
+                    } else {
+                        match serde_json::from_value::<TriggerConfig>(v.clone()) {
+                            Ok(t) => config.trigger = Some(t),
+                            Err(e) => warn!("invalid trigger config for '{}': {}", name, e),
+                        }
+                    }
+                }
                 _ => {
                     config.config.insert(k.clone(), v.clone());
                 }
@@ -2320,7 +2749,7 @@ impl PipeManager {
         }
 
         let new_content = serialize_pipe(&config, &new_body)?;
-        std::fs::write(&pipe_md, &new_content)?;
+        atomic_write(&pipe_md, &new_content)?;
 
         // Update in-memory
         let mut pipes = self.pipes.lock().await;
@@ -2401,8 +2830,13 @@ impl PipeManager {
             }
         }
 
-        // URL — try HTTP fetch
-        if source.starts_with("http://") || source.starts_with("https://") {
+        // URL — fetch over HTTPS only (reject plaintext HTTP to prevent MITM)
+        if source.starts_with("http://") {
+            return Err(anyhow!(
+                "pipe installation over plain HTTP is not allowed — use https:// instead"
+            ));
+        }
+        if source.starts_with("https://") {
             let name = url_to_pipe_name(source);
             let dest_dir = self.pipes_dir.join(&name);
             std::fs::create_dir_all(&dest_dir)?;
@@ -2415,7 +2849,7 @@ impl PipeManager {
                 ));
             }
             let content = response.text().await?;
-            std::fs::write(dest_dir.join("pipe.md"), &content)?;
+            atomic_write(&dest_dir.join("pipe.md"), &content)?;
             self.load_pipes().await?;
             let _ = remove_tombstone(&self.pipes_dir, &name);
             info!("installed pipe '{}' from URL", name);
@@ -2442,9 +2876,8 @@ impl PipeManager {
         config.source_slug = Some(slug.to_string());
         config.installed_version = Some(version);
 
-        // Hash the source_md content
-        let source_hash = simple_hash(source_md);
-        config.source_hash = Some(source_hash);
+        // Hash only the body (prompt) so config changes don't trigger locally_modified
+        config.source_hash = Some(simple_hash(&body));
 
         // Derive name from slug
         let name = slug.to_string();
@@ -2453,7 +2886,7 @@ impl PipeManager {
 
         // Re-serialize with tracking fields included
         let content = serialize_pipe(&config, &body)?;
-        std::fs::write(dest_dir.join("pipe.md"), &content)?;
+        atomic_write(&dest_dir.join("pipe.md"), &content)?;
 
         self.load_pipes().await?;
         let _ = remove_tombstone(&self.pipes_dir, &name);
@@ -2476,21 +2909,31 @@ impl PipeManager {
 
         let (mut config, body) = parse_frontmatter(source_md)?;
 
-        // Preserve user's enabled state and schedule from current config
+        // Preserve user's enabled state, schedule, preset, and connections from current config
         let current_path = dest_dir.join("pipe.md");
         if let Ok(current_content) = std::fs::read_to_string(&current_path) {
+            // Backup existing pipe.md before overwriting
+            let backup_path = dest_dir.join("pipe.md.bak");
+            if let Err(e) = std::fs::copy(&current_path, &backup_path) {
+                warn!("failed to backup pipe.md for '{}': {}", name, e);
+            }
+
             if let Ok((current_config, _)) = parse_frontmatter(&current_content) {
                 config.enabled = current_config.enabled;
                 config.preset = current_config.preset.clone();
+                config.schedule = current_config.schedule.clone();
+                config.connections = current_config.connections.clone();
             }
         }
 
         config.source_slug = Some(slug.to_string());
         config.installed_version = Some(version);
-        config.source_hash = Some(simple_hash(source_md));
+        // Hash only the prompt body so config changes (schedule, preset, etc.)
+        // don't trigger locally_modified — only actual prompt edits do.
+        config.source_hash = Some(simple_hash(&body));
 
         let content = serialize_pipe(&config, &body)?;
-        std::fs::write(current_path, &content)?;
+        atomic_write(&current_path, &content)?;
 
         self.load_pipes().await?;
         info!("updated pipe '{}' to store v{}", name, version);
@@ -2621,15 +3064,29 @@ impl PipeManager {
         let pipes_dir = self.pipes_dir.clone();
         let on_run_complete = self.on_run_complete.clone();
         let on_output_line = self.on_output_line.clone();
+        let connection_check = self.connection_check.clone();
         let store = self.store.clone();
         let api_port = self.api_port;
         let token_registry = self.token_registry.clone();
         let extra_context = self.extra_context.clone();
+        let _local_api_key = self.local_api_key.clone();
 
         let handle = tokio::spawn(async move {
             info!("pipe scheduler started (generation {})", generation);
             let mut last_run: HashMap<String, DateTime<Utc>> = HashMap::new();
             let mut last_cleanup = Instant::now();
+
+            // local_api_key is passed to each pipe subprocess via cmd.env() in the
+            // executor — see PiExecutor::spawn_pi / spawn_pi_streaming.
+
+            // Sequential execution: only one scheduled pipe runs at a time to
+            // avoid rate-limit stampedes when many pipes share the same cron.
+            // Event-triggered pipes bypass the queue for low-latency response.
+            let execution_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+            // Track pipes that are queued (waiting for semaphore) or running,
+            // so the scheduler doesn't double-queue the same pipe.
+            let queued_or_running: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+                Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
             // Load last_run from DB on first tick
             if let Some(ref store) = store {
@@ -2646,11 +3103,24 @@ impl PipeManager {
                 }
             }
 
-            // Subscribe to workflow events for event-triggered pipes
+            // Subscribe to trigger-relevant events only.
+            // We subscribe to individual topics to avoid processing high-frequency
+            // system events (ui_frame, window_ocr, realtime_transcription).
             use futures::StreamExt;
-            let mut workflow_rx = screenpipe_events::subscribe_to_event::<
-                screenpipe_events::WorkflowEvent,
-            >("workflow_event");
+            let mut meeting_start_rx =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+            let mut meeting_end_rx =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+            let mut workflow_rx =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("workflow_event");
+            // pipe_completed:* uses subscribe_to_all with prefix filtering below
+            let mut pipe_completed_rx = screenpipe_events::subscribe_to_all_events();
+
+            // Circular chain detection: track recently-triggered pipe→pipe chains.
+            // If A→B→A would fire, suppress the second link.
+            let mut recent_chain: std::collections::HashMap<String, Instant> =
+                std::collections::HashMap::new();
+            const CHAIN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
             loop {
                 // Check for shutdown
@@ -2678,42 +3148,93 @@ impl PipeManager {
                         .collect()
                 };
 
-                // Drain pending workflow events and mark matching pipes for immediate execution.
-                // We reset their last_run to epoch so the existing should_run() check
-                // passes on this tick, reusing the full execution path without duplication.
+                // Drain pending events and mark matching pipes for immediate execution.
+                // Collect events from targeted subscriptions to avoid processing
+                // high-frequency system events (ui_frame, window_ocr, etc.).
                 let mut event_triggered: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 {
                     use futures::FutureExt;
-                    while let Some(event) = workflow_rx.next().now_or_never().flatten() {
-                        let event_type = &event.data.event_type;
+
+                    // Collect events from all targeted subscriptions into one vec
+                    let mut pending_events: Vec<(String, serde_json::Value)> = Vec::new();
+                    while let Some(e) = meeting_start_rx.next().now_or_never().flatten() {
+                        pending_events.push((e.name, e.data));
+                    }
+                    while let Some(e) = meeting_end_rx.next().now_or_never().flatten() {
+                        pending_events.push((e.name, e.data));
+                    }
+                    while let Some(e) = workflow_rx.next().now_or_never().flatten() {
+                        // For workflow_event, expose the inner event_type as the match key
+                        let event_type = e
+                            .data
+                            .get("event_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("workflow_event")
+                            .to_string();
+                        pending_events.push((event_type, e.data));
+                    }
+                    // pipe_completed:* — filter from all-events subscription
+                    while let Some(e) = pipe_completed_rx.next().now_or_never().flatten() {
+                        if e.name.starts_with("pipe_completed:") {
+                            pending_events.push((e.name, e.data));
+                        }
+                    }
+
+                    // Expire old chain cooldowns
+                    recent_chain.retain(|_, ts| ts.elapsed() < CHAIN_COOLDOWN);
+
+                    for (event_name, _data) in &pending_events {
                         for (name, config, _body) in &pipe_snapshot {
                             if !config.enabled {
                                 continue;
                             }
                             if let Some(ref trigger) = config.trigger {
-                                if trigger.events.iter().any(|e| e == event_type) {
-                                    let already_running = {
-                                        let r = running.lock().await;
-                                        r.contains_key(name)
-                                    };
-                                    if already_running {
+                                if !trigger.events.iter().any(|e| e == event_name) {
+                                    continue;
+                                }
+
+                                // Don't let a pipe trigger itself
+                                if *event_name == format!("pipe_completed:{}", name) {
+                                    continue;
+                                }
+
+                                // Circular chain detection: if pipe X was triggered by
+                                // pipe_completed:Y within the cooldown, don't let
+                                // pipe_completed:X trigger Y back.
+                                if let Some(source_pipe) =
+                                    event_name.strip_prefix("pipe_completed:")
+                                {
+                                    let reverse_key = format!("{}→{}", name, source_pipe);
+                                    if recent_chain.contains_key(&reverse_key) {
                                         debug!(
-                                            "scheduler: event '{}' skipped pipe '{}' (already running)",
-                                            event_type, name
+                                            "scheduler: suppressing circular chain {} → {} → {}",
+                                            source_pipe, name, source_pipe
                                         );
                                         continue;
                                     }
-                                    info!(
-                                        "scheduler: event '{}' ({:.0}%) triggered pipe '{}'",
-                                        event_type,
-                                        event.data.confidence * 100.0,
-                                        name
-                                    );
-                                    // Reset last_run so should_run() passes for "manual" pipes too
-                                    last_run.remove(name);
-                                    event_triggered.insert(name.clone());
+                                    // Record this chain link
+                                    let chain_key = format!("{}→{}", source_pipe, name);
+                                    recent_chain.insert(chain_key, Instant::now());
                                 }
+
+                                let already_running = {
+                                    let r = running.lock().await;
+                                    r.contains_key(name)
+                                };
+                                if already_running {
+                                    debug!(
+                                        "scheduler: event '{}' skipped pipe '{}' (already running)",
+                                        event_name, name
+                                    );
+                                    continue;
+                                }
+                                info!(
+                                    "scheduler: event '{}' triggered pipe '{}'",
+                                    event_name, name
+                                );
+                                last_run.remove(name);
+                                event_triggered.insert(name.clone());
                             }
                         }
                     }
@@ -2730,11 +3251,47 @@ impl PipeManager {
                         continue;
                     }
 
-                    // Check not already running
+                    // Check not already queued or running
                     {
-                        let r = running.lock().await;
-                        if r.contains_key(name) {
+                        let qr = queued_or_running.lock().await;
+                        if qr.contains(name) {
                             continue;
+                        }
+                    }
+
+                    // Setup-mode gate: pipes whose declared `connections` aren't
+                    // all configured (`enabled && credentials present`) must not
+                    // run on schedule or event. Mirrors the manual-run gate in
+                    // pipes_api::run_pipe_now. Placed after the schedule/queue
+                    // checks so we only hit the SecretStore when the pipe would
+                    // otherwise be about to start.
+                    if !config.connections.is_empty() {
+                        if let Some(check) = &connection_check {
+                            let missing = check(config.connections.clone()).await;
+                            if !missing.is_empty() {
+                                debug!(
+                                    "scheduler: pipe '{}' in setup mode (missing connections: {:?}), skipping",
+                                    name, missing
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Defense-in-depth: check PID file (survives crashes)
+                    if let Some(existing_pid) = read_pid_file(&pipes_dir, name) {
+                        if is_process_alive(existing_pid) {
+                            debug!(
+                                "scheduler: pipe '{}' has live process {} (PID file), skipping",
+                                name, existing_pid
+                            );
+                            continue;
+                        } else {
+                            info!(
+                                "scheduler: pipe '{}' has stale PID file (pid {}), cleaning up",
+                                name, existing_pid
+                            );
+                            remove_pid_file(&pipes_dir, name);
                         }
                     }
 
@@ -2754,13 +3311,21 @@ impl PipeManager {
                         continue;
                     }
 
-                    info!("scheduler: running pipe '{}'", name);
+                    info!(
+                        "scheduler: queuing pipe '{}' ({})",
+                        name,
+                        if triggered_by_event {
+                            "event"
+                        } else {
+                            "scheduled"
+                        }
+                    );
                     last_run.insert(name.clone(), Utc::now());
 
-                    // Mark running
+                    // Mark as queued so the next tick doesn't double-queue
                     {
-                        let mut r = running.lock().await;
-                        r.insert(name.clone(), ExecutionHandle { pid: 0 });
+                        let mut qr = queued_or_running.lock().await;
+                        qr.insert(name.clone());
                     }
 
                     // Resolve preset → model/provider overrides (same as run_pipe)
@@ -2790,13 +3355,31 @@ impl PipeManager {
                             ),
                         }
                     } else {
-                        (
-                            config.model.clone(),
-                            config.provider.clone(),
-                            None,
-                            None,
-                            None,
-                        )
+                        // No preset in pipe config — use the user's default preset
+                        // so scheduled pipes respect the user's AI settings instead
+                        // of silently falling through to screenpipe cloud.
+                        match resolve_preset(&pipes_dir, "default") {
+                            Some(resolved) => {
+                                info!(
+                                    "scheduler: pipe '{}' has no preset configured, using user's default preset → model={}, provider={:?}",
+                                    name, resolved.model, resolved.provider
+                                );
+                                (
+                                    resolved.model,
+                                    resolved.provider,
+                                    resolved.url,
+                                    resolved.api_key,
+                                    resolved.prompt,
+                                )
+                            }
+                            None => (
+                                config.model.clone(),
+                                config.provider.clone(),
+                                None,
+                                None,
+                                None,
+                            ),
+                        }
                     };
 
                     // Pre-configure pi with the pipe's provider
@@ -2808,7 +3391,9 @@ impl PipeManager {
                             provider.as_deref(),
                             Some(&model),
                             provider_url.as_deref(),
-                        ) {
+                        )
+                        .await
+                        {
                             warn!("scheduler: failed to pre-configure pi provider: {}", e);
                         }
 
@@ -2849,8 +3434,34 @@ impl PipeManager {
                     let store_ref = store.clone();
                     let token_registry_ref = token_registry.clone();
                     let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
+                    let semaphore = execution_semaphore.clone();
+                    let pipes_dir_for_mark = pipes_dir.clone();
+                    let queued_ref = queued_or_running.clone();
 
                     tokio::spawn(async move {
+                        // Event-triggered pipes skip the queue for low-latency response.
+                        // Scheduled pipes wait for the previous one to finish.
+                        let _permit = if !is_event_triggered {
+                            Some(
+                                semaphore
+                                    .acquire()
+                                    .await
+                                    .expect("execution semaphore closed"),
+                            )
+                        } else {
+                            None
+                        };
+
+                        // Mark running + write PID file only after acquiring the permit,
+                        // so the UI shows accurate state (not "running" while queued).
+                        {
+                            let mut r = running_ref.lock().await;
+                            r.insert(pipe_name.clone(), ExecutionHandle { pid: 0 });
+                        }
+                        write_pid_file(&pipes_dir_for_mark, &pipe_name, std::process::id());
+
+                        info!("scheduler: running pipe '{}'", pipe_name);
+
                         // Create DB execution row
                         let trigger = if is_event_triggered {
                             "event"
@@ -2881,22 +3492,30 @@ impl PipeManager {
                             let _ = store.set_execution_running(id, None).await;
                         }
 
-                        // PID channel
-                        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
+                        // Shared PID — set synchronously by the executor right after spawn
+                        let shared_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                        let shared_pid_for_kill = shared_pid.clone();
+                        let pipes_dir_for_pidfile = pipes_dir_for_log.clone();
+                        let pipe_name_for_pidfile = pipe_name.clone();
 
-                        // Spawn PID watcher
+                        // Update running HashMap + DB + PID file once PID is available
                         let running_for_pid = running_ref.clone();
                         let store_for_pid = store_ref.clone();
                         let name_for_pid = pipe_name.clone();
                         let exec_id_for_pid = exec_id;
+                        let shared_pid_watcher = shared_pid.clone();
                         tokio::spawn(async move {
-                            if let Ok(pid) = pid_rx.await {
+                            // Brief wait for the synchronous PID store
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            let pid = shared_pid_watcher.load(std::sync::atomic::Ordering::SeqCst);
+                            if pid != 0 {
                                 {
                                     let mut r = running_for_pid.lock().await;
                                     if let Some(handle) = r.get_mut(&name_for_pid) {
                                         handle.pid = pid;
                                     }
                                 }
+                                write_pid_file(&pipes_dir_for_pidfile, &pipe_name_for_pidfile, pid);
                                 if let (Some(ref store), Some(id)) =
                                     (&store_for_pid, exec_id_for_pid)
                                 {
@@ -2935,7 +3554,7 @@ impl PipeManager {
                                 provider.as_deref(),
                                 provider_url.as_deref(),
                                 api_key.as_deref(),
-                                Some(pid_tx),
+                                Some(shared_pid.clone()),
                                 line_tx,
                                 history_enabled,
                                 Some(&pipe_system_prompt),
@@ -2945,8 +3564,8 @@ impl PipeManager {
 
                         let finished_at = Utc::now();
 
-                        // Remove from running
-                        let removed_handle = {
+                        // Remove from running + clean up PID file
+                        let _removed_handle = {
                             let mut r = running_ref.lock().await;
                             r.remove(&pipe_name)
                         };
@@ -2954,6 +3573,11 @@ impl PipeManager {
                             let mut exec_ids = running_exec_ids_ref.lock().await;
                             exec_ids.remove(&pipe_name);
                         }
+                        {
+                            let mut qr = queued_ref.lock().await;
+                            qr.remove(&pipe_name);
+                        }
+                        remove_pid_file(&pipes_dir_for_log, &pipe_name);
 
                         let (log, cb_error_type): (PipeRunLog, Option<String>) = match run_result {
                             Ok(Ok(output)) => {
@@ -3045,10 +3669,10 @@ impl PipeManager {
                             }
                             Err(_elapsed) => {
                                 warn!("pipe '{}' timed out after {}s", pipe_name, pipe_timeout);
-                                if let Some(handle) = removed_handle {
-                                    if handle.pid != 0 {
-                                        let _ = crate::agents::pi::kill_process_group(handle.pid);
-                                    }
+                                let real_pid =
+                                    shared_pid_for_kill.load(std::sync::atomic::Ordering::SeqCst);
+                                if real_pid != 0 {
+                                    let _ = crate::agents::pi::kill_process_group(real_pid);
                                 }
                                 if let (Some(ref store), Some(id)) = (&store_ref, exec_id) {
                                     let _ = store
@@ -3119,6 +3743,18 @@ impl PipeManager {
                             entry.pop_front();
                         }
                         drop(l);
+
+                        // Emit pipe_completed event so other pipes can chain
+                        let event_name = format!("pipe_completed:{}", name_for_cb);
+                        let _ = screenpipe_events::send_event(
+                            &event_name,
+                            screenpipe_events::PipeCompletedEvent {
+                                pipe_name: name_for_cb.clone(),
+                                success,
+                                duration_secs,
+                                timestamp: chrono::Utc::now(),
+                            },
+                        );
 
                         // Fire run-complete callback (analytics, etc.)
                         if let Some(ref cb) = on_complete {
@@ -3251,7 +3887,7 @@ impl PipeManager {
                     }
                 }
                 std::fs::create_dir_all(&dir)?;
-                std::fs::write(&pipe_md, content)?;
+                atomic_write(&pipe_md, content)?;
                 info!("installed built-in pipe: {}", name);
             }
         }
@@ -3321,6 +3957,22 @@ pub fn parse_frontmatter(content: &str) -> Result<(PipeConfig, String)> {
     Ok((config, body))
 }
 
+/// Atomic file write: write to a temp file in the same directory, then rename.
+/// On Unix, rename is atomic. On Windows, this avoids the partial-write window
+/// where a concurrent reader (e.g. the scheduler) sees a truncated file.
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("cannot determine parent dir of {:?}", path))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.flush()?;
+    // persist atomically (rename on Unix, MoveFileEx on Windows)
+    tmp.persist(path)?;
+    Ok(())
+}
+
 /// Serialize a PipeConfig + body back to pipe.md format.
 /// Name is excluded from frontmatter (derived from directory name).
 pub fn serialize_pipe(config: &PipeConfig, body: &str) -> Result<String> {
@@ -3343,6 +3995,7 @@ pub fn serialize_pipe(config: &PipeConfig, body: &str) -> Result<String> {
         "connections",
         "permissions",
         "timeout",
+        "trigger",
         "source_slug",
         "installed_version",
         "source_hash",
@@ -3378,8 +4031,14 @@ fn render_pipe_system_prompt(body: &str, api_port: u16, system_prompt: Option<&s
         sys.push_str("\n\n");
     }
 
+    let api_auth_note = if std::env::var("SCREENPIPE_LOCAL_API_KEY").is_ok() {
+        "\nAPI Authentication: REQUIRED. Add `-H \"Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY\"` to ALL curl requests to the Screenpipe API. The env var is already set in your environment.\n"
+    } else {
+        ""
+    };
+
     sys.push_str(&format!(
-        "OS: {os}\nOutput directory: ./output/\nScreenpipe API: http://localhost:{api_port}\nPrefer bun/TypeScript for scripts. Python may not be installed.\nSend notifications via POST http://localhost:11435/notify with {{\"title\": \"...\", \"body\": \"...\"}}. Body supports markdown. File links MUST use absolute paths (e.g. [View log](/Users/me/file.md)), never relative paths like ./output/file.md — relative paths break the notification link handler.\n\n"
+        "CRITICAL: You ARE this pipe. You are already running inside it. NEVER run `screenpipe pipe run` — that would create a recursive duplicate. Execute the task directly using the tools available to you (bash, file I/O, HTTP requests, etc.).\n\nOS: {os}\nOutput directory: ./output/\nScreenpipe API: http://localhost:{api_port}{api_auth_note}\nPrefer bun/TypeScript for scripts. Python may not be installed.\nSend notifications via POST http://localhost:11435/notify with {{\"title\": \"...\", \"body\": \"...\"}}. Body supports markdown. File links MUST use absolute paths (e.g. [View log](/Users/me/file.md)), never relative paths like ./output/file.md — relative paths break the notification link handler.\n\n"
     ));
     sys.push_str(body);
     sys
@@ -3418,7 +4077,9 @@ fn render_prompt_with_port(
         r#"Time range: {start_time} to {end_time}
 Date: {date}
 Timezone: {timezone} (UTC{tz_offset})
-"#
+Pipe name: {}
+"#,
+        config.name
     );
 
     prompt.push_str(&header);
@@ -3427,7 +4088,7 @@ Timezone: {timezone} (UTC{tz_offset})
         prompt.push_str(ctx);
     }
 
-    prompt.push_str("\nExecute the pipe now.");
+    prompt.push_str("\nDo the work described above now. Do NOT re-run this pipe via CLI.");
 
     prompt
 }
@@ -3456,9 +4117,19 @@ pub fn parse_schedule(schedule: &str) -> Option<ParsedSchedule> {
             86400,
         )));
     }
+    if s.eq_ignore_ascii_case("weekly") || s.eq_ignore_ascii_case("every week") {
+        return Some(ParsedSchedule::Interval(std::time::Duration::from_secs(
+            7 * 86400,
+        )));
+    }
     // Try human-readable interval first
     if let Some(d) = parse_duration_str(s) {
         return Some(ParsedSchedule::Interval(d));
+    }
+    // Try "every day at Xam/pm" and "every <weekday> at Xam/pm"
+    // These are generated by the UI schedule dropdown.
+    if let Some(cron) = parse_human_schedule(s) {
+        return Some(ParsedSchedule::Cron(Box::new(cron)));
     }
     // Try cron expression (5 or 6 field)
     // cron crate requires 7 fields (sec min hour dom month dow year),
@@ -3472,6 +4143,151 @@ pub fn parse_schedule(schedule: &str) -> Option<ParsedSchedule> {
         return Some(ParsedSchedule::Cron(Box::new(cron)));
     }
     None
+}
+
+/// Parse human-readable schedules like "every day at 9am", "every monday at 6pm".
+/// Times are interpreted as local time and converted to UTC for the cron expression,
+/// since the cron library evaluates against UTC.
+fn parse_human_schedule(s: &str) -> Option<CronSchedule> {
+    let s = s.to_lowercase();
+    let s = s.strip_prefix("every").unwrap_or(&s).trim();
+
+    // Extract "at Xam/pm" from the end
+    let (prefix, local_hour) = if let Some(at_pos) = s.find(" at ") {
+        let time_str = s[at_pos + 4..].trim();
+        let h = parse_time_str(time_str)?;
+        (s[..at_pos].trim(), h)
+    } else {
+        return None;
+    };
+
+    // Convert local hour to UTC using current system timezone offset
+    let utc_hour = local_hour_to_utc(local_hour);
+
+    // "day" → every day at that hour
+    // "monday", "tuesday", etc. → specific weekday
+    let cron_str = match prefix {
+        "day" => format!("0 0 {} * * * *", utc_hour),
+        "daily" => format!("0 0 {} * * * *", utc_hour),
+        "monday" | "mon" => format!("0 0 {} * * 1 *", utc_hour),
+        "tuesday" | "tue" => format!("0 0 {} * * 2 *", utc_hour),
+        "wednesday" | "wed" => format!("0 0 {} * * 3 *", utc_hour),
+        "thursday" | "thu" => format!("0 0 {} * * 4 *", utc_hour),
+        "friday" | "fri" => format!("0 0 {} * * 5 *", utc_hour),
+        "saturday" | "sat" => format!("0 0 {} * * 6 *", utc_hour),
+        "sunday" | "sun" => format!("0 0 {} * * 0 *", utc_hour),
+        _ => return None,
+    };
+
+    CronSchedule::from_str(&cron_str).ok()
+}
+
+/// Convert a local hour (0-23) to UTC hour using the system's current timezone offset.
+fn local_hour_to_utc(local_hour: u32) -> u32 {
+    let now = chrono::Local::now();
+    let offset_secs = now.offset().local_minus_utc(); // positive = east of UTC
+    let offset_hours = offset_secs / 3600;
+    // local_hour - offset = utc_hour, wrapped to 0-23
+    ((local_hour as i32 - offset_hours).rem_euclid(24)) as u32
+}
+
+/// Parse "9am", "12pm", "6pm", "14", "9" into a 24-hour number.
+fn parse_time_str(s: &str) -> Option<u32> {
+    let s = s.trim().to_lowercase();
+    if let Some((hour, minute)) = parse_hour_minute(&s) {
+        if minute != 0 {
+            return None;
+        }
+        return Some(hour);
+    }
+    if let Some(h) = s.strip_suffix("am") {
+        let n: u32 = h.trim().parse().ok()?;
+        if n == 12 {
+            Some(0)
+        } else if n <= 12 {
+            Some(n)
+        } else {
+            None
+        }
+    } else if let Some(h) = s.strip_suffix("pm") {
+        let n: u32 = h.trim().parse().ok()?;
+        if n == 12 {
+            Some(12)
+        } else if n <= 12 {
+            Some(n + 12)
+        } else {
+            None
+        }
+    } else {
+        let n: u32 = s.parse().ok()?;
+        if n < 24 {
+            Some(n)
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_hour_minute(s: &str) -> Option<(u32, u32)> {
+    let normalized = s
+        .replace(" a.m.", "am")
+        .replace(" p.m.", "pm")
+        .replace(" a.m", "am")
+        .replace(" p.m", "pm")
+        .replace(" am", "am")
+        .replace(" pm", "pm")
+        .replace(' ', "");
+
+    let (clock, ampm) = if let Some(c) = normalized.strip_suffix("am") {
+        (c, Some("am"))
+    } else if let Some(c) = normalized.strip_suffix("pm") {
+        (c, Some("pm"))
+    } else {
+        (normalized.as_str(), None)
+    };
+
+    let (hour, minute) = if let Some((h, m)) = clock.split_once(':') {
+        let hour: u32 = h.parse().ok()?;
+        let minute: u32 = m.parse().ok()?;
+        (hour, minute)
+    } else {
+        let hour: u32 = clock.parse().ok()?;
+        (hour, 0)
+    };
+
+    if minute >= 60 {
+        return None;
+    }
+
+    let hour24 = match ampm {
+        Some("am") => {
+            if hour == 12 {
+                0
+            } else if hour <= 12 {
+                hour
+            } else {
+                return None;
+            }
+        }
+        Some("pm") => {
+            if hour == 12 {
+                12
+            } else if hour <= 12 {
+                hour + 12
+            } else {
+                return None;
+            }
+        }
+        _ => {
+            if hour < 24 {
+                hour
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some((hour24, minute))
 }
 
 /// Check if a pipe should run now given its schedule and last run time.
@@ -3879,7 +4695,7 @@ mod tests {
         let content = "---\nschedule: manual\n---\n\nBody";
         let (config, _) = parse_frontmatter(content).unwrap();
         assert_eq!(config.agent, "pi");
-        assert_eq!(config.model, "claude-haiku-4-5");
+        assert_eq!(config.model, "auto");
         assert!(config.enabled);
         assert!(config.provider.is_none());
     }
@@ -3915,6 +4731,8 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let body = "Do something useful";
@@ -4010,6 +4828,95 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_schedule_human_daily() {
+        match parse_schedule("every day at 9am") {
+            Some(ParsedSchedule::Cron(_)) => {}
+            other => panic!(
+                "expected cron for 'every day at 9am', got {:?}",
+                other.is_some()
+            ),
+        }
+        match parse_schedule("every day at 12pm") {
+            Some(ParsedSchedule::Cron(_)) => {}
+            other => panic!(
+                "expected cron for 'every day at 12pm', got {:?}",
+                other.is_some()
+            ),
+        }
+        match parse_schedule("every day at 6pm") {
+            Some(ParsedSchedule::Cron(_)) => {}
+            other => panic!(
+                "expected cron for 'every day at 6pm', got {:?}",
+                other.is_some()
+            ),
+        }
+        match parse_schedule("daily at 9am") {
+            Some(ParsedSchedule::Cron(_)) => {}
+            other => panic!(
+                "expected cron for 'daily at 9am', got {:?}",
+                other.is_some()
+            ),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_human_weekday() {
+        match parse_schedule("every monday at 9am") {
+            Some(ParsedSchedule::Cron(_)) => {}
+            other => panic!(
+                "expected cron for 'every monday at 9am', got {:?}",
+                other.is_some()
+            ),
+        }
+    }
+
+    #[test]
+    fn test_should_run_human_daily() {
+        // "every day at 9am" should fire if last run was yesterday
+        let yesterday = Utc::now() - chrono::Duration::hours(25);
+        assert!(should_run("every day at 9am", yesterday));
+    }
+
+    #[test]
+    fn test_parse_time_str() {
+        assert_eq!(parse_time_str("9am"), Some(9));
+        assert_eq!(parse_time_str("12pm"), Some(12));
+        assert_eq!(parse_time_str("12am"), Some(0));
+        assert_eq!(parse_time_str("6pm"), Some(18));
+        assert_eq!(parse_time_str("1pm"), Some(13));
+        assert_eq!(parse_time_str("14"), Some(14));
+        assert_eq!(parse_time_str("9:00am"), Some(9));
+        assert_eq!(parse_time_str("9:00 am"), Some(9));
+        assert_eq!(parse_time_str("09:00"), Some(9));
+        assert_eq!(parse_time_str("9:30am"), None);
+    }
+
+    #[test]
+    fn test_parse_schedule_weekly_aliases() {
+        match parse_schedule("weekly") {
+            Some(ParsedSchedule::Interval(d)) => {
+                assert_eq!(d, std::time::Duration::from_secs(7 * 86400));
+            }
+            _ => panic!("expected weekly interval"),
+        }
+        match parse_schedule("every week") {
+            Some(ParsedSchedule::Interval(d)) => {
+                assert_eq!(d, std::time::Duration::from_secs(7 * 86400));
+            }
+            _ => panic!("expected every week interval"),
+        }
+    }
+
+    #[test]
+    fn test_local_hour_to_utc() {
+        // Just verify it returns valid hours and doesn't panic
+        for h in 0..24 {
+            let utc = local_hour_to_utc(h);
+            assert!(utc < 24, "local_hour_to_utc({}) returned {}", h, utc);
+        }
+    }
+
+    #[test]
     fn test_parse_schedule_garbage() {
         assert!(parse_schedule("not a schedule").is_none());
     }
@@ -4054,12 +4961,14 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let prompt = render_prompt_with_port(&config, "body text", 3031, None, None);
         // User prompt contains time range and the "Execute" instruction
         assert!(prompt.contains("Time range:"));
-        assert!(prompt.contains("Execute the pipe now."));
+        assert!(prompt.contains("Do the work described above now."));
         // Port / body go into system prompt, not user prompt
         let sys = render_pipe_system_prompt("body text", 3031, None);
         assert!(sys.contains("http://localhost:3031"));
@@ -4084,6 +4993,8 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let sys = render_pipe_system_prompt("hello", 3030, None);
@@ -4107,6 +5018,8 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let sys = render_pipe_system_prompt("body text", 3030, Some("You are a helpful assistant"));
@@ -4132,11 +5045,20 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let sys = render_pipe_system_prompt("body text", 3030, None);
         assert!(!sys.contains("System prompt:"));
         assert!(sys.contains("body text"));
+    }
+
+    #[test]
+    fn test_system_prompt_contains_anti_recursion_warning() {
+        let sys = render_pipe_system_prompt("task body", 3030, None);
+        assert!(sys.contains("NEVER run `screenpipe pipe run`"));
+        assert!(sys.contains("You ARE this pipe"));
     }
 
     // -- PipeExecution / SchedulerState serde roundtrip ----------------------
@@ -4203,6 +5125,8 @@ mod tests {
                 source_slug: None,
                 installed_version: None,
                 source_hash: None,
+                subagent: false,
+                privacy_filter: false,
                 trigger: None,
             },
             last_run: None,
@@ -4309,5 +5233,428 @@ mod tests {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         assert!(!history, "history should default to false");
+    }
+
+    // -- frontmatter round-trip tests (trigger/duplicate detection) -----------
+
+    #[test]
+    fn test_roundtrip_minimal_config() {
+        let content = "---\nschedule: every 30m\nenabled: true\n---\n\nDo stuff";
+        let (config, body) = parse_frontmatter(content).unwrap();
+        assert_eq!(config.schedule, "every 30m");
+        assert!(config.enabled);
+        assert_eq!(body, "Do stuff");
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        let (config2, body2) = parse_frontmatter(&serialized).unwrap();
+        assert_eq!(config2.schedule, "every 30m");
+        assert!(config2.enabled);
+        assert_eq!(body2, "Do stuff");
+    }
+
+    #[test]
+    fn test_roundtrip_with_trigger() {
+        let content = "---\nschedule: manual\nenabled: true\ntrigger:\n  events:\n    - crm_update\n    - meeting_end\n  custom:\n    - when I open slack\n---\n\nHandle events";
+        let (config, body) = parse_frontmatter(content).unwrap();
+        assert_eq!(config.schedule, "manual");
+        let trigger = config.trigger.as_ref().unwrap();
+        assert_eq!(trigger.events, vec!["crm_update", "meeting_end"]);
+        assert_eq!(trigger.custom, vec!["when I open slack"]);
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+
+        // Must not contain duplicate trigger keys
+        let trigger_count = serialized.matches("trigger:").count();
+        assert_eq!(
+            trigger_count, 1,
+            "serialized YAML has duplicate 'trigger:' keys:\n{}",
+            serialized
+        );
+
+        // Round-trip must parse back identically
+        let (config2, body2) = parse_frontmatter(&serialized).unwrap();
+        assert_eq!(body2, "Handle events");
+        let trigger2 = config2.trigger.as_ref().unwrap();
+        assert_eq!(trigger2.events, vec!["crm_update", "meeting_end"]);
+        assert_eq!(trigger2.custom, vec!["when I open slack"]);
+    }
+
+    #[test]
+    fn test_roundtrip_trigger_none() {
+        let content = "---\nschedule: every 1h\nenabled: true\n---\n\nNo trigger";
+        let (config, body) = parse_frontmatter(content).unwrap();
+        assert!(config.trigger.is_none());
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        assert!(
+            !serialized.contains("trigger:"),
+            "trigger: should not appear when None:\n{}",
+            serialized
+        );
+
+        let (config2, _) = parse_frontmatter(&serialized).unwrap();
+        assert!(config2.trigger.is_none());
+    }
+
+    #[test]
+    fn test_no_duplicate_keys_all_fields() {
+        let content = "---\nschedule: every 2h\nenabled: true\nmodel: claude-haiku-4-5\nprovider: openai\npreset: my-preset\nconnections:\n  - slack\n  - gmail\ntimeout: 600\ntrigger:\n  events:\n    - test_event\nsource_slug: my-pipe\ninstalled_version: 5\nsource_hash: abc123\n---\n\nFull config";
+        let (config, body) = parse_frontmatter(content).unwrap();
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+
+        // Check no known field appears more than once
+        for field in &[
+            "schedule:",
+            "enabled:",
+            "model:",
+            "provider:",
+            "preset:",
+            "connections:",
+            "timeout:",
+            "trigger:",
+            "source_slug:",
+            "installed_version:",
+            "source_hash:",
+        ] {
+            let count = serialized.matches(field).count();
+            assert!(
+                count <= 1,
+                "field '{}' appears {} times in serialized YAML:\n{}",
+                field,
+                count,
+                serialized
+            );
+        }
+
+        // Must round-trip
+        let (config2, _) = parse_frontmatter(&serialized).unwrap();
+        assert_eq!(config2.schedule, "every 2h");
+        assert!(config2.trigger.is_some());
+        assert_eq!(config2.trigger.unwrap().events, vec!["test_event"]);
+    }
+
+    #[test]
+    fn test_trigger_in_extras_gets_cleaned() {
+        // Simulate the bug: trigger lands in both the struct field AND the extras HashMap
+        let content = "---\nschedule: every 1h\nenabled: true\n---\n\nTest";
+        let (mut config, body) = parse_frontmatter(content).unwrap();
+
+        // Set trigger on the struct
+        config.trigger = Some(TriggerConfig {
+            events: vec!["my_event".to_string()],
+            custom: vec![],
+        });
+
+        // Also sneak it into the extras HashMap (simulating the bug)
+        config.config.insert(
+            "trigger".to_string(),
+            serde_json::json!({"events": ["my_event"], "custom": []}),
+        );
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+
+        // serialize_pipe should have cleaned the duplicate from extras
+        let trigger_count = serialized.matches("trigger:").count();
+        assert_eq!(
+            trigger_count, 1,
+            "duplicate trigger: not cleaned from extras:\n{}",
+            serialized
+        );
+
+        // Must still parse correctly
+        let (config2, _) = parse_frontmatter(&serialized).unwrap();
+        let t = config2.trigger.unwrap();
+        assert_eq!(t.events, vec!["my_event"]);
+    }
+
+    #[test]
+    fn test_all_known_fields_cleaned_from_extras() {
+        let content = "---\nschedule: every 1h\nenabled: true\n---\n\nTest";
+        let (mut config, body) = parse_frontmatter(content).unwrap();
+
+        // Insert every known field into extras HashMap (worst case scenario)
+        config
+            .config
+            .insert("schedule".to_string(), serde_json::json!("every 2h"));
+        config
+            .config
+            .insert("enabled".to_string(), serde_json::json!(false));
+        config
+            .config
+            .insert("model".to_string(), serde_json::json!("gpt-4"));
+        config
+            .config
+            .insert("provider".to_string(), serde_json::json!("openai"));
+        config
+            .config
+            .insert("trigger".to_string(), serde_json::json!({"events": ["x"]}));
+        config
+            .config
+            .insert("connections".to_string(), serde_json::json!(["slack"]));
+        config
+            .config
+            .insert("timeout".to_string(), serde_json::json!(300));
+        config
+            .config
+            .insert("source_slug".to_string(), serde_json::json!("test"));
+        config
+            .config
+            .insert("installed_version".to_string(), serde_json::json!(1));
+        config
+            .config
+            .insert("source_hash".to_string(), serde_json::json!("abc"));
+        config
+            .config
+            .insert("preset".to_string(), serde_json::json!("my-preset"));
+        config
+            .config
+            .insert("name".to_string(), serde_json::json!("test-pipe"));
+        config
+            .config
+            .insert("config".to_string(), serde_json::json!({"old": true}));
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+
+        // Every known field should appear at most once
+        for field in &[
+            "schedule:",
+            "enabled:",
+            "model:",
+            "trigger:",
+            "connections:",
+            "timeout:",
+            "source_slug:",
+            "installed_version:",
+            "source_hash:",
+        ] {
+            let count = serialized.matches(field).count();
+            assert!(
+                count <= 1,
+                "field '{}' appears {} times after cleanup:\n{}",
+                field,
+                count,
+                serialized
+            );
+        }
+
+        // "config:" and "name:" should not appear at all (they're stripped)
+        assert!(
+            !serialized.contains("\nconfig:"),
+            "legacy 'config:' not cleaned:\n{}",
+            serialized
+        );
+        assert!(
+            !serialized.contains("\nname:"),
+            "'name:' should be stripped:\n{}",
+            serialized
+        );
+
+        // Must still parse without error
+        parse_frontmatter(&serialized).expect("round-trip parse failed after extras cleanup");
+    }
+
+    #[test]
+    fn test_update_config_trigger_does_not_leak_to_extras() {
+        // Simulate what update_config does when receiving a trigger update
+        let content = "---\nschedule: every 1h\nenabled: true\n---\n\nTest";
+        let (mut config, body) = parse_frontmatter(content).unwrap();
+
+        // Simulate the update_config match arm for "trigger"
+        let trigger_json =
+            serde_json::json!({"events": ["new_event"], "custom": ["when I open chrome"]});
+        match serde_json::from_value::<TriggerConfig>(trigger_json.clone()) {
+            Ok(t) => config.trigger = Some(t),
+            Err(_) => panic!("trigger deserialization should succeed"),
+        }
+
+        // Verify trigger is NOT in extras
+        assert!(
+            !config.config.contains_key("trigger"),
+            "trigger leaked into extras HashMap"
+        );
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        let trigger_count = serialized.matches("trigger:").count();
+        assert_eq!(trigger_count, 1, "trigger duplicated:\n{}", serialized);
+
+        let (config2, _) = parse_frontmatter(&serialized).unwrap();
+        let t = config2.trigger.unwrap();
+        assert_eq!(t.events, vec!["new_event"]);
+        assert_eq!(t.custom, vec!["when I open chrome"]);
+    }
+
+    #[test]
+    fn test_multiple_trigger_updates_no_accumulation() {
+        let content = "---\nschedule: manual\nenabled: true\ntrigger:\n  events:\n    - old_event\n---\n\nTest";
+        let (mut config, body) = parse_frontmatter(content).unwrap();
+
+        // Update trigger 3 times in a row
+        for i in 0..3 {
+            let trigger_json = serde_json::json!({"events": [format!("event_{}", i)]});
+            config.trigger = Some(serde_json::from_value::<TriggerConfig>(trigger_json).unwrap());
+
+            let serialized = serialize_pipe(&config, &body).unwrap();
+            let trigger_count = serialized.matches("trigger:").count();
+            assert_eq!(
+                trigger_count, 1,
+                "trigger duplicated on iteration {}:\n{}",
+                i, serialized
+            );
+
+            // Re-parse for next iteration (simulates read-modify-write cycle)
+            let (new_config, _) = parse_frontmatter(&serialized).unwrap();
+            config = new_config;
+        }
+
+        // Final state should have event_2
+        let t = config.trigger.unwrap();
+        assert_eq!(t.events, vec!["event_2"]);
+    }
+
+    #[test]
+    fn test_unknown_extra_fields_preserved() {
+        // Extra fields that are NOT known should survive round-trip
+        let content = "---\nschedule: every 1h\nenabled: true\nmy_custom_field: hello\nanother: 42\n---\n\nTest";
+        let (config, body) = parse_frontmatter(content).unwrap();
+        assert_eq!(
+            config
+                .config
+                .get("my_custom_field")
+                .and_then(|v| v.as_str()),
+            Some("hello")
+        );
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        let (config2, _) = parse_frontmatter(&serialized).unwrap();
+        assert_eq!(
+            config2
+                .config
+                .get("my_custom_field")
+                .and_then(|v| v.as_str()),
+            Some("hello")
+        );
+        assert_eq!(
+            config2.config.get("another").and_then(|v| v.as_i64()),
+            Some(42)
+        );
+    }
+
+    // -- sequential pipe execution tests ------------------------------------
+
+    #[tokio::test]
+    async fn test_semaphore_serializes_scheduled_pipes() {
+        // Simulates 3 scheduled pipes acquiring the semaphore.
+        // They should run one at a time, not in parallel.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let active_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let max_concurrent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let sem = semaphore.clone();
+            let active = active_count.clone();
+            let max = max_concurrent.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                // Update max if this is the highest we've seen
+                max.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                // Simulate pipe execution
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Max concurrent should be 1 — pipes ran sequentially
+        assert_eq!(
+            max_concurrent.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "scheduled pipes should run sequentially (max concurrent = 1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_triggered_bypasses_semaphore() {
+        // Simulates 1 scheduled pipe holding the semaphore while an
+        // event-triggered pipe starts without waiting.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let event_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scheduled_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let sem = semaphore.clone();
+        let sched_flag = scheduled_running.clone();
+        let event_flag = event_started.clone();
+
+        // Scheduled pipe: holds permit for 200ms
+        let scheduled = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            sched_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            sched_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // Give the scheduled pipe time to acquire the permit
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(scheduled_running.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Event-triggered pipe: skips semaphore (None permit)
+        let event = tokio::spawn(async move {
+            // Event pipes don't acquire the semaphore
+            let _permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            event_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        event.await.unwrap();
+
+        // Event pipe should have started while scheduled pipe was still running
+        assert!(
+            event_started.load(std::sync::atomic::Ordering::SeqCst),
+            "event-triggered pipe should start immediately without waiting for semaphore"
+        );
+        assert!(
+            scheduled_running.load(std::sync::atomic::Ordering::SeqCst),
+            "scheduled pipe should still be running when event pipe completes"
+        );
+
+        scheduled.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_queued_set_prevents_double_queue() {
+        let queued: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
+        // First queue attempt should succeed
+        {
+            let mut qr = queued.lock().await;
+            assert!(
+                qr.insert("my-pipe".to_string()),
+                "first insert should succeed"
+            );
+        }
+
+        // Second queue attempt should be blocked
+        {
+            let qr = queued.lock().await;
+            assert!(qr.contains("my-pipe"), "pipe should be in queued set");
+        }
+
+        // After removal, should be queueable again
+        {
+            let mut qr = queued.lock().await;
+            qr.remove("my-pipe");
+        }
+        {
+            let mut qr = queued.lock().await;
+            assert!(
+                qr.insert("my-pipe".to_string()),
+                "should be queueable after removal"
+            );
+        }
     }
 }

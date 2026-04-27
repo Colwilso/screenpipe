@@ -16,39 +16,97 @@ use tracing::{debug, error, info, warn};
 const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.60.0";
 pub const SCREENPIPE_API_URL: &str = "http://localhost:4000/v1";
 
-/// Returns the screenpipe cloud models array as a serde_json::Value.
-/// Shared between server-side pipe executor and desktop Pi chat so the
-/// model list stays in sync.
-/// Full model catalog matching the Cloudflare Worker gateway.
-/// Must stay in sync with packages/ai-gateway/src/handlers/models.ts.
-pub fn screenpipe_cloud_models() -> serde_json::Value {
+/// Fetch the model catalog from the Cloudflare Worker gateway and convert
+/// it into the format Pi's `models.json` expects.
+///
+/// The gateway (`/v1/models`) is the single source of truth. On failure
+/// (offline, timeout, gateway down) we fall back to a minimal hardcoded list
+/// so the app still works without network.
+pub async fn screenpipe_cloud_models(api_url: &str, token: Option<&str>) -> serde_json::Value {
+    match fetch_models_from_gateway(api_url, token).await {
+        Some(models) => models,
+        None => {
+            warn!("failed to fetch models from gateway, using fallback list");
+            fallback_cloud_models()
+        }
+    }
+}
+
+/// Fetch models from the gateway and transform into Pi's format.
+async fn fetch_models_from_gateway(
+    api_url: &str,
+    token: Option<&str>,
+) -> Option<serde_json::Value> {
+    let url = format!("{}/models", api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let mut req = client.get(&url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        warn!("gateway /v1/models returned {}", resp.status());
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let data = body.get("data")?.as_array()?;
+
+    let models: Vec<serde_json::Value> = data
+        .iter()
+        .map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+            let ctx = m
+                .get("context_window")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(128000);
+            let intelligence = m
+                .get("intelligence")
+                .and_then(|v| v.as_str())
+                .unwrap_or("standard");
+            let reasoning = intelligence == "highest" || intelligence == "high";
+
+            // Determine input modalities from best_for/tags
+            let best_for = m.get("best_for").and_then(|v| v.as_array());
+            let has_vision = best_for
+                .map(|arr| {
+                    arr.iter()
+                        .any(|v| v.as_str().map_or(false, |s| s.contains("vision")))
+                })
+                .unwrap_or(false);
+            let input = if has_vision {
+                json!(["text", "image"])
+            } else {
+                json!(["text"])
+            };
+
+            json!({
+                "id": id,
+                "name": name,
+                "reasoning": reasoning,
+                "input": input,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "contextWindow": ctx,
+                "maxTokens": 32000,
+            })
+        })
+        .collect();
+
+    info!("fetched {} models from gateway", models.len());
+    Some(json!(models))
+}
+
+/// Minimal fallback when the gateway is unreachable.
+/// Only auto — if the gateway is down, nothing works anyway.
+fn fallback_cloud_models() -> serde_json::Value {
     json!([
-        // ── Auto — smart routing with fallback (gateway resolves to best free model) ──
         {"id": "auto", "name": "Auto (recommended)", "reasoning": true, "input": ["text", "image"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
-        // ── Free models (Vertex AI MaaS — GCP credits, free for users) ──
-        {"id": "glm-4.7", "name": "GLM-4.7", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 200000, "maxTokens": 32000},
-        {"id": "glm-5", "name": "GLM-5", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
-        {"id": "kimi-k2.5", "name": "Kimi K2.5", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
-        {"id": "llama-4-maverick", "name": "Llama 4 Maverick (Vision)", "reasoning": true, "input": ["text", "image"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 524000, "maxTokens": 8192},
-        {"id": "llama-4-scout", "name": "Llama 4 Scout (Vision)", "reasoning": false, "input": ["text", "image"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 512000, "maxTokens": 8192},
-        // ── Free models (OpenRouter / Gemini) ──
-        {"id": "qwen/qwen3-coder:free", "name": "Qwen3 Coder 480B", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 262000, "maxTokens": 32000},
-        {"id": "stepfun/step-3.5-flash:free", "name": "Step 3.5 Flash", "reasoning": false, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 256000, "maxTokens": 32000},
-        {"id": "gemini-3-flash", "name": "Gemini 3 Flash", "reasoning": false, "input": ["text", "image"], "cost": {"input": 0.10, "output": 0.40, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 65536},
-        {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "reasoning": false, "input": ["text", "image"], "cost": {"input": 0.075, "output": 0.30, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 65536},
-        // ── Anthropic ──
-        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "reasoning": true, "input": ["text", "image"], "cost": {"input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75}, "contextWindow": 200000, "maxTokens": 32000},
-        {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "reasoning": true, "input": ["text", "image"], "cost": {"input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75}, "contextWindow": 200000, "maxTokens": 64000},
-        {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "reasoning": true, "input": ["text", "image"], "cost": {"input": 0.8, "output": 4, "cacheRead": 0.08, "cacheWrite": 1}, "contextWindow": 200000, "maxTokens": 64000},
-        // ── OpenRouter ──
-        {"id": "qwen/qwen3.5-flash-02-23", "name": "Qwen3.5 Flash", "reasoning": false, "input": ["text"], "cost": {"input": 0.065, "output": 0.26, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 32000},
-        {"id": "deepseek/deepseek-chat", "name": "DeepSeek V3.2", "reasoning": true, "input": ["text"], "cost": {"input": 0.26, "output": 0.38, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
-        {"id": "deepseek/deepseek-v3.2-speciale", "name": "DeepSeek V3.2 Speciale", "reasoning": true, "input": ["text"], "cost": {"input": 2.19, "output": 8.76, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
-        {"id": "qwen/qwen3.5-397b-a17b", "name": "Qwen3.5 397B", "reasoning": true, "input": ["text", "image"], "cost": {"input": 1.50, "output": 3.00, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 131000, "maxTokens": 32000},
-        {"id": "meta-llama/llama-4-scout", "name": "Llama 4 Scout", "reasoning": false, "input": ["text"], "cost": {"input": 0.11, "output": 0.34, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 512000, "maxTokens": 32000},
-        {"id": "meta-llama/llama-4-maverick", "name": "Llama 4 Maverick", "reasoning": true, "input": ["text"], "cost": {"input": 0.50, "output": 0.77, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 256000, "maxTokens": 32000},
-        // ── Google ──
-        {"id": "gemini-3.1-pro", "name": "Gemini 3.1 Pro", "reasoning": true, "input": ["text", "image"], "cost": {"input": 1.25, "output": 10.00, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 65536},
     ])
 }
 
@@ -58,6 +116,10 @@ pub struct PiExecutor {
     pub user_token: Option<String>,
     /// Screenpipe API base URL (default: `https://api.screenpi.pe/v1`).
     pub api_url: String,
+    /// Bearer token for the *local* screenpipe-server API (localhost:3030).
+    /// Exposed to the Pi subprocess as `SCREENPIPE_API_AUTH_KEY` so bash tool
+    /// calls against the local server can authenticate. None = auth disabled.
+    pub api_auth_key: Option<String>,
 }
 
 impl PiExecutor {
@@ -65,7 +127,15 @@ impl PiExecutor {
         Self {
             user_token,
             api_url: SCREENPIPE_API_URL.to_string(),
+            api_auth_key: None,
         }
+    }
+
+    /// Attach the local server's api_auth_key so Pi's bash tool can include
+    /// `Authorization: Bearer ...` on localhost:3030 calls.
+    pub fn with_api_auth_key(mut self, key: Option<String>) -> Self {
+        self.api_auth_key = key.filter(|k| !k.is_empty());
+        self
     }
 
     /// Ensure screenpipe skills exist in `project_dir/.pi/skills/`.
@@ -151,6 +221,7 @@ impl PiExecutor {
         use crate::pipes::permissions::PipePermissions;
         let perms = PipePermissions::from_config(config);
 
+        #[allow(clippy::type_complexity)]
         let all_skills: &[(&str, &str, Box<dyn Fn(&PipePermissions) -> bool>)] = &[
             (
                 "screenpipe-api",
@@ -220,6 +291,24 @@ impl PiExecutor {
         Ok(())
     }
 
+    /// Install or remove the sub-agent extension based on the `subagent` frontmatter flag.
+    /// When enabled, the agent can spawn parallel child pi processes via
+    /// `sub-agent run "prompt"` bash commands.
+    pub fn ensure_subagent_extension(project_dir: &Path, enabled: bool) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        let ext_path = ext_dir.join("sub-agent.ts");
+        if enabled {
+            std::fs::create_dir_all(&ext_dir)?;
+            let ext_content = include_str!("../../assets/extensions/sub-agent.ts");
+            std::fs::write(&ext_path, ext_content)?;
+            info!("sub-agent extension installed at {:?}", ext_path);
+        } else if ext_path.exists() {
+            std::fs::remove_file(&ext_path)?;
+            info!("sub-agent extension removed");
+        }
+        Ok(())
+    }
+
     /// Install or remove the web-search extension based on provider and offline mode.
     /// Web search uses the screenpipe cloud backend, so we only enable it
     /// for screenpipe-cloud to avoid sending data to our backend when the
@@ -263,7 +352,7 @@ impl PiExecutor {
     /// When a pipe uses a non-screenpipe provider (e.g. ollama, openai), pass
     /// the resolved `provider`, `model`, and optional `provider_url` so the
     /// corresponding entry is written to `models.json`.
-    pub fn ensure_pi_config(
+    pub async fn ensure_pi_config(
         user_token: Option<&str>,
         api_url: &str,
         provider: Option<&str>,
@@ -291,10 +380,10 @@ impl PiExecutor {
             json!({"providers": {}})
         };
         // Ensure providers key exists and is an object
-        if !models_config
+        if models_config
             .get("providers")
             .and_then(|p| p.as_object())
-            .is_some()
+            .is_none()
         {
             models_config = json!({"providers": {}});
         }
@@ -323,12 +412,13 @@ impl PiExecutor {
                 .or_else(|| std::env::var("SCREENPIPE_API_KEY").ok())
                 .unwrap_or_else(|| "SCREENPIPE_API_KEY".to_string());
             let api_key_value = api_key_value.as_str();
+            let models = screenpipe_cloud_models(api_url, user_token).await;
             let screenpipe_provider = json!({
                 "baseUrl": api_url,
                 "api": "openai-completions",
                 "apiKey": api_key_value,
                 "authHeader": true,
-                "models": screenpipe_cloud_models()
+                "models": models
             });
 
             if let Some(providers) = models_config
@@ -467,31 +557,18 @@ impl PiExecutor {
         Ok(())
     }
 
-    /// Resolve a model name for the screenpipe provider by stripping date suffixes
-    /// (e.g. "claude-haiku-4-5@20251001" → "claude-haiku-4-5") to match the cloud
-    /// model list. Passthrough for non-screenpipe providers.
+    /// Resolve a model name by stripping date suffixes
+    /// (e.g. "claude-haiku-4-5@20251001" → "claude-haiku-4-5").
+    /// Passthrough for non-screenpipe providers.
     fn resolve_model(requested: &str, provider: &str) -> String {
         if provider != "screenpipe" {
             return requested.to_string();
         }
-        let models = screenpipe_cloud_models();
-        // Exact match → use as-is
-        if models
-            .as_array()
-            .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(requested)))
-            .unwrap_or(false)
-        {
-            return requested.to_string();
-        }
-        // Strip @date suffix and try again
+        // Strip @date suffix if present — the gateway validates the model ID
         if let Some(base) = requested.split('@').next() {
-            if models
-                .as_array()
-                .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(base)))
-                .unwrap_or(false)
-            {
+            if base != requested {
                 warn!(
-                    "model '{}' not in cloud list, resolved to '{}'",
+                    "model '{}' has @date suffix, resolved to '{}'",
                     requested, base
                 );
                 return base.to_string();
@@ -510,7 +587,7 @@ impl PiExecutor {
         working_dir: &Path,
         resolved_provider: &str,
         provider_api_key: Option<&str>,
-        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        shared_pid: Option<super::SharedPid>,
         continue_session: bool,
         pipe_system_prompt: Option<&str>,
     ) -> Result<AgentOutput> {
@@ -567,6 +644,18 @@ impl PiExecutor {
             }
         }
 
+        // Local server bearer token — kept separate from cloud keys so it
+        // flows even in offline mode (the local server is always localhost).
+        if let Some(ref key) = self.api_auth_key {
+            cmd.env("SCREENPIPE_API_AUTH_KEY", key);
+        }
+
+        // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
+        // shim sourced from $BASH_ENV on every subshell. See bash_env.rs.
+        if let Ok(p) = crate::agents::bash_env::ensure_wrapper_in_default_dir() {
+            cmd.env("BASH_ENV", p);
+        }
+
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -588,10 +677,9 @@ impl PiExecutor {
         let child = cmd.spawn()?;
         let pid = child.id();
 
-        if let Some(tx) = pid_tx {
-            if let Some(p) = pid {
-                let _ = tx.send(p);
-            }
+        // Set PID synchronously — no async race
+        if let (Some(ref sp), Some(p)) = (&shared_pid, pid) {
+            sp.store(p, std::sync::atomic::Ordering::SeqCst);
         }
 
         let output = child.wait_with_output().await?;
@@ -620,7 +708,7 @@ impl PiExecutor {
         working_dir: &Path,
         resolved_provider: &str,
         provider_api_key: Option<&str>,
-        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        shared_pid: Option<super::SharedPid>,
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
         continue_session: bool,
         pipe_system_prompt: Option<&str>,
@@ -680,6 +768,17 @@ impl PiExecutor {
             }
         }
 
+        // Local server bearer token — unaffected by offline mode.
+        if let Some(ref key) = self.api_auth_key {
+            cmd.env("SCREENPIPE_API_AUTH_KEY", key);
+        }
+
+        // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
+        // shim sourced from $BASH_ENV on every subshell. See bash_env.rs.
+        if let Ok(p) = crate::agents::bash_env::ensure_wrapper_in_default_dir() {
+            cmd.env("BASH_ENV", p);
+        }
+
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -700,10 +799,9 @@ impl PiExecutor {
         let mut child = cmd.spawn()?;
         let pid = child.id();
 
-        if let Some(tx) = pid_tx {
-            if let Some(p) = pid {
-                let _ = tx.send(p);
-            }
+        // Set PID synchronously — no async race
+        if let (Some(ref sp), Some(p)) = (&shared_pid, pid) {
+            sp.store(p, std::sync::atomic::Ordering::SeqCst);
         }
 
         // Take stdout for streaming reads; stderr will be read after exit
@@ -806,7 +904,7 @@ impl AgentExecutor for PiExecutor {
         provider: Option<&str>,
         provider_url: Option<&str>,
         provider_api_key: Option<&str>,
-        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        shared_pid: Option<super::SharedPid>,
         continue_session: bool,
     ) -> Result<AgentOutput> {
         Self::ensure_pi_config(
@@ -815,7 +913,8 @@ impl AgentExecutor for PiExecutor {
             provider,
             Some(model),
             provider_url,
-        )?;
+        )
+        .await?;
         // Use filtered skills if permissions are configured, unfiltered otherwise
         Self::ensure_screenpipe_skill_auto(working_dir)?;
 
@@ -848,7 +947,7 @@ impl AgentExecutor for PiExecutor {
                 working_dir,
                 &resolved_provider,
                 provider_api_key,
-                pid_tx,
+                shared_pid.clone(),
                 continue_session,
                 None, // no pipe system prompt for trait-based calls
             )
@@ -870,7 +969,8 @@ impl AgentExecutor for PiExecutor {
                 provider,
                 Some(&resolved_model),
                 provider_url,
-            )?;
+            )
+            .await?;
             return self
                 .spawn_pi(
                     &pi_path,
@@ -897,7 +997,7 @@ impl AgentExecutor for PiExecutor {
         provider: Option<&str>,
         provider_url: Option<&str>,
         provider_api_key: Option<&str>,
-        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        shared_pid: Option<super::SharedPid>,
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
         continue_session: bool,
         pipe_system_prompt: Option<&str>,
@@ -911,7 +1011,8 @@ impl AgentExecutor for PiExecutor {
             provider,
             Some(&resolved_model),
             provider_url,
-        )?;
+        )
+        .await?;
         // Use filtered skills if permissions are configured, unfiltered otherwise
         Self::ensure_screenpipe_skill_auto(working_dir)?;
         Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
@@ -937,7 +1038,7 @@ impl AgentExecutor for PiExecutor {
                 working_dir,
                 &resolved_provider,
                 provider_api_key,
-                pid_tx,
+                shared_pid.clone(),
                 line_tx.clone(),
                 continue_session,
                 pipe_system_prompt,
@@ -959,7 +1060,8 @@ impl AgentExecutor for PiExecutor {
                 provider,
                 Some(&resolved_model),
                 provider_url,
-            )?;
+            )
+            .await?;
             return self
                 .spawn_pi_streaming(
                     &pi_path,
@@ -1349,11 +1451,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
         }
 
         // Prevent console window flash on Windows
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        cmd.creation_flags(0x08000000);
 
         cmd
     }
@@ -1789,8 +1887,8 @@ mod tests {
         assert_eq!(lines[1], "OK");
     }
 
-    #[test]
-    fn test_ensure_pi_config_adds_ollama_provider() {
+    #[tokio::test]
+    async fn test_ensure_pi_config_adds_ollama_provider() {
         // Call ensure_pi_config with ollama provider info
         PiExecutor::ensure_pi_config(
             None,
@@ -1799,6 +1897,7 @@ mod tests {
             Some("qwen3:8b"),
             Some("http://localhost:11434/v1"),
         )
+        .await
         .expect("ensure_pi_config should succeed");
 
         // Read models.json and verify ollama provider was added

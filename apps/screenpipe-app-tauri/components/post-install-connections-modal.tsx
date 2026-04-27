@@ -14,12 +14,16 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Check, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Loader2, Lock } from "lucide-react";
+import { commands } from "@/lib/utils/tauri";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   ConnectionCredentialForm,
   IntegrationIcon,
   IntegrationInfo,
 } from "@/components/settings/connections-section";
+import { localFetch } from "@/lib/api";
 
 interface PostInstallConnectionsModalProps {
   open: boolean;
@@ -40,6 +44,8 @@ export function PostInstallConnectionsModal({
   pipeName,
   connections,
 }: PostInstallConnectionsModalProps) {
+  const { settings } = useSettings();
+  const isPro = !!settings.user?.cloud_subscribed;
   const [statuses, setStatuses] = useState<Record<string, ConnectionStatus>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -51,15 +57,39 @@ export function PostInstallConnectionsModal({
       setLoading(true);
       try {
         // Fetch all available integrations
-        const res = await fetch("http://localhost:3030/connections");
+        const res = await localFetch("/connections");
         const data = await res.json();
         const integrations: IntegrationInfo[] = data.data || [];
 
         const newStatuses: Record<string, ConnectionStatus> = {};
 
         for (const connId of connections) {
-          const integration = integrations.find((i) => i.id === connId) || null;
-          const configured = integration?.connected ?? false;
+          // support instance keys like "notion:crm" — match on base id
+          const baseId = connId.includes(":") ? connId.split(":")[0] : connId;
+          const instanceName = connId.includes(":") ? connId.split(":").slice(1).join(":") : null;
+          const integration = integrations.find((i) => i.id === baseId) || null;
+
+          let configured = integration?.connected ?? false;
+
+          // for non-OAuth named instances, check the specific instance status
+          if (integration && instanceName && !integration.is_oauth) {
+            try {
+              const instRes = await localFetch(
+                `/connections/${baseId}/instances`
+              );
+              if (instRes.ok) {
+                const instData = await instRes.json();
+                const instances: { instance: string; enabled: boolean }[] =
+                  instData.instances || [];
+                const inst = instances.find((i) => i.instance === instanceName);
+                // only override if the instance was actually found
+                if (inst) configured = inst.enabled;
+              }
+            } catch {
+              // fall back to base integration status
+            }
+          }
+
           newStatuses[connId] = {
             integration,
             configured,
@@ -94,6 +124,30 @@ export function PostInstallConnectionsModal({
       (c) => c !== connId && !statuses[c]?.configured
     );
     setExpanded(nextUnconfigured || null);
+  };
+
+  const handleOAuthConnect = async (connId: string, integrationId: string) => {
+    setStatuses((prev) => ({
+      ...prev,
+      [connId]: { ...prev[connId], loading: true },
+    }));
+
+    try {
+      const res = await commands.oauthConnect(integrationId, null);
+      if (res.status === "ok" && res.data.connected) {
+        handleSaved(connId);
+      } else {
+        setStatuses((prev) => ({
+          ...prev,
+          [connId]: { ...prev[connId], loading: false },
+        }));
+      }
+    } catch {
+      setStatuses((prev) => ({
+        ...prev,
+        [connId]: { ...prev[connId], loading: false },
+      }));
+    }
   };
 
   const allConfigured = connections.every((c) => statuses[c]?.configured);
@@ -141,16 +195,21 @@ export function PostInstallConnectionsModal({
                         <div className="w-5 h-5 rounded-full border-2 border-muted-foreground/30" />
                       )}
                       {status?.configured && (
-                        <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-green-500 flex items-center justify-center">
-                          <Check className="h-2 w-2 text-white" />
+                        <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-foreground flex items-center justify-center">
+                          <Check className="h-2 w-2 text-background" />
                         </div>
                       )}
                     </div>
                     <span className="text-xs font-medium flex-1">
                       {integration?.name || connId}
+                      {connId.includes(":") && (
+                        <span className="text-muted-foreground font-normal ml-1">
+                          ({connId.split(":").slice(1).join(":")})
+                        </span>
+                      )}
                     </span>
                     {status?.configured ? (
-                      <span className="text-[10px] text-green-600">
+                      <span className="text-[10px] text-foreground">
                         configured
                       </span>
                     ) : (
@@ -165,7 +224,7 @@ export function PostInstallConnectionsModal({
                     )}
                   </button>
 
-                  {isExpanded && integration && (
+                  {isExpanded && integration && integration.fields.length > 0 && (
                     <div className="px-3 pb-3 border-t border-border pt-3">
                       <ConnectionCredentialForm
                         integrationId={integration.id}
@@ -175,6 +234,49 @@ export function PostInstallConnectionsModal({
                         }
                         onSaved={() => handleSaved(connId)}
                       />
+                    </div>
+                  )}
+
+                  {isExpanded && integration && integration.is_oauth && (
+                    <div className="px-3 pb-3 border-t border-border pt-3">
+                      {!isPro && !status?.configured ? (
+                        <div className="flex flex-col gap-1.5">
+                          <Button disabled size="sm" className="gap-1.5 text-xs opacity-60">
+                            <Lock className="h-3 w-3" />pro required
+                          </Button>
+                          <button
+                            onClick={() => openUrl("https://screenpi.pe/onboarding")}
+                            className="text-[10px] text-muted-foreground hover:text-foreground underline"
+                          >
+                            upgrade to pro to connect
+                          </button>
+                        </div>
+                      ) : (
+                        <Button
+                          size="sm"
+                          className="text-xs"
+                          disabled={status?.loading}
+                          onClick={() => handleOAuthConnect(connId, integration.id)}
+                        >
+                          {status?.loading ? (
+                            <>
+                              <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                              connecting...
+                            </>
+                          ) : (
+                            <>connect with {integration.name}</>
+                          )}
+                        </Button>
+                      )}
+                    </div>
+                  )}
+
+                  {isExpanded && integration && !integration.is_oauth && integration.fields.length === 0 && (
+                    <div className="px-3 pb-3 border-t border-border pt-3">
+                      <p className="text-xs text-muted-foreground">
+                        connect {integration.name} in{" "}
+                        <strong>settings &gt; connections</strong> then come back here.
+                      </p>
                     </div>
                   )}
 

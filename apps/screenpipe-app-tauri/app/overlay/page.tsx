@@ -4,7 +4,7 @@
 
 "use client";
 
-import { getStore, useSettings } from "@/lib/hooks/use-settings";
+import { getStore, saveAndEncrypt, useSettings } from "@/lib/hooks/use-settings";
 
 import React, { useEffect, useState, useRef, useCallback, ErrorInfo } from "react";
 import NotificationHandler from "@/components/notification-handler";
@@ -12,6 +12,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { useOnboarding } from "@/lib/hooks/use-onboarding";
 import { checkFirstRunNotification } from "@/lib/notifications";
 import { ChangelogDialog } from "@/components/changelog-dialog";
+import { localFetch } from "@/lib/api";
 
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 
@@ -25,7 +26,7 @@ import Timeline from "@/components/rewind/timeline";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { RefreshCw, AlertTriangle, WifiOff, Upload, Loader, Check, Calendar, X } from "lucide-react";
-import { NotificationBell } from "@/components/notification-bell";
+
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import { getVersion } from "@tauri-apps/api/app";
@@ -181,7 +182,7 @@ export default function OverlayPage() {
     const autoInitSync = async () => {
       try {
         // Check if sync is already running
-        const resp = await fetch("http://localhost:3030/sync/status");
+        const resp = await localFetch("/sync/status");
         if (resp.ok) {
           const data = await resp.json();
           if (data.enabled) return; // Already running
@@ -209,7 +210,7 @@ export default function OverlayPage() {
           try {
             const store = await getStore();
             await store.set("sync_password", password);
-            await store.save();
+            await saveAndEncrypt(store);
             localStorage.removeItem("sync_password");
             console.log("migrated sync password from localStorage to store.bin");
           } catch {
@@ -346,11 +347,6 @@ export default function OverlayPage() {
       {/* Transparent titlebar area - no drag region to prevent accidental window moves */}
       <div className="h-8 bg-gradient-to-b from-black/15 to-transparent w-full fixed top-0 left-0 z-[1000] pointer-events-none" />
 
-      {/* Notification bell - top right */}
-      <div className="fixed top-2 right-3 z-[1001]">
-        <NotificationBell />
-      </div>
-      
       <NotificationHandler />
       <PermissionBanner />
       {/* Only render content after settings are loaded */}

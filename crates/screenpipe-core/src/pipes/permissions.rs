@@ -169,6 +169,20 @@ pub struct PipePermissions {
     /// extension will block all curl commands to non-localhost URLs.
     #[serde(default)]
     pub offline_mode: bool,
+
+    /// Absolute path to this pipe's working directory.
+    /// Used for filesystem sandboxing — pipes can only write within this directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe_dir: Option<String>,
+
+    /// Mirrors `PipeConfig.privacy_filter`. When true, the `/search`
+    /// handler force-sets `query.filter_pii = true` for any request
+    /// carrying this pipe's bearer token, regardless of what the
+    /// request payload says. The pipe's LLM agent has no schema-level
+    /// way to bypass this — enforcement is server-side via the same
+    /// token plumbing used for endpoint allow/deny rules.
+    #[serde(default)]
+    pub privacy_filter: bool,
 }
 
 impl PipePermissions {
@@ -189,6 +203,8 @@ impl PipePermissions {
             days,
             pipe_token: None,
             offline_mode: crate::offline::is_offline_mode(),
+            pipe_dir: None,
+            privacy_filter: config.privacy_filter,
         }
     }
 
@@ -248,15 +264,13 @@ impl PipePermissions {
         // Default allowlist
         if self.use_default_allowlist {
             for pattern in DEFAULT_ALLOWED_ENDPOINTS {
-                if let Some(rule) = parse_bare_api(pattern) {
-                    if let PermissionRule::Api {
-                        method: rm,
-                        path: rp,
-                    } = &rule
-                    {
-                        if (rm == "*" || rm == &m) && glob_match(rp, path) {
-                            return true;
-                        }
+                if let Some(PermissionRule::Api {
+                    method: rm,
+                    path: rp,
+                }) = parse_bare_api(pattern)
+                {
+                    if (rm == "*" || rm == m) && glob_match(&rp, path) {
+                        return true;
                     }
                 }
             }
@@ -617,6 +631,8 @@ mod tests {
             days: None,
             pipe_token: None,
             offline_mode: false,
+            pipe_dir: None,
+            privacy_filter: false,
         }
     }
 
@@ -866,6 +882,8 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
             config: std::collections::HashMap::new(),
         };
@@ -891,6 +909,8 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
             config: std::collections::HashMap::new(),
         };
@@ -928,6 +948,8 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
             config: std::collections::HashMap::new(),
         };
@@ -978,6 +1000,8 @@ mod tests {
             source_slug: None,
             installed_version: None,
             source_hash: None,
+            subagent: false,
+            privacy_filter: false,
             trigger: None,
             config: std::collections::HashMap::new(),
         };

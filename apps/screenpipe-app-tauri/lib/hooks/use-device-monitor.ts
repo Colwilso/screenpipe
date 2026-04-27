@@ -4,6 +4,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { localFetch } from "@/lib/api";
 import { useSettings } from "./use-settings";
 
 interface DiscoveredHost {
@@ -89,10 +90,12 @@ async function fetchWithTimeout(
   }
 }
 
-async function remotePost(address: string, path: string, body?: object) {
+async function remotePost(address: string, path: string, body?: object, authToken?: string) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
   const res = await fetchWithTimeout(`http://${address}${path}`, FETCH_TIMEOUT_MS, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
@@ -100,6 +103,10 @@ async function remotePost(address: string, path: string, body?: object) {
     throw new Error(`${res.status}: ${text.slice(0, 200)}`);
   }
   return res.json().catch(() => ({}));
+}
+
+function authHeaders(token?: string): Record<string, string> {
+  return token ? { "Authorization": `Bearer ${token}` } : {};
 }
 
 export function useDeviceMonitor() {
@@ -118,14 +125,31 @@ export function useDeviceMonitor() {
   // Stable key for effect dependency
   const deviceKey = registeredDevices.map((d) => d.address).sort().join(",");
 
+  const apiKey = settings.user?.api_key || settings.user?.token;
+
+  const localHealthFetch = useCallback(
+    async (timeoutMs: number): Promise<Response> => {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await localFetch("/health", { signal: controller.signal });
+      } finally {
+        clearTimeout(id);
+      }
+    },
+    []
+  );
+
   const pollDevice = useCallback(
     async (address: string, label?: string): Promise<DeviceMonitorData> => {
       try {
+        const headers = authHeaders(apiKey ?? undefined);
         const [healthRes, pipesRes] = await Promise.all([
-          fetchWithTimeout(`http://${address}/health`, FETCH_TIMEOUT_MS),
+          fetchWithTimeout(`http://${address}/health`, FETCH_TIMEOUT_MS, { headers }),
           fetchWithTimeout(
             `http://${address}/pipes?include_executions=true`,
-            FETCH_TIMEOUT_MS
+            FETCH_TIMEOUT_MS,
+            { headers }
           ),
         ]);
 
@@ -179,7 +203,7 @@ export function useDeviceMonitor() {
     // Fetch local machine identity to filter self from device list
     (async () => {
       try {
-        const res = await fetchWithTimeout("http://localhost:3030/health", 3_000);
+        const res = await localHealthFetch(3_000);
         if (res.ok) {
           const h: HealthResponse = await res.json();
           localHostname = h.hostname?.toLowerCase() || null;
@@ -240,7 +264,7 @@ export function useDeviceMonitor() {
       clearInterval(timer);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deviceKey, pollDevice]);
+  }, [deviceKey, localHealthFetch, pollDevice]);
 
   // Clean up localhost entries and deduplicate devices by health fingerprint
   useEffect(() => {
@@ -306,20 +330,20 @@ export function useDeviceMonitor() {
 
   // Remote control actions
   const runPipe = useCallback(async (address: string, pipeName: string) => {
-    await remotePost(address, `/pipes/${encodeURIComponent(pipeName)}/run`);
-  }, []);
+    await remotePost(address, `/pipes/${encodeURIComponent(pipeName)}/run`, undefined, apiKey ?? undefined);
+  }, [apiKey]);
 
   const stopPipe = useCallback(async (address: string, pipeName: string) => {
-    await remotePost(address, `/pipes/${encodeURIComponent(pipeName)}/stop`);
-  }, []);
+    await remotePost(address, `/pipes/${encodeURIComponent(pipeName)}/stop`, undefined, apiKey ?? undefined);
+  }, [apiKey]);
 
   const enablePipe = useCallback(
     async (address: string, pipeName: string, enabled: boolean) => {
       await remotePost(address, `/pipes/${encodeURIComponent(pipeName)}/enable`, {
         enabled,
-      });
+      }, apiKey ?? undefined);
     },
-    []
+    [apiKey]
   );
 
   // Fetch full execution history for a specific pipe
@@ -354,7 +378,7 @@ export function useDeviceMonitor() {
       // Get local hostname to filter out self
       let localHostname: string | null = null;
       try {
-        const localRes = await fetchWithTimeout("http://localhost:3030/health", 2_000);
+        const localRes = await localHealthFetch(2_000);
         if (localRes.ok) {
           const localHealth: HealthResponse = await localRes.json();
           localHostname = localHealth.hostname || null;
@@ -420,21 +444,12 @@ export function useDeviceMonitor() {
       // Also fingerprint local machine to filter self
       let localFingerprint: string | null = null;
       try {
-        const localRes = await fetchWithTimeout("http://localhost:3333/health", 2_000);
+        const localRes = await localHealthFetch(2_000);
         if (localRes.ok) {
           const lh: HealthResponse = await localRes.json();
           localFingerprint = fingerprint(lh);
         }
       } catch { /* try other port */ }
-      if (!localFingerprint) {
-        try {
-          const localRes = await fetchWithTimeout("http://localhost:3030/health", 2_000);
-          if (localRes.ok) {
-            const lh: HealthResponse = await localRes.json();
-            localFingerprint = fingerprint(lh);
-          }
-        } catch { /* no local instance */ }
-      }
 
       const seenFingerprints = new Set<string>();
       if (localFingerprint) seenFingerprints.add(localFingerprint);
@@ -471,7 +486,7 @@ export function useDeviceMonitor() {
     } finally {
       setDiscovering(false);
     }
-  }, [settings.monitorDevices, updateSettings]);
+  }, [localHealthFetch, settings.monitorDevices, updateSettings]);
 
   // Auto-discover on first mount
   useEffect(() => {

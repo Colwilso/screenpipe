@@ -11,6 +11,7 @@ import posthog from "posthog-js";
 import ReactMarkdown from "react-markdown";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import localforage from "localforage";
+import { localFetch } from "@/lib/api";
 
 interface NotificationAction {
   label: string;
@@ -36,6 +37,37 @@ interface NotificationPayload {
   actions: NotificationAction[];
   autoDismissMs?: number;
   pipe_name?: string;
+}
+
+async function openNotificationLink(href: string) {
+  const raw = href.trim();
+  if (!raw) return;
+
+  let localPath: string | null = null;
+  if (raw.startsWith("~/")) {
+    const home = await import("@tauri-apps/api/path").then((m) => m.homeDir());
+    localPath = home + raw.slice(1);
+  } else if (raw.startsWith("/") && !raw.startsWith("//")) {
+    localPath = raw;
+  } else if (/^[A-Za-z]:[\\/]/.test(raw)) {
+    localPath = raw;
+  }
+
+  const { open } = await import("@tauri-apps/plugin-shell");
+  if (localPath && localPath.toLowerCase().endsWith(".md")) {
+    try {
+      await invoke("open_note_path", { path: localPath });
+      return;
+    } catch {
+      // Fallback to default file opener.
+    }
+  }
+  if (localPath) {
+    await invoke("open_note_path", { path: localPath });
+    return;
+  }
+
+  await open(raw);
 }
 
 export default function NotificationPanelPage() {
@@ -107,7 +139,7 @@ export default function NotificationPanelPage() {
                   });
                 } else {
                   // Run in background
-                  await fetch(`http://localhost:3030/pipes/${pipeName}/run`, {
+                  await localFetch(`/pipes/${pipeName}/run`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ notification_context: actionObj.context }),
@@ -118,7 +150,7 @@ export default function NotificationPanelPage() {
             }
             case "api": {
               if (actionObj.url) {
-                await fetch(`http://localhost:3030${actionObj.url}`, {
+                await localFetch(actionObj.url, {
                   method: actionObj.method || "POST",
                   headers: { "Content-Type": "application/json" },
                   body: actionObj.body ? JSON.stringify(actionObj.body) : undefined,
@@ -129,16 +161,27 @@ export default function NotificationPanelPage() {
             case "deeplink": {
               if (actionObj.url) {
                 if (actionObj.url.startsWith("screenpipe://")) {
-                  // Emit to main window's DeeplinkHandler which knows how to
-                  // route screenpipe:// URLs (timeline, frame, settings, etc.)
+                  // Show the Main window FIRST — its DeeplinkHandler only
+                  // routes events once mounted, and on macOS the window
+                  // won't actually come to the foreground unless we activate
+                  // the app (see show_window_activated for the rationale).
+                  // Then give React ~150ms to mount the listener before
+                  // emitting. Without this ordering, the emit fires into a
+                  // handler that hasn't subscribed yet and the click silently
+                  // does nothing.
+                  await invoke("show_window_activated", { window: "Main" });
+                  await new Promise((r) => setTimeout(r, 150));
                   await emit("deep-link-received", actionObj.url);
                 } else {
                   // External URL — open in system browser
                   try {
                     const { open } = await import("@tauri-apps/plugin-shell");
                     await open(actionObj.url);
-                  } catch {
-                    // shell plugin not available in this window
+                  } catch (e) {
+                    console.error(
+                      "notification open: shell plugin unavailable",
+                      e
+                    );
                   }
                 }
               }
@@ -151,11 +194,16 @@ export default function NotificationPanelPage() {
           return;
         }
 
-        // Legacy string-based action handlers
+        // Legacy string-based action handlers. The notification panel is a
+        // NonActivating NSPanel on macOS, so regular `show_window` completes
+        // successfully without actually bringing the target window to the
+        // foreground — use `show_window_activated` so explicit user clicks
+        // from the notification panel always surface the window above other
+        // apps, regardless of overlay_mode.
         if (actionStr === "open_timeline") {
-          await invoke("show_window", { window: "Main" });
+          await invoke("show_window_activated", { window: "Main" });
         } else if (actionStr === "open_chat") {
-          await invoke("show_window", { window: "Chat" });
+          await invoke("show_window_activated", { window: "Chat" });
         } else if (actionStr === "open_pipe_suggestions") {
           await showChatWithPrefill({
             context: PIPE_SUGGESTION_PROMPT,
@@ -184,7 +232,7 @@ export default function NotificationPanelPage() {
             for (let i = 0; i < 15; i++) {
               await new Promise((r) => setTimeout(r, 1000));
               try {
-                const res = await fetch("http://localhost:3030/health");
+                const res = await localFetch("/health");
                 if (res.ok) {
                   healthy = true;
                   break;
@@ -212,8 +260,24 @@ export default function NotificationPanelPage() {
           }
           return; // don't auto-hide on error so user sees the message
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        // Log loudly instead of swallowing silently — this is the place a
+        // bug like "click Open does nothing" used to vanish. We still hide
+        // the panel so the user isn't left with a stuck UI, but the failure
+        // now shows up in DevTools + ~/.screenpipe/logs (via tracing from
+        // any Tauri command that errored) + PostHog as a distinct event.
+        console.error(
+          "notification action failed",
+          { action: actionStr, type: actionObj?.type },
+          e
+        );
+        posthog.capture("notification_action_error", {
+          type: payload?.type,
+          id: payload?.id,
+          action: actionStr,
+          actionType: actionObj?.type,
+          error: String(e),
+        });
       }
 
       await hide(false);
@@ -465,24 +529,13 @@ export default function NotificationPanelPage() {
               components={{
                 a: ({ href, children }) => (
                   <a
-                    href={href}
                     onClick={async (e) => {
                       e.preventDefault();
                       if (!href) return;
                       try {
-                        // file paths: expand ~ and open natively
-                        let url = href;
-                        if (url.startsWith("~/")) {
-                          const home = await import("@tauri-apps/api/path").then(m => m.homeDir());
-                          url = "file://" + home + url.slice(2);
-                        } else if (url.startsWith("/") && !url.startsWith("//")) {
-                          url = "file://" + url;
-                        }
-                        const { open } = await import("@tauri-apps/plugin-shell");
-                        await open(url);
+                        await openNotificationLink(href);
                       } catch {
-                        // fallback: try window.open
-                        window.open(href, "_blank");
+                        console.error("failed to open url externally:", href);
                       }
                     }}
                     style={{ color: "rgba(0, 0, 0, 0.7)", textDecoration: "underline", cursor: "pointer" }}

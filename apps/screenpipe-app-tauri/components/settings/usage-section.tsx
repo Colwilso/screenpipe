@@ -10,8 +10,7 @@ import { Button } from "@/components/ui/button";
 import { loadAllConversations } from "@/lib/chat-storage";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { readTextFile, writeTextFile, exists } from "@tauri-apps/plugin-fs";
-
-const SCREENPIPE_API = "http://localhost:3030";
+import { localFetch } from "@/lib/api";
 
 type TimeRange = "day" | "week" | "month" | "all";
 
@@ -108,6 +107,20 @@ function aggregateEntries(entries: UsageEntry[], since?: number): ModelUsage[] {
   return Array.from(map.values()).sort((a, b) => b.count - a.count);
 }
 
+function dedupeEntries(entries: UsageEntry[]): UsageEntry[] {
+  const seen = new Set<string>();
+  const deduped: UsageEntry[] = [];
+
+  for (const entry of entries) {
+    const key = `${entry.timestamp}::${entry.source}::${entry.provider}::${entry.model}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(entry);
+  }
+
+  return deduped;
+}
+
 function getTimeSince(range: TimeRange): number | undefined {
   if (range === "all") return undefined;
   const now = Date.now();
@@ -144,7 +157,7 @@ export function UsageSection() {
 
     // Step 2: Incremental update
     try {
-      const newEntries = [...cache.entries];
+      const newEntries: UsageEntry[] = [];
       let totalChatsCount = 0;
       let chatMsgs = 0;
       let untracked = 0;
@@ -186,9 +199,8 @@ export function UsageSection() {
       }
 
       // Pipe executions - only fetch newer than cache watermark
-      let pipeNewCount = 0;
       try {
-        const pipesRes = await fetch(`${SCREENPIPE_API}/pipes`);
+        const pipesRes = await localFetch("/pipes");
         if (pipesRes.ok) {
           const pipesData = await pipesRes.json();
           const pipes = pipesData.data || [];
@@ -203,8 +215,8 @@ export function UsageSection() {
             const id = pipe.config?.name || pipe.source_slug || pipe.id || pipe.name;
             if (!id) continue;
             try {
-              const execRes = await fetch(
-                `${SCREENPIPE_API}/pipes/${id}/executions?limit=100`
+              const execRes = await localFetch(
+                `/pipes/${id}/executions?limit=100`
               );
               if (!execRes.ok) continue;
               const execData = await execRes.json();
@@ -218,7 +230,6 @@ export function UsageSection() {
                   const entryKey = `${ts}::${exec.provider || "pipe"}::${exec.model}`;
                   if (cachedPipeEntrySet.has(entryKey)) continue;
 
-                  pipeNewCount++;
                   newEntries.push({
                     model: exec.model,
                     provider: exec.provider || "pipe",
@@ -236,8 +247,8 @@ export function UsageSection() {
         // screenpipe not running
       }
 
-      // Merge new entries with cached entries (deduplicated by timestamp::model)
-      const allEntries = [...(cache.entries || []), ...newEntries];
+      // Merge new entries with cached entries and hard-dedupe to prevent inflation.
+      const allEntries = dedupeEntries([...(cache.entries || []), ...newEntries]);
 
       // Update cache
       const updatedCache: UsageCache = {

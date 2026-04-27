@@ -8,6 +8,8 @@ use anyhow::Result;
 use image::DynamicImage;
 use once_cell::sync::Lazy;
 use std::fmt;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing;
 
@@ -82,6 +84,12 @@ pub struct SafeMonitor {
     /// Lazy-initialized on first capture_image() call.
     #[cfg(target_os = "windows")]
     persistent_capture: Arc<std::sync::Mutex<Option<crate::wgc_capture::PersistentCapture>>>,
+    /// If true, skip persistent capture and use per-frame fallback for this session.
+    #[cfg(target_os = "windows")]
+    persistent_capture_disabled: Arc<AtomicBool>,
+    /// Consecutive persistent init failures for this monitor.
+    #[cfg(target_os = "windows")]
+    persistent_capture_failures: Arc<AtomicU32>,
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +207,10 @@ impl SafeMonitor {
             cached_monitor_index: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_os = "windows")]
             persistent_capture: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            persistent_capture_disabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "windows")]
+            persistent_capture_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -283,6 +295,55 @@ impl SafeMonitor {
         Ok(image)
     }
 
+    /// Capture an image excluding the given SCK window IDs (macOS only).
+    /// The OS won't render excluded windows into the capture buffer.
+    #[cfg(target_os = "macos")]
+    pub async fn capture_image_excluding(
+        &self,
+        excluded_window_ids: &[u32],
+    ) -> Result<DynamicImage> {
+        if excluded_window_ids.is_empty() {
+            return self.capture_image().await;
+        }
+
+        let monitor_id = self.monitor_id;
+        let use_sck = self.use_sck;
+        let cached_sck = self.cached_sck.clone();
+        let ids = excluded_window_ids.to_vec();
+
+        let image = tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
+            cidre::objc::ar_pool(|| -> Result<DynamicImage, String> {
+                if use_sck {
+                    let monitor = match cached_sck {
+                        Some(m) => m,
+                        None => SckMonitor::all()
+                            .map_err(|e| format!("{}", e))?
+                            .into_iter()
+                            .find(|m| m.id() == monitor_id)
+                            .ok_or_else(|| "Monitor not found".to_string())?,
+                    };
+
+                    if monitor.width().unwrap_or(0) == 0 || monitor.height().unwrap_or(0) == 0 {
+                        return Err("Invalid monitor dimensions".to_string());
+                    }
+
+                    monitor
+                        .capture_image_excluding(&ids)
+                        .map_err(|e| format!("{}", e))
+                        .map(DynamicImage::ImageRgba8)
+                } else {
+                    // xcap fallback doesn't support exclusion — capture normally
+                    Err("capture_image_excluding not supported on xcap path".to_string())
+                }
+            })
+            .map_err(|s| anyhow::anyhow!(s))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("capture task panicked: {}", e))??;
+
+        Ok(image)
+    }
+
     // Non-macOS: Use persistent WGC capture on Windows to avoid orange border flash.
     // Falls back to per-frame xcap capture if persistent session fails.
     #[cfg(not(target_os = "macos"))]
@@ -292,7 +353,13 @@ impl SafeMonitor {
         #[cfg(target_os = "windows")]
         {
             let persistent = self.persistent_capture.clone();
+            let persistent_disabled = self.persistent_capture_disabled.clone();
+            let persistent_failures = self.persistent_capture_failures.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
+                if persistent_disabled.load(Ordering::Relaxed) {
+                    return Self::per_frame_capture(monitor_id);
+                }
+
                 // Try existing persistent session
                 {
                     let guard = persistent
@@ -300,7 +367,10 @@ impl SafeMonitor {
                         .map_err(|e| anyhow::anyhow!("persistent capture mutex poisoned: {}", e))?;
                     if let Some(ref capture) = *guard {
                         match capture.get_latest_image(std::time::Duration::from_millis(200)) {
-                            Ok(img) => return Ok(img),
+                            Ok(img) => {
+                                persistent_failures.store(0, Ordering::Relaxed);
+                                return Ok(img);
+                            }
                             Err(e) => {
                                 tracing::debug!(
                                     "persistent capture failed for monitor {}, will reinit: {}",
@@ -331,23 +401,26 @@ impl SafeMonitor {
                                     anyhow::anyhow!("persistent capture mutex poisoned: {}", e)
                                 })?;
                                 *guard = Some(capture);
+                                persistent_failures.store(0, Ordering::Relaxed);
                                 return Ok(img);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "persistent capture init got no first frame for monitor {}: {}",
+                                Self::record_persistent_init_failure(
                                     monitor_id,
-                                    e
+                                    &persistent_disabled,
+                                    &persistent_failures,
+                                    &e.to_string(),
                                 );
                                 // capture dropped here, session cleaned up
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "failed to create persistent capture for monitor {}, falling back to per-frame: {}",
+                        Self::record_persistent_init_failure(
                             monitor_id,
-                            e
+                            &persistent_disabled,
+                            &persistent_failures,
+                            &e.to_string(),
                         );
                     }
                 }
@@ -501,6 +574,9 @@ impl SafeMonitor {
                     capture.stop();
                 }
             }
+            self.persistent_capture_disabled
+                .store(false, Ordering::Relaxed);
+            self.persistent_capture_failures.store(0, Ordering::Relaxed);
         }
 
         let monitor_id = self.monitor_id;
@@ -567,6 +643,67 @@ impl SafeMonitor {
         self.monitor_data.y
     }
 
+    /// Release the OS-level persistent capture session for this monitor.
+    ///
+    /// Called by the capture loop when focus has been absent long enough that
+    /// we don't expect to read frames soon (Cold state). Without this, the
+    /// underlying OS service keeps capturing at the stream's frame interval
+    /// forever — on macOS that's `replayd` at 2fps per idle monitor, which is
+    /// a measurable share of a core on dual-display setups.
+    ///
+    /// The session is lazily recreated on the next `capture_image()` call
+    /// after focus returns. Session-level disable/failure counters on Windows
+    /// are NOT reset — those reflect long-term stability, not transient
+    /// focus state.
+    ///
+    /// Safe to call when no session exists. Cheap.
+    pub fn release_capture_stream(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            crate::stream_invalidation::invalidate_monitor_stream(self.monitor_id);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(mut guard) = self.persistent_capture.lock() {
+                if let Some(mut capture) = guard.take() {
+                    capture.stop();
+                    tracing::info!(
+                        "released persistent WGC session for monitor {}",
+                        self.monitor_id
+                    );
+                }
+            }
+        }
+        // Linux: xcap captures per-frame, no persistent session to release.
+    }
+
+    #[cfg(target_os = "windows")]
+    fn record_persistent_init_failure(
+        monitor_id: u32,
+        persistent_disabled: &Arc<AtomicBool>,
+        persistent_failures: &Arc<AtomicU32>,
+        reason: &str,
+    ) {
+        let failures = persistent_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= 3 {
+            if !persistent_disabled.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "persistent capture disabled for monitor {} after {} init failures; falling back to per-frame for this session (last error: {})",
+                    monitor_id,
+                    failures,
+                    reason
+                );
+            }
+        } else {
+            tracing::debug!(
+                "persistent capture init failed for monitor {} (attempt {}/3): {}",
+                monitor_id,
+                failures,
+                reason
+            );
+        }
+    }
+
     /// A deterministic identifier derived from stable monitor properties
     /// (name, resolution, position). Unlike `id()`, this survives OS reboots.
     /// Format: "{name}_{width}x{height}_{x},{y}"
@@ -600,39 +737,58 @@ fn update_monitor_cache(monitors: &[SafeMonitor]) {
 /// List monitors with detailed error information (permission denied vs no monitors)
 #[cfg(target_os = "macos")]
 pub async fn list_monitors_detailed() -> std::result::Result<Vec<SafeMonitor>, MonitorListError> {
+    // Wrap the ObjC call paths in an autorelease pool — SckMonitor::all() and
+    // XcapMonitor::all() both allocate autoreleased NSObjects (display
+    // descriptors, NSStrings). Tokio blocking workers are long-lived and
+    // reused; without a per-call drain these accumulate forever.
+    // See monitor::tests::repro_list_monitors_autorelease_leak.
     let result: std::result::Result<Vec<SafeMonitor>, MonitorListError> =
         tokio::task::spawn_blocking(|| {
-            if use_sck_rs() {
-                tracing::debug!("Using sck-rs for screen capture (macOS 12.3+)");
-                match SckMonitor::all() {
-                    Ok(monitors) if monitors.is_empty() => Err(MonitorListError::NoMonitorsFound),
-                    Ok(monitors) => Ok(monitors.into_iter().map(SafeMonitor::from_sck).collect()),
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("permission") || err_str.contains("Screen recording") {
-                            Err(MonitorListError::PermissionDenied)
-                        } else if err_str.contains("No monitors") {
+            cidre::objc::ar_pool(|| {
+                if use_sck_rs() {
+                    tracing::debug!("Using sck-rs for screen capture (macOS 12.3+)");
+                    match SckMonitor::all() {
+                        Ok(monitors) if monitors.is_empty() => {
                             Err(MonitorListError::NoMonitorsFound)
-                        } else {
-                            Err(MonitorListError::Other(err_str))
+                        }
+                        Ok(monitors) => {
+                            Ok(monitors.into_iter().map(SafeMonitor::from_sck).collect())
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("permission")
+                                || err_str.contains("Screen recording")
+                            {
+                                Err(MonitorListError::PermissionDenied)
+                            } else if err_str.contains("No monitors") {
+                                Err(MonitorListError::NoMonitorsFound)
+                            } else {
+                                Err(MonitorListError::Other(err_str))
+                            }
+                        }
+                    }
+                } else {
+                    tracing::info!("Using xcap fallback for screen capture (macOS < 12.3)");
+                    match XcapMonitor::all() {
+                        Ok(monitors) if monitors.is_empty() => {
+                            Err(MonitorListError::NoMonitorsFound)
+                        }
+                        Ok(monitors) => {
+                            Ok(monitors.into_iter().map(SafeMonitor::from_xcap).collect())
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("permission")
+                                || err_str.contains("Screen recording")
+                            {
+                                Err(MonitorListError::PermissionDenied)
+                            } else {
+                                Err(MonitorListError::Other(err_str))
+                            }
                         }
                     }
                 }
-            } else {
-                tracing::info!("Using xcap fallback for screen capture (macOS < 12.3)");
-                match XcapMonitor::all() {
-                    Ok(monitors) if monitors.is_empty() => Err(MonitorListError::NoMonitorsFound),
-                    Ok(monitors) => Ok(monitors.into_iter().map(SafeMonitor::from_xcap).collect()),
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("permission") || err_str.contains("Screen recording") {
-                            Err(MonitorListError::PermissionDenied)
-                        } else {
-                            Err(MonitorListError::Other(err_str))
-                        }
-                    }
-                }
-            }
+            })
         })
         .await
         .unwrap_or(Err(MonitorListError::Other("Task panicked".to_string())));
@@ -854,6 +1010,10 @@ mod tests {
             cached_monitor_index: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_os = "windows")]
             persistent_capture: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            persistent_capture_disabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "windows")]
+            persistent_capture_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -897,5 +1057,145 @@ mod tests {
         let sid2 = "DELL U2718Q_3840x2160_0,0";
         let prefix2 = &sid2[..sid2.rfind('_').unwrap()];
         assert_eq!(prefix, prefix2);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_persistent_capture_disables_after_three_failures() {
+        let disabled = Arc::new(AtomicBool::new(false));
+        let failures = Arc::new(AtomicU32::new(0));
+
+        SafeMonitor::record_persistent_init_failure(1, &disabled, &failures, "err 1");
+        assert!(!disabled.load(Ordering::Relaxed));
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+
+        SafeMonitor::record_persistent_init_failure(1, &disabled, &failures, "err 2");
+        assert!(!disabled.load(Ordering::Relaxed));
+        assert_eq!(failures.load(Ordering::Relaxed), 2);
+
+        SafeMonitor::record_persistent_init_failure(1, &disabled, &failures, "err 3");
+        assert!(disabled.load(Ordering::Relaxed));
+        assert_eq!(failures.load(Ordering::Relaxed), 3);
+    }
+
+    /// Reproduction for the macOS memory leak reported 2026-04-22
+    /// (user's screenpipe at 13.2 GB RSS after ~48 h).
+    ///
+    /// Hypothesis: `list_monitors_detailed` calls `SckMonitor::all()` inside
+    /// `spawn_blocking` WITHOUT wrapping in `cidre::objc::ar_pool(...)`. Every
+    /// call therefore leaks autoreleased ObjC objects on the tokio blocking
+    /// worker threads (which are long-lived and reused).
+    ///
+    /// This test drives the leak path 2000× twice: once as-written (leaking),
+    /// once wrapped in `ar_pool` (expected not to leak). It reports peak RSS
+    /// (`ru_maxrss`) after each phase. On a leaked build, phase 1 should show
+    /// hundreds of MB of growth; phase 2 should be essentially flat.
+    ///
+    /// Kept `#[ignore]` because it's a perf/memory repro, not a correctness
+    /// test — run with:
+    ///   cargo test -p screenpipe-screen --lib monitor::tests::repro_list_monitors_autorelease_leak -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "macOS memory-leak repro; prints RSS deltas"]
+    async fn repro_list_monitors_autorelease_leak() {
+        /// Peak resident memory in bytes (ru_maxrss is bytes on Darwin,
+        /// despite the rusage man page claiming KB).
+        fn peak_rss_bytes() -> u64 {
+            unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+                ru.ru_maxrss as u64
+            }
+        }
+
+        fn fmt_mb(b: u64) -> String {
+            format!("{:.1} MB", (b as f64) / (1024.0 * 1024.0))
+        }
+
+        // 5 k calls × ~2.4 kB/call ≈ 12 MB growth — enough to rise cleanly
+        // out of noise. Real production hits this path tens of thousands of
+        // times per day across callers (focus-tracker safety-net poll every
+        // 5 s, monitor-watcher backstop every 60 s, focus callbacks, etc.).
+        const N: usize = 5_000;
+
+        let baseline = peak_rss_bytes();
+        eprintln!("[repro] baseline peak RSS: {}", fmt_mb(baseline));
+
+        // ── Phase 1: drive the code path AS-WRITTEN (should leak) ──
+        // We call `SckMonitor::all()` directly on a tokio blocking worker,
+        // matching what `list_monitors_detailed` does today (line ~744).
+        let before_phase1 = peak_rss_bytes();
+        for _ in 0..N {
+            tokio::task::spawn_blocking(|| {
+                // No ar_pool — matches current production path in
+                // list_monitors_detailed on macOS.
+                let _ = sck_rs::Monitor::all();
+            })
+            .await
+            .unwrap();
+        }
+        let after_phase1 = peak_rss_bytes();
+        let delta1 = after_phase1.saturating_sub(before_phase1);
+        eprintln!(
+            "[repro] after {} calls WITHOUT ar_pool: {} (+{} growth)",
+            N,
+            fmt_mb(after_phase1),
+            fmt_mb(delta1)
+        );
+
+        // ── Phase 2: same but wrapped in ar_pool (expected fix) ──
+        let before_phase2 = peak_rss_bytes();
+        for _ in 0..N {
+            tokio::task::spawn_blocking(|| {
+                cidre::objc::ar_pool(|| {
+                    let _ = sck_rs::Monitor::all();
+                });
+            })
+            .await
+            .unwrap();
+        }
+        let after_phase2 = peak_rss_bytes();
+        let delta2 = after_phase2.saturating_sub(before_phase2);
+        eprintln!(
+            "[repro] after {} calls WITH    ar_pool: {} (+{} growth)",
+            N,
+            fmt_mb(after_phase2),
+            fmt_mb(delta2)
+        );
+
+        eprintln!(
+            "[repro] leak delta (phase1 − phase2): {}",
+            fmt_mb(delta1.saturating_sub(delta2))
+        );
+
+        // Hypothesis: phase 1 leaks, phase 2 doesn't. `ru_maxrss` is peak-only
+        // so phase 2 cannot shrink below phase 1 — we check that phase 2
+        // grew far less than phase 1.
+        //
+        // Thresholds tuned from 2026-04-22 runs on M4 Max:
+        //   phase 1 (no ar_pool): ~4–5 MB growth and PLATEAUS (ObjC runtime
+        //     dedupes repeated NSString / CFArray instances describing the
+        //     same displays, so per-call overhead shrinks after the first
+        //     few hundred calls).
+        //   phase 2 (ar_pool):     0 MB growth (drained per call).
+        //
+        // The ~5 MB observed here is ONLY the `list_monitors_detailed`
+        // contribution in isolation. The user-report 13 GB / 48 h leak is
+        // almost certainly dominated by OTHER un-pooled cidre/cg callers
+        // (NSWorkspace observer thread in focus_tracker/darwin.rs,
+        // per-notification NSNotification retention, AX tree walks, etc.).
+        // This repro proves the CLASS of bug; it does not reproduce the
+        // full magnitude.
+        assert!(
+            delta1 > 2 * 1024 * 1024,
+            "expected >2 MB growth without ar_pool; got only {} — leak hypothesis not confirmed",
+            fmt_mb(delta1)
+        );
+        assert!(
+            delta1 > 3 * delta2,
+            "phase 1 should leak ≥3× phase 2; got phase1={}, phase2={}",
+            fmt_mb(delta1),
+            fmt_mb(delta2)
+        );
     }
 }

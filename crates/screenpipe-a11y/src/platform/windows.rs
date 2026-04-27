@@ -279,6 +279,16 @@ impl UiRecorder {
 // Thread-local state for hook callbacks
 // ============================================================================
 
+/// A deferred clipboard read request, queued from the LL hook and processed
+/// in the message loop where blocking is safe.
+struct PendingClipboard {
+    operation: char,
+    timestamp: chrono::DateTime<Utc>,
+    relative_ms: u64,
+    app_name: Option<String>,
+    window_title: Option<String>,
+}
+
 struct HookState {
     tx: Sender<UiEvent>,
     start: Instant,
@@ -291,6 +301,8 @@ struct HookState {
     activity_feed: Option<ActivityFeed>,
     click_queue: Arc<Mutex<Vec<ClickElementRequest>>>,
     focused_element: Arc<Mutex<Option<ElementContext>>>,
+    /// Clipboard operations deferred from the LL hook to the message loop.
+    pending_clipboard: Vec<PendingClipboard>,
 }
 
 // Thread-local storage for hook state
@@ -331,6 +343,7 @@ fn run_native_hooks(
             activity_feed,
             click_queue,
             focused_element,
+            pending_clipboard: Vec::new(),
         }));
     });
 
@@ -358,15 +371,19 @@ fn run_native_hooks(
         }
 
         // Message loop (required for hooks to receive events)
+        // Install a timer so GetMessageW wakes periodically for text buffer flushing.
+        // Without this, typed text stays in the buffer until the next input event.
+        const TEXT_FLUSH_TIMER_ID: usize = 42;
+        SetTimer(HWND::default(), TEXT_FLUSH_TIMER_ID, 100, None);
+
         let mut msg = MSG::default();
         while !stop.load(Ordering::Relaxed) {
-            // Use PeekMessage with a timeout to allow checking stop flag
             if GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
-            // Check for text buffer flush
+            // Check for text buffer flush (runs on timer tick and after every message)
             HOOK_STATE.with(|state| {
                 // Use try_borrow_mut to avoid panic — LL hook callbacks can
                 // fire synchronously during DispatchMessageW above
@@ -375,6 +392,42 @@ fn run_native_hooks(
                         if let Some(last_time) = s.last_text_time {
                             if last_time.elapsed().as_millis() as u64 >= s.config.text_timeout_ms {
                                 flush_text_buffer(s);
+                            }
+                        }
+
+                        // Process deferred clipboard operations — safe to block here
+                        // since we're in the message loop, not a LL hook callback.
+                        if !s.pending_clipboard.is_empty() {
+                            let pending = std::mem::take(&mut s.pending_clipboard);
+                            let capture_content = s.config.capture_clipboard_content;
+                            let apply_pii = s.config.apply_pii_removal;
+                            for p in pending {
+                                let content = if capture_content {
+                                    get_clipboard_text().map(|c| {
+                                        if apply_pii {
+                                            remove_pii(&c)
+                                        } else {
+                                            c
+                                        }
+                                    })
+                                } else {
+                                    None
+                                };
+                                let event = UiEvent {
+                                    id: None,
+                                    timestamp: p.timestamp,
+                                    relative_ms: p.relative_ms,
+                                    data: EventData::Clipboard {
+                                        operation: p.operation,
+                                        content,
+                                    },
+                                    app_name: p.app_name,
+                                    window_title: p.window_title,
+                                    browser_url: None,
+                                    element: None,
+                                    frame_id: None,
+                                };
+                                let _ = s.tx.try_send(event);
                             }
                         }
                     }
@@ -468,98 +521,26 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 }
 
                 // Check for clipboard operations (Ctrl+C, Ctrl+X, Ctrl+V)
+                // IMPORTANT: Do NOT read clipboard or apply PII regex here — this is
+                // a low-level hook callback that must return in <10ms or it stalls the
+                // entire system input queue. Instead, defer to the message loop.
                 if mods & 0x02 != 0 && s.config.capture_clipboard {
                     // Ctrl is pressed
-                    let apply_pii = s.config.apply_pii_removal;
-                    match vk_code {
-                        0x43 => {
-                            // C
-                            let event = UiEvent {
-                                id: None,
-                                timestamp,
-                                relative_ms: t,
-                                data: EventData::Clipboard {
-                                    operation: 'c',
-                                    content: if s.config.capture_clipboard_content {
-                                        get_clipboard_text().map(|c| {
-                                            if apply_pii {
-                                                remove_pii(&c)
-                                            } else {
-                                                c
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                },
-                                app_name: app_name.clone(),
-                                window_title: window_title.clone(),
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = s.tx.try_send(event);
-                            return;
-                        }
-                        0x58 => {
-                            // X
-                            let event = UiEvent {
-                                id: None,
-                                timestamp,
-                                relative_ms: t,
-                                data: EventData::Clipboard {
-                                    operation: 'x',
-                                    content: if s.config.capture_clipboard_content {
-                                        get_clipboard_text().map(|c| {
-                                            if apply_pii {
-                                                remove_pii(&c)
-                                            } else {
-                                                c
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                },
-                                app_name: app_name.clone(),
-                                window_title: window_title.clone(),
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = s.tx.try_send(event);
-                            return;
-                        }
-                        0x56 => {
-                            // V
-                            let event = UiEvent {
-                                id: None,
-                                timestamp,
-                                relative_ms: t,
-                                data: EventData::Clipboard {
-                                    operation: 'v',
-                                    content: if s.config.capture_clipboard_content {
-                                        get_clipboard_text().map(|c| {
-                                            if apply_pii {
-                                                remove_pii(&c)
-                                            } else {
-                                                c
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                },
-                                app_name: app_name.clone(),
-                                window_title: window_title.clone(),
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = s.tx.try_send(event);
-                            return;
-                        }
-                        _ => {}
+                    let op = match vk_code {
+                        0x43 => Some('c'), // C
+                        0x58 => Some('x'), // X
+                        0x56 => Some('v'), // V
+                        _ => None,
+                    };
+                    if let Some(operation) = op {
+                        s.pending_clipboard.push(PendingClipboard {
+                            operation,
+                            timestamp,
+                            relative_ms: t,
+                            app_name: app_name.clone(),
+                            window_title: window_title.clone(),
+                        });
+                        return;
                     }
                 }
 
@@ -1401,5 +1382,74 @@ mod tests {
         assert_eq!(0x02, 2); // Ctrl
         assert_eq!(0x04, 4); // Alt
         assert_eq!(0x08, 8); // Win
+    }
+
+    fn make_test_state(tx: tokio::sync::mpsc::Sender<UiEvent>, text: &str) -> HookState {
+        HookState {
+            tx,
+            start: std::time::Instant::now(),
+            config: crate::config::UiCaptureConfig::default(),
+            last_mouse_pos: (0, 0),
+            text_buf: text.to_string(),
+            last_text_time: if text.is_empty() {
+                None
+            } else {
+                Some(std::time::Instant::now())
+            },
+            current_app: Arc::new(parking_lot::Mutex::new(Some("test".into()))),
+            current_window: Arc::new(parking_lot::Mutex::new(Some("test window".into()))),
+            activity_feed: None,
+            click_queue: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            focused_element: Arc::new(parking_lot::Mutex::new(None)),
+            pending_clipboard: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_flush_text_buffer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut state = make_test_state(tx, "hello world");
+
+        // Buffer has content — flush should send a Text event
+        flush_text_buffer(&mut state);
+        assert!(state.text_buf.is_empty());
+        assert!(state.last_text_time.is_none());
+
+        let event = rx.try_recv().unwrap();
+        match event.data {
+            EventData::Text { ref content, .. } => {
+                assert_eq!(content, "hello world");
+            }
+            _ => panic!("expected Text event, got {:?}", event.data),
+        }
+    }
+
+    #[test]
+    fn test_flush_empty_buffer_is_noop() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut state = make_test_state(tx, "");
+
+        flush_text_buffer(&mut state);
+        assert!(rx.try_recv().is_err()); // No event sent
+    }
+
+    #[test]
+    fn test_vk_to_char_punctuation() {
+        assert_eq!(vk_to_char(0xBA, 0), Some(';'));
+        assert_eq!(vk_to_char(0xBA, 1), Some(':'));
+        assert_eq!(vk_to_char(0xBE, 0), Some('.'));
+        assert_eq!(vk_to_char(0xBF, 0), Some('/'));
+        assert_eq!(vk_to_char(0xBF, 1), Some('?'));
+        assert_eq!(vk_to_char(0x0D, 0), Some('\n')); // Enter
+        assert_eq!(vk_to_char(0x08, 0), Some('\x08')); // Backspace
+    }
+
+    #[test]
+    fn test_vk_to_char_unknown_returns_none() {
+        // F1-F12 and other non-printable keys should return None
+        assert_eq!(vk_to_char(0x70, 0), None); // F1
+        assert_eq!(vk_to_char(0x7B, 0), None); // F12
+        assert_eq!(vk_to_char(0x2E, 0), None); // Delete
+        assert_eq!(vk_to_char(0x25, 0), None); // Left arrow
     }
 }

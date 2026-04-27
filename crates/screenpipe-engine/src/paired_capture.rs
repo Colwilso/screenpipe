@@ -14,18 +14,39 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use image::DynamicImage;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use screenpipe_a11y::tree::{create_tree_walker, TreeSnapshot, TreeWalkerConfig};
 use screenpipe_core::pii_removal::remove_pii;
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_os = "windows"))]
+use std::sync::OnceLock;
 use std::time::Instant;
+#[cfg(not(target_os = "windows"))]
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
+/// Strip gutter-line-number runs from OCR output.
+///
+/// Obsidian and other code/markdown editors render a line-number gutter that
+/// Apple Vision extracts as long digit globs: "93154155156157158159…". These
+/// blob into the indexed text and dominate search results without adding
+/// information. A run of 30+ digits (optionally separated by whitespace) is
+/// almost certainly a gutter — real prose rarely has that density. Phone
+/// numbers, UUIDs, and timestamps are all shorter than the 30-digit threshold.
+fn strip_gutter_noise(text: &str) -> String {
+    static GUTTER: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?:\d[\s]*){30,}").expect("valid regex"));
+    GUTTER.replace_all(text, " ").into_owned()
+}
+
 /// Limits concurrent OCR tasks to avoid CPU spikes when multiple monitors
 /// trigger capture simultaneously.
+#[cfg(not(target_os = "windows"))]
 static OCR_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+#[cfg(not(target_os = "windows"))]
 fn ocr_semaphore() -> &'static Semaphore {
     OCR_SEMAPHORE.get_or_init(|| Semaphore::new(1))
 }
@@ -113,14 +134,14 @@ pub async fn paired_capture(
         let n = name.to_lowercase();
         // Terminal emulators whose AX text is raw buffer and not useful
         // for bounding-box overlay. OCR produces better results.
+        // Note: Ghostty, iTerm2, and Terminal.app were removed — they have
+        // full AX support and the thin-detection heuristic handles them
+        // correctly. See https://github.com/screenpipe/screenpipe/issues/2685
         n.contains("wezterm")
-            || n.contains("iterm")
-            || n.contains("terminal")
             || n.contains("alacritty")
             || n.contains("kitty")
             || n.contains("hyper")
             || n.contains("warp")
-            || n.contains("ghostty")
     });
     let has_accessibility_text = !app_prefers_ocr
         && tree_snapshot
@@ -140,7 +161,7 @@ pub async fn paired_capture(
     let (ocr_text, ocr_text_json) = if !has_accessibility_text || a11y_is_thin {
         // Windows native OCR is async, so call it directly (not inside spawn_blocking)
         #[cfg(target_os = "windows")]
-        {
+        let raw = {
             match screenpipe_screen::perform_ocr_windows(&ctx.image).await {
                 Ok((text, json, _confidence)) => (text, json),
                 Err(e) => {
@@ -148,15 +169,15 @@ pub async fn paired_capture(
                     (String::new(), "[]".to_string())
                 }
             }
-        }
+        };
         // Apple and Tesseract OCR are sync, use spawn_blocking with semaphore
         // to limit concurrent OCR and avoid CPU spikes on multi-monitor setups.
         #[cfg(not(target_os = "windows"))]
-        {
+        let raw = {
             let _permit = ocr_semaphore().acquire().await.unwrap();
             let image_for_ocr = ctx.image.clone();
             let languages = ctx.languages.clone();
-            let ocr_result = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 #[cfg(target_os = "macos")]
                 {
                     let (text, json, _confidence) =
@@ -171,9 +192,13 @@ pub async fn paired_capture(
                 }
             })
             .await
-            .unwrap_or_else(|_| (String::new(), "[]".to_string()));
-            ocr_result
-        }
+            .unwrap_or_else(|_| (String::new(), "[]".to_string()))
+        };
+
+        // Strip editor gutter noise (see strip_gutter_noise doc). Applied to
+        // the flat text but NOT to text_json — the JSON carries per-box OCR
+        // coordinates which downstream overlay/highlight UIs need intact.
+        (strip_gutter_noise(&raw.0), raw.1)
     } else {
         (String::new(), "[]".to_string())
     };
@@ -547,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn test_paired_capture_without_accessibility() {
         let tmp = TempDir::new().unwrap();
-        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80);
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
         let db = DatabaseManager::new("sqlite::memory:", Default::default())
             .await
             .unwrap();
@@ -584,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn test_paired_capture_with_accessibility_text() {
         let tmp = TempDir::new().unwrap();
-        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80);
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
         let db = DatabaseManager::new("sqlite::memory:", Default::default())
             .await
             .unwrap();
@@ -644,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn test_paired_capture_empty_accessibility_text() {
         let tmp = TempDir::new().unwrap();
-        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80);
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
         let db = DatabaseManager::new("sqlite::memory:", Default::default())
             .await
             .unwrap();

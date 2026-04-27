@@ -28,11 +28,83 @@ for (let i = 0; i < args.length; i++) {
 
 const SCREENPIPE_API = `http://localhost:${port}`;
 
+// Discover API key: env var > db.sqlite direct read > npx fallbacks
+function discoverApiKey(): string {
+  const envKey = process.env.SCREENPIPE_LOCAL_API_KEY || process.env.SCREENPIPE_API_KEY;
+  if (envKey) return envKey;
+
+  const os = require("os");
+  const path = require("path");
+  const fs = require("fs");
+  const { execFileSync, execSync } = require("child_process");
+
+  // Read api_auth_key directly from ~/.screenpipe/db.sqlite.
+  // The key may be stored as plaintext base64 (nonce=zeros, keychain unavailable)
+  // or encrypted (non-zero nonce, keychain was available at write time).
+  // If plaintext: decode and return. If encrypted: skip, fall through to CLI.
+  try {
+    const dbPath = path.join(os.homedir(), ".screenpipe", "db.sqlite");
+    if (fs.existsSync(dbPath)) {
+      const sqliteBin = process.platform === "win32" ? "sqlite3.exe" : "sqlite3";
+      // Check nonce — all zeros means plaintext base64, non-zero means encrypted
+      const row = execFileSync(sqliteBin, [
+        dbPath,
+        "SELECT hex(nonce), value FROM secrets WHERE key = 'api_auth_key';",
+      ], {
+        timeout: 5000,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+      if (row) {
+        const sepIdx = row.indexOf("|");
+        const nonceHex = sepIdx >= 0 ? row.substring(0, sepIdx) : "";
+        const value = sepIdx >= 0 ? row.substring(sepIdx + 1) : row;
+        const isPlaintext = !nonceHex || /^0+$/.test(nonceHex);
+        if (isPlaintext && value) {
+          const decoded = Buffer.from(value, "base64").toString("utf-8");
+          if (decoded && decoded.startsWith("sp-")) return decoded;
+          if (value.startsWith("sp-")) return value;
+        }
+        // Non-zero nonce = encrypted — fall through to CLI which can decrypt via keychain
+      }
+    }
+  } catch {}
+
+  // Fallback: use the current Node binary to find npx (no PATH dependency)
+  try {
+    const npxPath = path.join(path.dirname(process.execPath), "npx");
+    const token = execFileSync(npxPath, ["screenpipe@latest", "auth", "token"], {
+      timeout: 15000,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    if (token) return token;
+  } catch {}
+
+  // Last resort: npx on PATH
+  try {
+    const token = execSync("npx screenpipe@latest auth token", {
+      timeout: 15000,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    if (token) return token;
+  } catch {}
+
+  return "";
+}
+
+const API_KEY = discoverApiKey();
+
+// Read version from package.json (single source of truth)
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const PKG_VERSION: string = require("../package.json").version;
+
 // Initialize server
 const server = new Server(
   {
     name: "screenpipe",
-    version: "0.9.0",
+    version: PKG_VERSION,
   },
   {
     capabilities: {
@@ -115,9 +187,10 @@ const TOOLS: Tool[] = [
   {
     name: "activity-summary",
     description:
-      "Lightweight activity overview (~200-500 tokens): app usage with active minutes, audio speakers, recent texts. " +
+      "Rich activity overview: app usage, window/tab titles with URLs and time spent, key text per context, audio transcriptions. " +
       "USE THIS FIRST for broad questions: 'what was I doing?', 'how long on X?', 'which apps?'. " +
-      "Only escalate to search-content if you need specific text content.",
+      "The 'windows' field shows exactly what the user worked on (e.g. 'Debug crash issue — 20 min', 'Stripe pricing page — 5 min'). " +
+      "Usually sufficient without further searches.",
     annotations: { title: "Activity Summary", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -236,6 +309,167 @@ const TOOLS: Tool[] = [
         },
       },
       required: ["title", "pipe_name"],
+    },
+  },
+  {
+    name: "health-check",
+    description:
+      "Check if screenpipe is running and healthy. Returns recording status, frame/audio stats, timestamps.",
+    annotations: { title: "Health Check", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "list-audio-devices",
+    description: "List available audio input/output devices for recording.",
+    annotations: { title: "List Audio Devices", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "list-monitors",
+    description: "List available monitors/screens for capture.",
+    annotations: { title: "List Monitors", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "add-tags",
+    description:
+      "Add tags to a content item (vision frame or audio chunk) for organization and retrieval.",
+    annotations: { title: "Add Tags", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: {
+      type: "object",
+      properties: {
+        content_type: { type: "string", enum: ["vision", "audio"], description: "Type of content to tag" },
+        id: { type: "integer", description: "Content item ID" },
+        tags: { type: "array", items: { type: "string" }, description: "Tags to add" },
+      },
+      required: ["content_type", "id", "tags"],
+    },
+  },
+  {
+    name: "search-speakers",
+    description: "Search for speakers by name prefix. Returns speaker ID, name, and metadata.",
+    annotations: { title: "Search Speakers", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Speaker name prefix to search for (case-insensitive)" },
+      },
+    },
+  },
+  {
+    name: "list-unnamed-speakers",
+    description: "List speakers that haven't been named yet. Useful for speaker identification workflow.",
+    annotations: { title: "List Unnamed Speakers", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max results (default 10)", default: 10 },
+        offset: { type: "integer", description: "Pagination offset", default: 0 },
+      },
+    },
+  },
+  {
+    name: "update-speaker",
+    description: "Rename a speaker or update their metadata.",
+    annotations: { title: "Update Speaker", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer", description: "Speaker ID" },
+        name: { type: "string", description: "New speaker name" },
+        metadata: { type: "string", description: "JSON metadata string" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "merge-speakers",
+    description: "Merge two speakers into one (e.g. when the same person was detected as different speakers).",
+    annotations: { title: "Merge Speakers", readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    inputSchema: {
+      type: "object",
+      properties: {
+        speaker_to_keep: { type: "integer", description: "Speaker ID to keep" },
+        speaker_to_merge: { type: "integer", description: "Speaker ID to merge into the kept one" },
+      },
+      required: ["speaker_to_keep", "speaker_to_merge"],
+    },
+  },
+  {
+    name: "start-meeting",
+    description: "Manually start a meeting recording session.",
+    annotations: { title: "Start Meeting", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string", description: "App name (default 'manual')", default: "manual" },
+        title: { type: "string", description: "Meeting title" },
+        attendees: { type: "string", description: "Comma-separated attendee names" },
+      },
+    },
+  },
+  {
+    name: "stop-meeting",
+    description: "Stop the current manual meeting recording session.",
+    annotations: { title: "Stop Meeting", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "get-meeting",
+    description: "Get details of a specific meeting by ID, including transcription and attendees.",
+    annotations: { title: "Get Meeting", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer", description: "Meeting ID" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "keyword-search",
+    description:
+      "Fast keyword search using FTS index. Faster than search-content for exact keyword matching. " +
+      "Returns frame IDs and matched text.",
+    annotations: { title: "Keyword Search", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string", description: "Keyword search query" },
+        content_type: { type: "string", enum: ["ocr", "audio", "all"], description: "Content type filter", default: "all" },
+        start_time: { type: "string", description: "ISO 8601 UTC or relative" },
+        end_time: { type: "string", description: "ISO 8601 UTC or relative" },
+        app_name: { type: "string", description: "Filter by app name" },
+        limit: { type: "integer", description: "Max results (default 20)", default: 20 },
+        offset: { type: "integer", description: "Pagination offset", default: 0 },
+      },
+      required: ["q"],
+    },
+  },
+  {
+    name: "get-frame-elements",
+    description:
+      "Get all UI elements for a specific frame. More targeted than search-elements when you already have a frame_id.",
+    annotations: { title: "Get Frame Elements", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        frame_id: { type: "integer", description: "Frame ID" },
+      },
+      required: ["frame_id"],
+    },
+  },
+  {
+    name: "control-recording",
+    description:
+      "Start or stop audio/screen recording. Use to pause/resume capture.",
+    annotations: { title: "Control Recording", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["start-audio", "stop-audio"], description: "Recording action" },
+      },
+      required: ["action"],
     },
   },
 ];
@@ -365,6 +599,7 @@ async function fetchAPI(
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}),
       ...options.headers,
     },
   });
@@ -544,14 +779,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         );
 
+        // Window/tab activity — what pages/documents were open
+        const windowLines = (data.windows || []).map(
+          (w: {
+            app_name: string;
+            window_name: string;
+            browser_url: string;
+            minutes: number;
+            frame_count: number;
+          }) => {
+            const url = w.browser_url ? ` (${w.browser_url})` : "";
+            return `  [${w.app_name}] ${w.window_name}${url} — ${w.minutes} min`;
+          }
+        );
+
         const speakerLines = (data.audio_summary?.speakers || []).map(
           (s: { name: string; segment_count: number }) =>
             `  ${s.name}: ${s.segment_count} segments`
         );
 
-        const textLines = (data.recent_texts || []).map(
-          (t: { text: string; app_name: string; timestamp: string }) =>
-            `  [${t.app_name}] ${t.text}`
+        // Actual audio transcriptions (not just counts)
+        const transcriptLines = (data.audio_summary?.top_transcriptions || []).map(
+          (t: { transcription: string; speaker: string; device: string; timestamp: string }) =>
+            `  [${t.speaker}, ${t.timestamp.slice(11, 19)}] ${t.transcription}`
+        );
+
+        // Key text content sampled across the time range
+        const textLines = (data.key_texts || data.recent_texts || []).map(
+          (t: { text: string; app_name: string; window_name?: string; timestamp: string }) => {
+            const win = t.window_name ? ` | ${t.window_name}` : "";
+            return `  [${t.app_name}${win}, ${t.timestamp.slice(11, 19)}] ${t.text}`;
+          }
         );
 
         const summary = [
@@ -561,11 +819,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           "Apps:",
           ...(appsLines.length ? appsLines : ["  (none)"]),
           "",
+          "Windows & Tabs:",
+          ...(windowLines.length ? windowLines.slice(0, 20) : ["  (none)"]),
+          "",
           `Audio: ${data.audio_summary?.segment_count || 0} segments`,
           ...(speakerLines.length ? speakerLines : []),
+          ...(transcriptLines.length ? ["", "Audio transcriptions:", ...transcriptLines.slice(0, 15)] : []),
           "",
-          "Recent texts:",
-          ...(textLines.length ? textLines.slice(0, 10) : ["  (none)"]),
+          "Key content (sampled across time range):",
+          ...(textLines.length ? textLines.slice(0, 20) : ["  (none)"]),
         ].join("\n");
 
         return { content: [{ type: "text", text: summary }] };
@@ -854,7 +1116,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           body: args.body || "",
           type: "pipe",
         };
-        if (args.timeout_secs) notifBody.timeout = args.timeout_secs * 1000;
+        if (args.timeout_secs) notifBody.timeout = Number(args.timeout_secs) * 1000;
         if (args.actions) notifBody.actions = args.actions;
         const notifResponse = await fetch("http://localhost:11435/notify", {
           method: "POST",
@@ -865,6 +1127,235 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const notifResult = await notifResponse.json();
         return {
           content: [{ type: "text", text: `Notification sent: ${notifResult.message}` }],
+        };
+      }
+
+      case "health-check": {
+        const response = await fetchAPI("/health");
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const data = await response.json();
+        return {
+          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+        };
+      }
+
+      case "list-audio-devices": {
+        const response = await fetchAPI("/audio/list");
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const devices = await response.json();
+        if (!Array.isArray(devices) || devices.length === 0) {
+          return { content: [{ type: "text", text: "No audio devices found." }] };
+        }
+        const formatted = devices.map(
+          (d: { name: string; is_default: boolean; device_type?: string }) =>
+            `${d.is_default ? "* " : "  "}${d.name}${d.device_type ? ` (${d.device_type})` : ""}`
+        );
+        return {
+          content: [{ type: "text", text: `Audio devices:\n${formatted.join("\n")}` }],
+        };
+      }
+
+      case "list-monitors": {
+        const response = await fetchAPI("/vision/list");
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const monitors = await response.json();
+        if (!Array.isArray(monitors) || monitors.length === 0) {
+          return { content: [{ type: "text", text: "No monitors found." }] };
+        }
+        const formatted = monitors.map(
+          (m: { id: number; name?: string; width?: number; height?: number; is_default?: boolean }) =>
+            `${m.is_default ? "* " : "  "}Monitor ${m.id}${m.name ? `: ${m.name}` : ""}${m.width ? ` (${m.width}x${m.height})` : ""}`
+        );
+        return {
+          content: [{ type: "text", text: `Monitors:\n${formatted.join("\n")}` }],
+        };
+      }
+
+      case "add-tags": {
+        const contentType = args.content_type as string;
+        const id = args.id as number;
+        const tags = args.tags as string[];
+        if (!contentType || !id || !tags) {
+          return { content: [{ type: "text", text: "Error: content_type, id, and tags are required" }] };
+        }
+        const response = await fetchAPI(`/tags/${contentType}/${id}`, {
+          method: "POST",
+          body: JSON.stringify({ tags }),
+        });
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        return {
+          content: [{ type: "text", text: `Tags added to ${contentType}/${id}: ${tags.join(", ")}` }],
+        };
+      }
+
+      case "search-speakers": {
+        const nameQuery = args.name as string;
+        if (!nameQuery) {
+          return { content: [{ type: "text", text: "Error: name is required" }] };
+        }
+        const response = await fetchAPI(`/speakers/search?name=${encodeURIComponent(nameQuery)}`);
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const speakers = await response.json();
+        if (!Array.isArray(speakers) || speakers.length === 0) {
+          return { content: [{ type: "text", text: "No speakers found." }] };
+        }
+        const formatted = speakers.map(
+          (s: { id: number; name: string; metadata?: string }) =>
+            `#${s.id} ${s.name}${s.metadata ? ` — ${s.metadata}` : ""}`
+        );
+        return {
+          content: [{ type: "text", text: `Speakers:\n${formatted.join("\n")}` }],
+        };
+      }
+
+      case "list-unnamed-speakers": {
+        const limit = (args.limit as number) || 10;
+        const offset = (args.offset as number) || 0;
+        const response = await fetchAPI(`/speakers/unnamed?limit=${limit}&offset=${offset}`);
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const speakers = await response.json();
+        if (!Array.isArray(speakers) || speakers.length === 0) {
+          return { content: [{ type: "text", text: "No unnamed speakers found." }] };
+        }
+        const formatted = speakers.map(
+          (s: { id: number; name: string }) => `#${s.id} ${s.name}`
+        );
+        return {
+          content: [{ type: "text", text: `Unnamed speakers:\n${formatted.join("\n")}` }],
+        };
+      }
+
+      case "update-speaker": {
+        const speakerId = args.id as number;
+        if (!speakerId) {
+          return { content: [{ type: "text", text: "Error: id is required" }] };
+        }
+        const body: Record<string, unknown> = { id: speakerId };
+        if (args.name !== undefined) body.name = args.name;
+        if (args.metadata !== undefined) body.metadata = args.metadata;
+        const response = await fetchAPI("/speakers/update", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        return {
+          content: [{ type: "text", text: `Speaker ${speakerId} updated.` }],
+        };
+      }
+
+      case "merge-speakers": {
+        const keepId = args.speaker_to_keep as number;
+        const mergeId = args.speaker_to_merge as number;
+        if (!keepId || !mergeId) {
+          return { content: [{ type: "text", text: "Error: speaker_to_keep and speaker_to_merge are required" }] };
+        }
+        const response = await fetchAPI("/speakers/merge", {
+          method: "POST",
+          body: JSON.stringify({ speaker_to_keep: keepId, speaker_to_merge: mergeId }),
+        });
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        return {
+          content: [{ type: "text", text: `Merged speaker ${mergeId} into ${keepId}.` }],
+        };
+      }
+
+      case "start-meeting": {
+        const body: Record<string, unknown> = {};
+        if (args.app) body.app = args.app;
+        if (args.title) body.title = args.title;
+        if (args.attendees) body.attendees = args.attendees;
+        const response = await fetchAPI("/meetings/start", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const meeting = await response.json();
+        return {
+          content: [{ type: "text", text: `Meeting started (id: ${meeting.id || "ok"}).` }],
+        };
+      }
+
+      case "stop-meeting": {
+        const response = await fetchAPI("/meetings/stop", { method: "POST" });
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        return {
+          content: [{ type: "text", text: "Meeting stopped." }],
+        };
+      }
+
+      case "get-meeting": {
+        const meetingId = args.id as number;
+        if (!meetingId) {
+          return { content: [{ type: "text", text: "Error: id is required" }] };
+        }
+        const response = await fetchAPI(`/meetings/${meetingId}`);
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const meeting = await response.json();
+        return {
+          content: [{ type: "text", text: JSON.stringify(meeting, null, 2) }],
+        };
+      }
+
+      case "keyword-search": {
+        const params = new URLSearchParams();
+        for (const [key, value] of Object.entries(args)) {
+          if (value !== null && value !== undefined) {
+            params.append(key, String(value));
+          }
+        }
+        const response = await fetchAPI(`/search/keyword?${params.toString()}`);
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const data = await response.json();
+        const results = data.data || [];
+        if (results.length === 0) {
+          return { content: [{ type: "text", text: "No keyword search results found." }] };
+        }
+        const formatted = results.map((r: Record<string, unknown>) => {
+          const content = r.content as Record<string, unknown> | undefined;
+          return `[${r.type}] ${content?.app_name || "?"} | ${content?.timestamp || ""}\n${content?.text || content?.transcription || ""}`;
+        });
+        return {
+          content: [{ type: "text", text: `Results: ${results.length}\n\n${formatted.join("\n---\n")}` }],
+        };
+      }
+
+      case "get-frame-elements": {
+        const frameId = args.frame_id as number;
+        if (!frameId) {
+          return { content: [{ type: "text", text: "Error: frame_id is required" }] };
+        }
+        const response = await fetchAPI(`/frames/${frameId}/elements`);
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const elements = await response.json();
+        if (!Array.isArray(elements) || elements.length === 0) {
+          return { content: [{ type: "text", text: `No elements found for frame ${frameId}.` }] };
+        }
+        const formatted = elements.map(
+          (e: { role: string; text: string | null; depth: number; source: string }) => {
+            const indent = "  ".repeat(Math.min(e.depth, 5));
+            return `${indent}[${e.source}:${e.role}] ${e.text || "(no text)"}`;
+          }
+        );
+        return {
+          content: [{ type: "text", text: `Frame ${frameId} elements (${elements.length}):\n${formatted.join("\n")}` }],
+        };
+      }
+
+      case "control-recording": {
+        const action = args.action as string;
+        if (!action) {
+          return { content: [{ type: "text", text: "Error: action is required" }] };
+        }
+        let endpoint: string;
+        if (action === "start-audio") endpoint = "/audio/start";
+        else if (action === "stop-audio") endpoint = "/audio/stop";
+        else {
+          return { content: [{ type: "text", text: `Error: unknown action '${action}'` }] };
+        }
+        const response = await fetchAPI(endpoint, { method: "POST" });
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        return {
+          content: [{ type: "text", text: `Recording action '${action}' executed.` }],
         };
       }
 

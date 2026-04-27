@@ -4,12 +4,13 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { LockedSetting } from "@/components/enterprise-locked-setting";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Rocket, Moon, Sun, Monitor, FlaskConical, Shield, ExternalLink, Layers, RefreshCw, Undo2, MessageSquare, Trash2 } from "lucide-react";
+import { Rocket, Moon, Sun, Monitor, FlaskConical, Shield, ExternalLink, Layers, RefreshCw, Undo2, MessageSquare, Trash2, Sparkles } from "lucide-react";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
@@ -114,6 +115,7 @@ export default function GeneralSettings() {
       </div>
 
       <div className="space-y-2">
+        <LockedSetting settingKey="auto_start">
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
@@ -135,6 +137,7 @@ export default function GeneralSettings() {
             </div>
           </CardContent>
         </Card>
+        </LockedSetting>
 
         {!isEnterprise && (
           <Card className="border-border bg-card">
@@ -160,6 +163,59 @@ export default function GeneralSettings() {
           </Card>
         )}
 
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">Auto-Update Pipes</h3>
+                  <p className="text-xs text-muted-foreground">Update store pipes you haven&apos;t modified</p>
+                </div>
+              </div>
+              <Switch
+                id="auto-update-pipes-toggle"
+                checked={settings?.autoUpdatePipes ?? true}
+                onCheckedChange={(checked) =>
+                  handleSettingsChange({ autoUpdatePipes: checked })
+                }
+                className="ml-4"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Sparkles className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">Enhanced AI</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Use Screenpipe Cloud for smarter suggestions
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60 mt-0.5">
+                    sends recent activity to screenpipe cloud for processing. we don&apos;t store your data (zero retention).
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="enhanced-ai-toggle"
+                checked={settings?.enhancedAI ?? false}
+                onCheckedChange={async (checked) => {
+                  handleSettingsChange({ enhancedAI: checked });
+                  const token = settings?.user?.token || "";
+                  try {
+                    await commands.setEnhancedAiSuggestions(checked, token);
+                  } catch {}
+                }}
+                className="ml-4"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
         {!isEnterprise && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
@@ -171,7 +227,7 @@ export default function GeneralSettings() {
                       Version{currentVersion ? ` ${currentVersion}` : ""}
                     </h3>
                     <p className="text-xs text-muted-foreground">
-                      install a previous version (at your own risk)
+                      Install a previous version (at your own risk)
                     </p>
                   </div>
                 </div>
@@ -221,7 +277,7 @@ export default function GeneralSettings() {
               <div className="flex items-center space-x-2.5">
                 <Trash2 className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Clear cache</h3>
+                  <h3 className="text-sm font-medium text-foreground">Clear Cache</h3>
                   <p className="text-xs text-muted-foreground">
                     Remove AI agent cache, old logs, and recovery artifacts
                   </p>
@@ -309,7 +365,7 @@ export default function GeneralSettings() {
             <div className="flex items-center space-x-2.5">
               <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
               <div>
-                <h3 className="text-sm font-medium text-foreground">Reset onboarding</h3>
+                <h3 className="text-sm font-medium text-foreground">Reset Onboarding</h3>
                 <p className="text-xs text-muted-foreground">Run the setup wizard again</p>
               </div>
             </div>

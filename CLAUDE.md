@@ -164,9 +164,11 @@ Note: The Tauri app (`apps/screenpipe-app-tauri/src-tauri`) is excluded from the
 brew install pkg-config ffmpeg jq cmake wget git-lfs
 ```
 
-## LiteLLM Proxy (local AI routing)
+## LiteLLM Proxy (local AI routing) -- DEPRECATED
 
-The desktop app routes all LLM requests through a local LiteLLM proxy. This is required for Pi (the in-app chat assistant) and for pipes that call LLM APIs (e.g. obsidian-sync).
+> **DEPRECATED**: The LiteLLM proxy is no longer used. Do not start it on screenpipe launch. This section is retained for historical reference only.
+
+The desktop app previously routed all LLM requests through a local LiteLLM proxy. This was required for Pi (the in-app chat assistant) and for pipes that call LLM APIs (e.g. obsidian-sync).
 
 ### How it works
 
@@ -246,6 +248,14 @@ The desktop app needs these macOS TCC permissions, which can be revoked silently
 If the app enters a permission-recovery loop on startup, re-grant these in System Settings > Privacy & Security.
 
 ## Git Usage
-- Multiple agents work on this codebase in parallel — never delete local code, use `git reset --hard`, or force-push
+- Multiple agents work on this codebase in parallel -- never delete local code, use `git reset --hard`, or force-push
 - Performance target: <20% CPU, <3GB RAM on release builds
-- Ship daily — small, focused changes, every commit should be deployable
+- Ship daily -- small, focused changes, every commit should be deployable
+
+## A/B test learnings (Mar-Apr 2026)
+- "automations" converts better than "pipes" for checkout (+32-95% lift)
+- shorter landing page (no search/chat/privacy sections) converts better (+78% lift)
+- hero headline "agents that watch you" vs "your computer finally works" -- no difference
+- showing price in hero CTA ("$99/mo") slightly hurts vs plain "DOWNLOAD" (-18%)
+- prominent guarantee banner above pricing -- no effect
+- annual plan shown first doubles annual uptake (36% vs 18%), similar total checkout rate

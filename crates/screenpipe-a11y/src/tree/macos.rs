@@ -159,6 +159,9 @@ fn looks_like_url(s: &str) -> bool {
 pub struct MacosTreeWalker {
     config: TreeWalkerConfig,
     incognito_detector: Box<dyn crate::incognito::IncognitoDetector>,
+    /// Gates the per-walk `AXEnhancedUserInterface` toggle so we only poke a
+    /// given renderer at most once per TTL instead of on every walk.
+    enhanced_mode_cache: super::enhanced_mode_cache::EnhancedModeCache,
 }
 
 impl MacosTreeWalker {
@@ -166,6 +169,7 @@ impl MacosTreeWalker {
         Self {
             config,
             incognito_detector: crate::incognito::create_detector(),
+            enhanced_mode_cache: super::enhanced_mode_cache::EnhancedModeCache::with_default_ttl(),
         }
     }
 }
@@ -245,9 +249,28 @@ impl MacosTreeWalker {
         // and causes the renderer to materialize the full AX tree.
         // Ref: https://codereview.chromium.org/6909013
         // Ref: https://github.com/electron/electron/issues/7206
-        let eui_attr_name = cf::String::from_str("AXEnhancedUserInterface");
-        let eui_attr = ax::Attr::with_string(&eui_attr_name);
-        let _ = ax_app.set_attr(eui_attr, cf::Boolean::value_true());
+        //
+        // The toggle is expensive (the renderer rebuilds its AX tree each time
+        // we poke it), so we only re-assert it once per TTL per pid. Chromium
+        // latches the mode so one poke is plenty; if the renderer ever drops
+        // the mode we recover on the next TTL window.
+        if self.enhanced_mode_cache.should_enable(pid) {
+            let eui_attr_name = cf::String::from_str("AXEnhancedUserInterface");
+            let eui_attr = ax::Attr::with_string(&eui_attr_name);
+            let _ = ax_app.set_attr(eui_attr, cf::Boolean::value_true());
+
+            // Also set AXManualAccessibility — the Chromium-specific flag.
+            // Newer Electron builds (and Chrome itself) respond to this without
+            // the "screen reader is active" side effects of EnhancedUserInterface.
+            // Some apps (Obsidian in particular — issue #3002) never materialize
+            // their tree under EnhancedUserInterface alone. Idempotent to set
+            // both: the better-supported flag wins.
+            let ama_attr_name = cf::String::from_str("AXManualAccessibility");
+            let ama_attr = ax::Attr::with_string(&ama_attr_name);
+            let _ = ax_app.set_attr(ama_attr, cf::Boolean::value_true());
+
+            debug!("enhanced AX mode enabled for pid={} app={}", pid, app_name);
+        }
 
         let window_val = match ax_app.attr_value(ax::attr::focused_window()) {
             Ok(v) => v,
@@ -321,6 +344,17 @@ impl MacosTreeWalker {
 
         // Walk the accessibility tree
         walk_element(window, 0, &mut state);
+
+        // If a browser extension popup matching an ignored window was detected,
+        // skip the entire capture — including the screenshot — to prevent the
+        // popup content from appearing in the timeline.
+        if state.hit_ignored_extension {
+            debug!(
+                "skipping capture: browser extension popup matched ignored window in app={}",
+                app_name
+            );
+            return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
+        }
 
         let text_content = state.text_buffer;
         // Don't bail on empty text — we still need the app_name and window_name
@@ -401,6 +435,12 @@ struct WalkState {
     monitor_y: f64,
     monitor_w: f64,
     monitor_h: f64,
+    /// User-configured ignored window patterns (lowercase) for filtering browser
+    /// extension popups whose AXWebArea title matches an ignored keyword.
+    ignored_windows_lower: Vec<String>,
+    /// Set to true when a browser extension popup matching an ignored pattern is
+    /// detected. Signals the caller to skip the entire capture (including screenshot).
+    hit_ignored_extension: bool,
 }
 
 impl WalkState {
@@ -425,6 +465,12 @@ impl WalkState {
             monitor_y: config.monitor_y,
             monitor_w: config.monitor_width,
             monitor_h: config.monitor_height,
+            ignored_windows_lower: config
+                .ignored_windows
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
+            hit_ignored_extension: false,
         }
     }
 
@@ -500,6 +546,12 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
         state.max_depth_reached = depth;
     }
 
+    // Yield every 100 elements to let macOS process pending HID/input events.
+    // Without this, tight AX IPC loops can starve USB mouse/keyboard event delivery.
+    if state.node_count.is_multiple_of(100) {
+        std::thread::yield_now();
+    }
+
     // Set a per-element timeout to prevent IPC hangs
     let _ = elem.set_messaging_timeout_secs(state.element_timeout_secs);
 
@@ -517,8 +569,34 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
     // Extract text from this element
     if should_extract_text(&role_str) {
         extract_text(elem, &role_str, depth, state);
-    } else if role_str == "AXGroup" || role_str == "AXWebArea" {
+    } else if role_str == "AXWebArea" {
+        // Browser extension popup detection: AXWebArea nodes inside Chrome/Arc/Edge
+        // carry the extension name as their title and a chrome-extension:// URL.
+        // If the title matches an ignored-window pattern, skip the entire subtree
+        // to prevent capturing password manager or other sensitive extension content.
+        if !state.ignored_windows_lower.is_empty() {
+            let matches = |val: &str| {
+                let lower = val.to_lowercase();
+                state
+                    .ignored_windows_lower
+                    .iter()
+                    .any(|ig| lower.contains(ig.as_str()))
+            };
+            if get_string_attr(elem, ax::attr::title()).is_some_and(|t| matches(&t))
+                || get_string_attr(elem, ax::attr::url()).is_some_and(|u| matches(&u))
+            {
+                state.hit_ignored_extension = true;
+                return;
+            }
+        }
         // Groups and web areas: only extract if they have a direct value
+        if let Some(val) = get_string_attr(elem, ax::attr::value()) {
+            if !val.is_empty() {
+                append_text(&mut state.text_buffer, &val);
+            }
+        }
+    } else if role_str == "AXGroup" {
+        // Groups: only extract if they have a direct value
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);

@@ -7,6 +7,7 @@
 const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
 import React, { useEffect, useState, useMemo, useCallback } from "react";
+import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -32,7 +33,6 @@ import {
   Monitor,
   Volume2,
   Headphones,
-  Folder,
   AppWindowMac,
   EyeOff,
   Key,
@@ -86,6 +86,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ToastAction } from "@/components/ui/toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent } from "@/components/ui/card";
@@ -96,7 +97,7 @@ import * as Sentry from "@sentry/react";
 import { defaultOptions } from "tauri-plugin-sentry-api";
 import { useLoginDialog } from "../login-dialog";
 import { BatterySaverSection } from "./battery-saver-section";
-import { ScheduleSettings } from "./schedule-settings";
+// ScheduleSettings moved to privacy-section
 import { ValidatedInput } from "../ui/validated-input";
 import {
   validateField,
@@ -290,7 +291,7 @@ function TranscriptionDictionary({
           <Languages className="h-4 w-4 text-muted-foreground shrink-0" />
           <div className="flex-1 min-w-0">
             <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-              custom vocabulary
+              Custom Vocabulary
               <HelpTooltip text="Add custom words (names, brands, jargon) to improve transcription accuracy. You can also add replacements to auto-correct common mistranscriptions." />
               {vocabularyWords.length > 0 && (
                 <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
@@ -500,6 +501,18 @@ export function RecordingSettings() {
   const [availableAudioDevices, setAvailableAudioDevices] = useState<
     AudioDeviceInfo[]
   >([]);
+
+  // Gate for the experimental CoreAudio Process Tap toggle — we only show
+  // the switch on macOS 14.4+ where the API exists. Probed once via a
+  // Tauri command that proxies to
+  // `screenpipe_audio::core::process_tap::is_process_tap_available()`.
+  const [coreaudioTapAvailable, setCoreaudioTapAvailable] = useState<boolean | null>(null);
+  useEffect(() => {
+    invoke<boolean>("check_coreaudio_process_tap_available")
+      .then(setCoreaudioTapAvailable)
+      .catch(() => setCoreaudioTapAvailable(false));
+  }, []);
+
   const { toast } = useToast();
   const [isUpdating, setIsUpdating] = useState(false);
   const { health } = useHealthCheck();
@@ -823,14 +836,14 @@ export function RecordingSettings() {
         }
       }
 
-      await commands.stopScreenpipe();
+      await commands.stopCapture();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await commands.startCapture();
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      await commands.spawnScreenpipe(null);
-      await new Promise((resolve) => setTimeout(resolve, 2000));
 
       toast({
         title: "Settings updated successfully",
-        description: "Screenpipe has been restarted with new settings",
+        description: "Recording restarted with new settings",
       });
     } catch (error) {
       console.error("Failed to update settings:", error);
@@ -988,42 +1001,6 @@ The average knowledge worker switches between four hundred different windows per
 
 Your screen is a pipe. Everything you see, hear, and type flows through it. Screenpipe just makes sure nothing valuable leaks away.`;
 
-  const handleDataDirChange = async () => {
-    try {
-      const dataDir = await getDataDir();
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        defaultPath: dataDir,
-      });
-      if (!selected) return;
-
-      const result = await commands.validateDataDir(selected);
-      if (result.status === "error") {
-        toast({
-          title: "invalid directory",
-          description: String(result.error),
-          variant: "destructive",
-          duration: 5000,
-        });
-        return;
-      }
-      handleSettingsChange({ dataDir: selected }, true);
-    } catch (error) {
-      console.error("failed to change data directory:", error);
-      toast({
-        title: "error",
-        description: "failed to change data directory",
-        variant: "destructive",
-        duration: 5000,
-      });
-    }
-  };
-
-  const handleDataDirReset = () => {
-    handleSettingsChange({ dataDir: "default" }, true);
-  };
-
   const handleIgnoredWindowsChange = (values: string[]) => {
     // Convert all values to lowercase for comparison
     const lowerCaseValues = values.map((v) => v.toLowerCase());
@@ -1174,66 +1151,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </CardContent>
       </Card>
 
-      {/* Recording Schedule */}
-      <ScheduleSettings
-        enabled={settings.scheduleEnabled ?? false}
-        rules={(settings.scheduleRules as any[]) ?? []}
-        onChange={(enabled, rules) => {
-          handleSettingsChange({ scheduleEnabled: enabled, scheduleRules: rules } as any);
-        }}
-      />
-
-      {/* Data Directory */}
-      <div className="space-y-2">
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Folder className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">
-                    Data directory
-                  </h3>
-                  <p className="text-xs text-muted-foreground truncate max-w-[250px]">
-                    {!settings.dataDir || settings.dataDir === "default"
-                      ? "~/.screenpipe (default)"
-                      : settings.dataDir}
-                  </p>
-                  <p className="text-[10px] text-muted-foreground/70 mt-0.5">
-                    changing directory starts fresh recordings
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-1.5">
-                {settings.dataDir &&
-                  settings.dataDir !== "default" &&
-                  settings.dataDir !== "" && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={handleDataDirReset}
-                      className="h-7 text-xs shrink-0"
-                    >
-                      Reset
-                    </Button>
-                  )}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleDataDirChange}
-                  className="h-7 text-xs shrink-0"
-                >
-                  Change
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      
-
       {/* Audio */}
+      <LockedSetting settingKey="audio_recording">
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Audio</h2>
 
@@ -1244,15 +1163,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               <div className="flex items-center space-x-2.5">
                 <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Audio recording</h3>
+                  <h3 className="text-sm font-medium text-foreground">Audio Recording</h3>
                   <p className="text-xs text-muted-foreground">Capture audio from microphone and system</p>
                 </div>
               </div>
-              {isTogglingAudio ? (
-                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-              ) : (
-                <Switch id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
-              )}
+              <ManagedSwitch settingKey="disableAudio" id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
             </div>
           </CardContent>
         </Card>
@@ -1624,7 +1539,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <Zap className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                      Batch transcription
+                      Batch Transcription
                       <HelpTooltip text="Accumulates longer audio chunks (30s-5min) using silence-gap detection before sending to Whisper. Gives the model more context for better transcription quality and speaker diarization." />
                     </h3>
                     <p className="text-xs text-muted-foreground">Longer audio chunks for better transcription quality</p>
@@ -1681,7 +1596,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <Music className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                      Filter music
+                      Filter Music
                       <HelpTooltip text="Detect and filter out music-dominant audio (e.g. Spotify, YouTube) before transcription using spectral analysis. Reduces garbage transcriptions from background music." />
                     </h3>
                     <p className="text-xs text-muted-foreground">Remove background music from transcriptions</p>
@@ -1707,8 +1622,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               <div className="flex items-center space-x-2.5">
                 <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Follow system default</h3>
-                  <p className="text-xs text-muted-foreground">Auto-switch when you change default device</p>
+                  <h3 className="text-sm font-medium text-foreground">Auto-select audio devices</h3>
+                  <p className="text-xs text-muted-foreground">Records all default devices. Turn off to exclude bluetooth headphones or pick specific devices.</p>
                 </div>
               </div>
               <Switch
@@ -1887,11 +1802,37 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         />
         )}
 
-      </div>
+        {/* CoreAudio System Audio (macOS 14.4+ only; default on) */}
+        {!settings.disableAudio && coreaudioTapAvailable && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">
+                    CoreAudio system audio capture
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Captures system audio via the CoreAudio Process Tap API (macOS 14.4+). Survives SCK display-enumeration failures after sleep/wake. <strong>Off by default</strong> — the Process Tap can't see audio from voice-processing apps (Zoom / Google Meet / Microsoft Teams), so turning it on will silently drop all meeting audio. Leave off unless you specifically need the sleep/wake resilience. Falls back to ScreenCaptureKit automatically if unavailable. Restart recording after changing.
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="experimentalCoreaudioSystemAudio"
+                checked={Boolean(settings.experimentalCoreaudioSystemAudio ?? false)}
+                onCheckedChange={(checked) => handleSettingsChange({ experimentalCoreaudioSystemAudio: checked }, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+        )}
 
-      
+      </div>
+      </LockedSetting>
 
       {/* Screen */}
+      <LockedSetting settingKey="screen_recording">
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Screen</h2>
 
@@ -1906,7 +1847,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <p className="text-xs text-muted-foreground">Capture screenshots from your monitors</p>
                 </div>
               </div>
-              <Switch id="disableVision" checked={!settings.disableVision} onCheckedChange={(checked) => handleSettingsChange({ disableVision: !checked }, true)} />
+              <ManagedSwitch settingKey="disableVision" id="disableVision" checked={!settings.disableVision} onCheckedChange={(checked) => handleSettingsChange({ disableVision: !checked }, true)} />
             </div>
           </CardContent>
         </Card>
@@ -1999,33 +1940,9 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
-        {/* Text extraction — accessibility and input capture are always enabled (defaults in store.rs) */}
-
-        {/* Workflow event detection (cloud) */}
-        {settings.user?.cloud_subscribed && (
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Zap className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    Workflow events
-                    <span className="text-[10px] font-normal text-muted-foreground bg-muted px-1.5 py-0.5 rounded">cloud</span>
-                  </h3>
-                  <p className="text-xs text-muted-foreground">AI detects your workflow patterns and triggers event-based pipes</p>
-                </div>
-              </div>
-              <Switch
-                checked={settings.enableWorkflowEvents || false}
-                onCheckedChange={(checked) => handleSettingsChange({ enableWorkflowEvents: checked } as any, true)}
-              />
-            </div>
-          </CardContent>
-        </Card>
-        )}
-
       </div>
+      </LockedSetting>
+
 
       {/* System */}
       <div className="space-y-2 pt-2">

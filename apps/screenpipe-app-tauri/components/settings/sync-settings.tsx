@@ -34,6 +34,7 @@ import {
   EyeOff,
   Key,
 } from "lucide-react";
+import { localFetch } from "@/lib/api";
 import { toast } from "@/components/ui/use-toast";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -55,7 +56,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
-import { useSettings, getStore } from "@/lib/hooks/use-settings";
+import { useSettings, getStore, saveAndEncrypt } from "@/lib/hooks/use-settings";
 import { motion } from "framer-motion";
 import Lottie from "lottie-react";
 import cloudSyncAnimation from "@/public/animations/cloud-sync.json";
@@ -758,7 +759,7 @@ export function SyncSettings() {
 
     // 1. Check if the server-side sync service is already running (same session, navigated away and back)
     try {
-      const serverStatus = await fetch("http://localhost:3030/sync/status");
+      const serverStatus = await localFetch("/sync/status");
       if (serverStatus.ok) {
         const serverData = await serverStatus.json();
         console.log("[sync] step 1 - server status:", serverData);
@@ -797,7 +798,7 @@ export function SyncSettings() {
         // Migration: save to store.bin, remove from localStorage
         const store = await getStore();
         await store.set("sync_password", password);
-        await store.save();
+        await saveAndEncrypt(store);
         localStorage.removeItem("sync_password");
         console.log("[sync] step 2b - migration succeeded");
         return true;
@@ -826,7 +827,7 @@ export function SyncSettings() {
       console.log("[sync] step 3 - legacy password worked, saving to store.bin");
       const store = await getStore();
       await store.set("sync_password", legacyDerived);
-      await store.save();
+      await saveAndEncrypt(store);
       return true;
     } catch (e) {
       console.log("[sync] step 3 - legacy deterministic password failed:", e);
@@ -840,7 +841,7 @@ export function SyncSettings() {
       console.log("[sync] step 4 - init_sync with random password succeeded");
       const store = await getStore();
       await store.set("sync_password", randomPassword);
-      await store.save();
+      await saveAndEncrypt(store);
       return true;
     } catch (e) {
       console.log("[sync] step 4 - init_sync failed, showing password prompt:", e);
@@ -853,7 +854,7 @@ export function SyncSettings() {
   };
 
   const fetchDeviceCounts = () => {
-    fetch("http://localhost:3030/data/device-storage")
+    localFetch("/data/device-storage")
       .then((r) => r.ok ? r.json() : [])
       .then((data: { machine_id: string; frames: number; audio_chunks: number }[]) => {
         const map: Record<string, { frames: number; audioChunks: number }> = {};
@@ -952,8 +953,7 @@ export function SyncSettings() {
         const subscriptionStatus = data.subscription?.status;
         const hasSubscription = data.hasSubscription ||
           subscriptionStatus === "trialing" ||
-          subscriptionStatus === "active" ||
-          !!settings.user?.cloud_subscribed;
+          subscriptionStatus === "active";
         setSubscription({
           hasSubscription,
           tier: data.subscription?.tier || null,
@@ -962,12 +962,32 @@ export function SyncSettings() {
 
         if (hasSubscription) {
           if (settings.user && !settings.user.cloud_subscribed) {
-            await updateSettings({
+            const engineUpdate: Record<string, any> = {
               user: { ...settings.user, cloud_subscribed: true },
-            });
+            };
+            // Auto-switch to cloud transcription for new subscribers
+            if (settings.audioTranscriptionEngine !== "screenpipe-cloud") {
+              engineUpdate.audioTranscriptionEngine = "screenpipe-cloud";
+            }
+            await updateSettings(engineUpdate);
           }
           return await initSyncBackend();
         } else {
+          // Subscription expired/cancelled — clear cloud flag and revert engine
+          // only if it's still set to cloud (don't touch disabled or other engines)
+          if (settings.user?.cloud_subscribed) {
+            const revertUpdate: Record<string, any> = {
+              user: { ...settings.user, cloud_subscribed: false },
+            };
+            if (settings.audioTranscriptionEngine === "screenpipe-cloud") {
+              const { platform: getPlatform } = await import("@tauri-apps/plugin-os");
+              const os = getPlatform();
+              revertUpdate.audioTranscriptionEngine = os === "macos"
+                ? "whisper-large-v3-turbo-quantized"
+                : "parakeet";
+            }
+            await updateSettings(revertUpdate);
+          }
           setStep("onboarding");
           return false;
         }
@@ -1075,7 +1095,7 @@ export function SyncSettings() {
       try {
         const store = await getStore();
         await store.set("sync_password", password);
-        await store.save();
+        await saveAndEncrypt(store);
         // Clean up any old localStorage entry
         localStorage.removeItem("sync_password");
       } catch {
@@ -1226,7 +1246,7 @@ export function SyncSettings() {
     try {
       const store = await getStore();
       await store.delete("sync_password");
-      await store.save();
+      await saveAndEncrypt(store);
     } catch {
       // Non-critical
     }

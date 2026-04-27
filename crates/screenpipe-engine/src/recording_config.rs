@@ -40,6 +40,8 @@ pub struct RecordingConfig {
     // Devices & monitors
     pub audio_devices: Vec<String>,
     pub use_system_default_audio: bool,
+    /// Experimental: use CoreAudio Process Tap for System Audio on macOS 14.4+.
+    pub experimental_coreaudio_system_audio: bool,
     pub monitor_ids: Vec<String>,
     pub use_all_monitors: bool,
 
@@ -106,6 +108,27 @@ pub struct RecordingConfig {
 
     /// Per-day schedule rules (only used when schedule_enabled is true).
     pub schedule_rules: Vec<screenpipe_config::ScheduleRule>,
+
+    /// Maximum width for stored snapshots (0 = no limit). Default: 1920.
+    pub max_snapshot_width: u32,
+
+    /// Require authentication for remote (non-localhost) API access.
+    /// When true, requests from other devices must include
+    /// `Authorization: Bearer <SCREENPIPE_API_KEY>`.
+    pub api_auth: bool,
+
+    /// The API key for this instance (from SCREENPIPE_API_KEY env or auth.json).
+    /// Used to validate incoming remote requests when api_auth is enabled.
+    pub api_auth_key: Option<String>,
+
+    /// IP address the HTTP server listens on. Default: 127.0.0.1 (localhost only).
+    /// Set to 0.0.0.0 to allow access from other devices on the network.
+    /// When set to 0.0.0.0, api_auth should be enabled for security.
+    pub listen_address: std::net::Ipv4Addr,
+
+    /// When true, create a keychain encryption key if one doesn't exist.
+    /// Without this, the CLI only uses an existing key (created by the desktop app).
+    pub encrypt_secrets: bool,
 }
 
 impl RecordingConfig {
@@ -123,6 +146,10 @@ impl RecordingConfig {
         audio_engine_override: Option<&str>,
     ) -> Self {
         let engine_str = audio_engine_override.unwrap_or(&settings.audio_transcription_engine);
+
+        // Sync the record_while_locked preference to the shared atomic flag
+        // so the audio recording loop can read it without holding a config reference.
+        screenpipe_config::set_record_while_locked(settings.record_while_locked);
 
         Self {
             audio_chunk_duration: settings.audio_chunk_duration.max(0) as u64,
@@ -143,6 +170,7 @@ impl RecordingConfig {
             },
             audio_devices: settings.audio_devices.clone(),
             use_system_default_audio: settings.use_system_default_audio,
+            experimental_coreaudio_system_audio: settings.experimental_coreaudio_system_audio,
             monitor_ids: settings.monitor_ids.clone(),
             use_all_monitors: settings.use_all_monitors,
             ignored_windows: settings.ignored_windows.clone(),
@@ -192,6 +220,21 @@ impl RecordingConfig {
                 .unwrap_or_default(),
             schedule_enabled: settings.schedule_enabled,
             schedule_rules: settings.schedule_rules.clone(),
+            max_snapshot_width: settings.max_snapshot_width,
+            // LAN exposure is opt-in. We force `api_auth` on whenever
+            // `listen_on_lan` is true so a user can never accidentally
+            // publish an unauthenticated API on their local network. The
+            // UI makes the dependency explicit; this guard is the safety
+            // net if someone edits the settings JSON by hand or flips the
+            // field via an older frontend that doesn't know about it.
+            api_auth: settings.api_auth || settings.listen_on_lan,
+            api_auth_key: None,
+            listen_address: if settings.listen_on_lan {
+                std::net::Ipv4Addr::UNSPECIFIED // 0.0.0.0 — all interfaces
+            } else {
+                std::net::Ipv4Addr::LOCALHOST
+            },
+            encrypt_secrets: false, // desktop app handles keychain via Tauri commands
         }
     }
 
@@ -217,12 +260,14 @@ impl RecordingConfig {
         audio_devices: Vec<String>,
     ) -> AudioManagerBuilder {
         AudioManagerBuilder::new()
+            .is_disabled(self.disable_audio)
             .audio_chunk_duration(Duration::from_secs(self.audio_chunk_duration))
             .vad_engine(VadEngineEnum::Silero)
             .languages(self.languages.clone())
             .transcription_engine(self.audio_transcription_engine.clone())
             .enabled_devices(audio_devices)
             .use_system_default_audio(self.use_system_default_audio)
+            .experimental_coreaudio_system_audio(self.experimental_coreaudio_system_audio)
             .deepgram_api_key(self.deepgram_api_key.clone())
             .output_path(output_path)
             .use_pii_removal(self.use_pii_removal)
@@ -250,6 +295,59 @@ impl RecordingConfig {
             ignore_incognito_windows: self.ignore_incognito_windows,
             pause_on_drm_content: self.pause_on_drm_content,
             languages: self.languages.clone(),
+            max_snapshot_width: self.max_snapshot_width,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn settings_with(lan: bool, api_auth: bool) -> screenpipe_config::RecordingSettings {
+        let mut s = screenpipe_config::RecordingSettings::default();
+        s.listen_on_lan = lan;
+        s.api_auth = api_auth;
+        s
+    }
+
+    fn build(s: &screenpipe_config::RecordingSettings) -> RecordingConfig {
+        RecordingConfig::from_settings(s, std::path::PathBuf::from("/tmp/sp_test"), None)
+    }
+
+    #[test]
+    fn defaults_to_loopback() {
+        let c = build(&screenpipe_config::RecordingSettings::default());
+        assert_eq!(c.listen_address, Ipv4Addr::LOCALHOST);
+        assert!(c.api_auth, "api_auth defaults to true for safety");
+    }
+
+    #[test]
+    fn listen_on_lan_binds_unspecified() {
+        let c = build(&settings_with(true, true));
+        assert_eq!(c.listen_address, Ipv4Addr::UNSPECIFIED);
+        assert!(c.api_auth);
+    }
+
+    #[test]
+    fn listen_on_lan_forces_api_auth_on_even_if_disabled() {
+        // The UI or a hand-edited settings file might flip api_auth off
+        // while listen_on_lan is on — we refuse to let that combo ship.
+        let c = build(&settings_with(true, false));
+        assert_eq!(c.listen_address, Ipv4Addr::UNSPECIFIED);
+        assert!(
+            c.api_auth,
+            "api_auth must be forced on when LAN access is enabled"
+        );
+    }
+
+    #[test]
+    fn listen_on_lan_off_respects_api_auth_off() {
+        // If the user has explicitly disabled auth AND kept the bind on
+        // loopback, leave them alone — localhost-only is already safe.
+        let c = build(&settings_with(false, false));
+        assert_eq!(c.listen_address, Ipv4Addr::LOCALHOST);
+        assert!(!c.api_auth);
     }
 }

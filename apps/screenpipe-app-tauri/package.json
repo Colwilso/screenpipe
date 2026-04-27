@@ -78,6 +78,7 @@
     "react-resizable-panels": "^2.1.9",
     "react-syntax-highlighter": "^15.6.6",
     "recharts": "^3.8.0",
+    "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
     "sonner": "^2.0.7",
@@ -91,6 +92,7 @@
     "zustand": "^5.0.11"
   },
   "devDependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@tailwindcss/typography": "^0.5.19",
     "@tauri-apps/cli": "=2.10.0",
     "@testing-library/jest-dom": "^6.9.1",

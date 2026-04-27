@@ -411,6 +411,23 @@ const CHROMIUM_BROWSERS: &[ChromiumBrowserInfo] = &[
     },
 ];
 
+/// Returns true on macOS 14.4+ where the CoreAudio Process Tap API is
+/// available. Used to gate the "experimental System Audio via CoreAudio"
+/// toggle — we don't show it on platforms where flipping it would be a
+/// no-op. False on Windows, Linux, and older macOS.
+#[tauri::command(async)]
+#[specta::specta]
+pub fn check_coreaudio_process_tap_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        screenpipe_audio::core::process_tap::is_process_tap_available()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Check if Arc browser is installed (macOS only)
 #[tauri::command(async)]
 #[specta::specta]
@@ -427,6 +444,7 @@ pub fn check_arc_installed() -> bool {
 }
 
 /// Returns the names of installed Chromium browsers that need Automation permission
+#[allow(dead_code)]
 #[tauri::command(async)]
 #[specta::specta]
 pub fn get_installed_browsers() -> Vec<String> {
@@ -447,6 +465,7 @@ pub fn get_installed_browsers() -> Vec<String> {
 
 /// Check if Automation permission is granted for all installed Chromium browsers.
 /// Returns true only if ALL installed browsers have automation granted.
+#[allow(dead_code)]
 #[tauri::command(async)]
 #[specta::specta]
 pub fn check_browsers_automation_permission(_app: tauri::AppHandle) -> bool {
@@ -480,6 +499,7 @@ pub fn check_browsers_automation_permission(_app: tauri::AppHandle) -> bool {
 /// Request Automation permission for installed Chromium browsers that are already running.
 /// Never force-launches browsers — only prompts for ones the user already has open.
 /// Opens System Settings > Automation as fallback for browsers not running.
+#[allow(dead_code)]
 #[tauri::command(async)]
 #[specta::specta]
 pub fn request_browsers_automation_permission(_app: tauri::AppHandle) -> bool {
@@ -538,6 +558,112 @@ pub fn request_browsers_automation_permission(_app: tauri::AppHandle) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         false
+    }
+}
+
+/// Per-browser automation status: "granted", "denied", or "not_asked".
+/// Also includes whether the browser is currently running.
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAutomationStatus {
+    pub name: String,
+    pub status: String, // "granted" | "denied" | "not_asked"
+    pub running: bool,
+}
+
+/// Returns per-browser automation permission status for all installed Chromium browsers.
+#[allow(dead_code)]
+#[tauri::command(async)]
+#[specta::specta]
+pub fn get_browsers_automation_status() -> Vec<BrowserAutomationStatus> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        CHROMIUM_BROWSERS
+            .iter()
+            .filter(|b| std::path::Path::new(b.app_path).exists())
+            .map(|b| {
+                let running = Command::new("pgrep")
+                    .args(["-x", b.process_name])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+
+                let status = if is_app_bundle() {
+                    match ae_check_automation_direct(b.bundle_id, false) {
+                        0 => "granted",
+                        -1744 => "denied",
+                        _ => "not_asked",
+                    }
+                } else {
+                    "not_asked" // can't reliably check in dev mode
+                };
+
+                BrowserAutomationStatus {
+                    name: b.name.to_string(),
+                    status: status.to_string(),
+                    running,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Request automation permission for a single browser by name.
+/// Returns the new status: "granted", "denied", or "not_asked".
+#[allow(dead_code)]
+#[tauri::command(async)]
+#[specta::specta]
+pub fn request_single_browser_automation(browser_name: String) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        let browser = CHROMIUM_BROWSERS.iter().find(|b| b.name == browser_name);
+
+        let Some(browser) = browser else {
+            return "not_asked".to_string();
+        };
+
+        if !std::path::Path::new(browser.app_path).exists() {
+            return "not_asked".to_string();
+        }
+
+        let running = Command::new("pgrep")
+            .args(["-x", browser.process_name])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !running {
+            // Can't prompt — open System Settings as fallback
+            open_permission_settings(OSPermission::Automation);
+            return "not_asked".to_string();
+        }
+
+        if is_app_bundle() {
+            match ae_check_automation_direct(browser.bundle_id, true) {
+                0 => "granted".to_string(),
+                -1744 => "denied".to_string(),
+                _ => "not_asked".to_string(),
+            }
+        } else {
+            open_permission_settings(OSPermission::Automation);
+            "not_asked".to_string()
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = browser_name;
+        "not_asked".to_string()
     }
 }
 
@@ -780,154 +906,9 @@ pub fn request_arc_automation_permission(_app: tauri::AppHandle) -> bool {
     }
 }
 
-/// Start background permission monitor that checks permissions periodically
-/// and emits an event when any permission is lost
-#[cfg(target_os = "macos")]
-pub async fn start_permission_monitor(app: tauri::AppHandle) {
-    use crate::store::OnboardingStore;
-    use tauri::Emitter;
-    use tokio::time::{interval, Duration};
-
-    // Wait for onboarding to complete before monitoring permissions
-    // During onboarding, permissions haven't been granted yet - monitoring would cause false alarms
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        match OnboardingStore::get(&app) {
-            Ok(Some(store)) if store.is_completed => break,
-            _ => continue,
-        }
-    }
-
-    // Extra delay after onboarding to let permissions settle
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Check if any Chromium browser is installed once at startup
-    let any_browser_installed = CHROMIUM_BROWSERS
-        .iter()
-        .any(|b| std::path::Path::new(b.app_path).exists());
-
-    let mut check_interval = interval(Duration::from_secs(10));
-
-    // Track consecutive failures to avoid false positives from transient TCC issues
-    // macOS preflight() and AEDeterminePermissionToAutomateTarget can return
-    // inconsistent results transiently, especially Arc automation in dev mode
-    // (run_self_detached has timing-dependent launchctl behavior)
-    let mut screen_fail_count = 0u32;
-    let mut mic_fail_count = 0u32;
-    let mut accessibility_fail_count = 0u32;
-    let mut browser_fail_count = 0u32;
-    // Require consecutive successes before resetting fail count, to prevent
-    // a single transient "OK" from resetting the counter and re-triggering
-    let mut screen_ok_count = 0u32;
-    let mut mic_ok_count = 0u32;
-    let mut accessibility_ok_count = 0u32;
-    let mut browser_ok_count = 0u32;
-    const REQUIRED_CONSECUTIVE_FAILURES: u32 = 2;
-    const REQUIRED_CONSECUTIVE_SUCCESSES: u32 = 3; // need 3 consecutive OKs (~30s) to reset
-
-    // Cooldown: don't re-emit within 5 minutes even if counters re-trigger
-    let mut last_emitted: Option<tokio::time::Instant> = None;
-    const EMIT_COOLDOWN: Duration = Duration::from_secs(300);
-
-    loop {
-        check_interval.tick().await;
-        if QUIT_REQUESTED.load(Ordering::SeqCst) {
-            info!("Permission monitor received quit request, shutting down.");
-            break;
-        }
-
-        let perms = do_permissions_check(false);
-        let screen_ok = perms.screen_recording.permitted();
-        let mic_ok = perms.microphone.permitted();
-        let accessibility_ok = perms.accessibility.permitted();
-
-        // Check browser automation permission if any Chromium browser is installed
-        // This is informational only — never triggers recovery modal (#2510)
-        let browser_automation_ok = if any_browser_installed {
-            check_browsers_automation_permission(app.clone())
-        } else {
-            true
-        };
-
-        // Update consecutive failure/success counts
-        // Only reset fail count after REQUIRED_CONSECUTIVE_SUCCESSES in a row
-        // This prevents transient "OK" flickers from resetting the counter
-        if screen_ok {
-            screen_ok_count += 1;
-            if screen_ok_count >= REQUIRED_CONSECUTIVE_SUCCESSES {
-                screen_fail_count = 0;
-            }
-        } else {
-            screen_ok_count = 0;
-            screen_fail_count = screen_fail_count.saturating_add(1);
-        }
-
-        if mic_ok {
-            mic_ok_count += 1;
-            if mic_ok_count >= REQUIRED_CONSECUTIVE_SUCCESSES {
-                mic_fail_count = 0;
-            }
-        } else {
-            mic_ok_count = 0;
-            mic_fail_count = mic_fail_count.saturating_add(1);
-        }
-
-        if accessibility_ok {
-            accessibility_ok_count += 1;
-            if accessibility_ok_count >= REQUIRED_CONSECUTIVE_SUCCESSES {
-                accessibility_fail_count = 0;
-            }
-        } else {
-            accessibility_ok_count = 0;
-            accessibility_fail_count = accessibility_fail_count.saturating_add(1);
-        }
-
-        if browser_automation_ok {
-            browser_ok_count += 1;
-            if browser_ok_count >= REQUIRED_CONSECUTIVE_SUCCESSES {
-                browser_fail_count = 0;
-            }
-        } else {
-            browser_ok_count = 0;
-            browser_fail_count = browser_fail_count.saturating_add(1);
-        }
-
-        // Only trigger when we have REQUIRED_CONSECUTIVE_FAILURES in a row
-        let screen_confirmed_lost = screen_fail_count == REQUIRED_CONSECUTIVE_FAILURES;
-        let mic_confirmed_lost = mic_fail_count == REQUIRED_CONSECUTIVE_FAILURES;
-        let accessibility_confirmed_lost =
-            accessibility_fail_count == REQUIRED_CONSECUTIVE_FAILURES;
-        // Browser automation is tracked but NOT used to trigger the recovery modal —
-        // it's optional and shouldn't block the user (#2510).
-        let _ = browser_fail_count; // keep tracking for payload, suppress unused warning
-
-        // Only emit permission-lost when a CORE permission is lost (screen, mic, accessibility).
-        let core_lost = screen_confirmed_lost || mic_confirmed_lost || accessibility_confirmed_lost;
-        if core_lost && (!screen_ok || !mic_ok || !accessibility_ok) {
-            // Enforce cooldown to prevent modal spam from flaky checks
-            let should_emit = match last_emitted {
-                Some(t) => t.elapsed() >= EMIT_COOLDOWN,
-                None => true,
-            };
-            if should_emit {
-                if let Err(e) = app.emit(
-                    "permission-lost",
-                    serde_json::json!({
-                        "screen_recording": !screen_ok,
-                        "microphone": !mic_ok,
-                        "accessibility": !accessibility_ok,
-                        "browser_automation": !browser_automation_ok,
-                    }),
-                ) {
-                    error!("failed to emit permission-lost event: {}", e);
-                }
-                last_emitted = Some(tokio::time::Instant::now());
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub async fn start_permission_monitor(_app: tauri::AppHandle) {
-    // No-op on non-macOS platforms
-}
+// NOTE: Runtime permission monitoring is now handled by
+// `screenpipe-engine::permission_monitor` which emits `permission_lost` /
+// `permission_restored` events on the shared event bus. The Tauri app
+// subscribes via `crate::permission_events` over /ws/events. This module
+// keeps the synchronous TCC/AV check helpers used by the onboarding UI
+// and the preflight startup check.

@@ -9,14 +9,17 @@
 //! - Click-through mode: mouse events pass through to windows below
 //! - Interactive mode: window receives mouse events normally
 
-use tauri::WebviewWindow;
+use tauri::{AppHandle, Manager, WebviewWindow};
 use tracing::{error, info};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, SetForegroundWindow, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
-    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_THICKFRAME,
+    GetWindowLongW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongW, SetWindowPos,
+    GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_DISPLAY_AFFINITY, WS_CAPTION,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_THICKFRAME,
 };
 
 /// Extended window styles for overlay behavior
@@ -115,8 +118,10 @@ pub fn setup_overlay(window: &WebviewWindow, click_through: bool) -> Result<(), 
             let rc = mi.rcMonitor;
             info!(
                 "Repositioning overlay to monitor rect: ({}, {}) {}x{}",
-                rc.left, rc.top,
-                rc.right - rc.left, rc.bottom - rc.top
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top
             );
             SetWindowPos(
                 hwnd,
@@ -219,14 +224,58 @@ pub fn is_click_through_enabled(window: &WebviewWindow) -> bool {
 /// Repositions the overlay to exactly cover the monitor at the given physical point.
 /// Used when re-showing the overlay so it appears on the monitor where the cursor is,
 /// matching macOS behavior where the panel moves to the active screen.
-pub fn reposition_to_cursor_monitor(window: &WebviewWindow, cursor_x: i32, cursor_y: i32) -> Result<(), String> {
+/// Centers window-mode overlay (fixed inner size) on the monitor that contains
+/// the cursor. Without this, Windows places the first webview near the prior
+/// window (often beside Home), which breaks cursor-vs-monitor bounds checks.
+pub fn center_window_mode_on_cursor_monitor(
+    window: &WebviewWindow,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let cursor = app.cursor_position().map_err(|e| e.to_string())?;
+    let monitors = app.available_monitors().map_err(|e| e.to_string())?;
+    let monitor = monitors
+        .into_iter()
+        .find(|m| {
+            let p = m.position();
+            let s = m.size();
+            let cx = cursor.x as i32;
+            let cy = cursor.y as i32;
+            cx >= p.x
+                && cx < p.x + s.width as i32
+                && cy >= p.y
+                && cy < p.y + s.height as i32
+        })
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .ok_or_else(|| "no monitor found for centering".to_string())?;
+
+    let mp = monitor.position();
+    let ms = monitor.size();
+    let ws = window.inner_size().map_err(|e| e.to_string())?;
+    let x = mp.x + (ms.width as i32 - ws.width as i32) / 2;
+    let y = mp.y + (ms.height as i32 - ws.height as i32) / 2;
+
+    window
+        .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)))
+        .map_err(|e| e.to_string())?;
+    info!("window-mode overlay centered at ({}, {})", x, y);
+    Ok(())
+}
+
+pub fn reposition_to_cursor_monitor(
+    window: &WebviewWindow,
+    cursor_x: i32,
+    cursor_y: i32,
+) -> Result<(), String> {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::MonitorFromPoint;
 
     let hwnd = get_hwnd(window).ok_or("Failed to get HWND")?;
 
     unsafe {
-        let point = POINT { x: cursor_x, y: cursor_y };
+        let point = POINT {
+            x: cursor_x,
+            y: cursor_y,
+        };
         let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -242,8 +291,10 @@ pub fn reposition_to_cursor_monitor(window: &WebviewWindow, cursor_x: i32, curso
         let rc = mi.rcMonitor;
         info!(
             "Repositioning overlay to cursor monitor: ({}, {}) {}x{}",
-            rc.left, rc.top,
-            rc.right - rc.left, rc.bottom - rc.top
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top
         );
 
         let result = SetWindowPos(
@@ -317,6 +368,29 @@ pub fn bring_to_front_and_activate(window: &WebviewWindow) -> Result<(), String>
     }
 
     info!("Overlay brought to front and activated");
+    Ok(())
+}
+
+/// Controls whether the window is excluded from screen capture tools like OBS.
+///
+/// When `capturable` is false, `WDA_EXCLUDEFROMCAPTURE` hides the window from
+/// all screen recording APIs (requires Windows 10 version 2004+).
+/// When true, `WDA_NONE` restores normal capture visibility.
+pub fn set_display_affinity(window: &WebviewWindow, capturable: bool) -> Result<(), String> {
+    let hwnd = get_hwnd(window).ok_or("Failed to get HWND")?;
+    let affinity: WINDOW_DISPLAY_AFFINITY = if capturable {
+        WDA_NONE
+    } else {
+        WDA_EXCLUDEFROMCAPTURE
+    };
+    unsafe {
+        SetWindowDisplayAffinity(hwnd, affinity)
+            .map_err(|e| format!("SetWindowDisplayAffinity failed: {}", e))?;
+    }
+    info!(
+        "Window display affinity set: capturable={} (affinity=0x{:X})",
+        capturable, affinity.0
+    );
     Ok(())
 }
 

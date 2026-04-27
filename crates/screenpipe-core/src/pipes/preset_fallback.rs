@@ -217,10 +217,7 @@ impl PresetFallbackRegistry {
         let mut changed = false;
 
         for (i, preset_id) in presets.iter().enumerate().take(MAX_FALLBACK_DEPTH) {
-            let breaker = state
-                .presets
-                .entry(preset_id.clone())
-                .or_insert_with(PresetBreaker::default);
+            let breaker = state.presets.entry(preset_id.clone()).or_default();
 
             // Check if cooldown expired → HALF_OPEN
             if breaker.check_recovery() {
@@ -246,10 +243,7 @@ impl PresetFallbackRegistry {
     /// Record a successful execution for a preset.
     pub fn record_success(&self, preset_id: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let breaker = state
-            .presets
-            .entry(preset_id.to_string())
-            .or_insert_with(PresetBreaker::default);
+        let breaker = state.presets.entry(preset_id.to_string()).or_default();
         breaker.record_success();
         self.persist(&state);
     }
@@ -276,10 +270,7 @@ impl PresetFallbackRegistry {
         };
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let breaker = state
-            .presets
-            .entry(preset_id.to_string())
-            .or_insert_with(PresetBreaker::default);
+        let breaker = state.presets.entry(preset_id.to_string()).or_default();
         breaker.trip(reason);
         self.persist(&state);
 
@@ -319,10 +310,7 @@ impl PresetFallbackRegistry {
         };
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let breaker = state
-            .presets
-            .entry(preset_id.to_string())
-            .or_insert_with(PresetBreaker::default);
+        let breaker = state.presets.entry(preset_id.to_string()).or_default();
         breaker.trip(reason);
         self.persist(&state);
 
@@ -337,8 +325,20 @@ impl PresetFallbackRegistry {
 
         for (id, breaker) in state.presets.iter_mut() {
             if breaker.state == BreakerState::Open && now >= breaker.cooldown_until {
-                breaker.state = BreakerState::HalfOpen;
-                info!("startup recovery: preset '{}' moved to half-open", id);
+                // Cooldown expired >24h ago — fully reset so a prolonged outage
+                // (e.g. auth drift) doesn't leave the breaker stuck indefinitely.
+                if now.saturating_sub(breaker.cooldown_until) > 86400 {
+                    breaker.state = BreakerState::Closed;
+                    breaker.failure_count = 0;
+                    breaker.success_streak = 0;
+                    info!(
+                        "startup recovery: preset '{}' reset to closed (stale open >24h)",
+                        id
+                    );
+                } else {
+                    breaker.state = BreakerState::HalfOpen;
+                    info!("startup recovery: preset '{}' moved to half-open", id);
+                }
                 changed = true;
             }
             // Sanity: if cooldown_until is more than 24h in the future, reset it

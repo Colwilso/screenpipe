@@ -125,27 +125,11 @@ jobs:
             echo "windows_runner=windows-2022" >> $GITHUB_OUTPUT
             echo "⚠️ Forcing GitHub-hosted runners (manual override)"
           else
-            # macOS aarch64: MacBook only (Apple Intelligence requires local Xcode 26 SDK)
-            MACBOOK=$(check_runner "macos-26")
+            # macOS aarch64: GitHub-hosted macos-26 runner
+            echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
+            echo "✅ Using GitHub-hosted macos-26 runner"
 
-            if [ "$MACBOOK" = "available" ]; then
-              echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
-              echo "✅ MacBook (macos-26) is available"
-            elif [ "$MACBOOK" = "busy" ]; then
-              RESULT=$(wait_for_runner "macos-26" 300)
-              if [ "$RESULT" = "available" ]; then
-                echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
-                echo "✅ MacBook (macos-26) became available"
-              else
-                echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
-                echo "⚠️ MacBook still busy after 5 min — queuing anyway (will wait for runner)"
-              fi
-            else
-              echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
-              echo "⚠️ MacBook offline — job will wait until it comes online"
-            fi
-
-            # Always use GH-hosted Windows — self-hosted is unreliable for builds
+            # Always use GH-hosted Windows - self-hosted is unreliable for builds
             echo "windows_runner=windows-2022" >> $GITHUB_OUTPUT
             echo "ℹ️ Using GH-hosted Windows runner (windows-2022)"
           fi
@@ -169,7 +153,7 @@ jobs:
           fi
 
       - name: draft placeholder
-        run: echo "R2-based releases — no CN draft needed"
+        run: echo "R2-based releases - no CN draft needed"
 
   publish-tauri:
     needs: [check_commit, draft]
@@ -180,14 +164,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Self-hosted macOS 26 runner (MacBook Pro) for Apple Silicon + Apple Intelligence
-          # Falls back to macos-latest (GH-hosted) if runner is offline
+          # GitHub-hosted macOS 26 runner for Apple Silicon + Apple Intelligence
           - platform: ${{ needs.check_commit.outputs.macos_arm_runner || 'macos-latest' }}
             args: "--target aarch64-apple-darwin --features metal,parakeet-mlx"
             target: aarch64-apple-darwin
             tauri-args: "--target aarch64-apple-darwin --features metal,parakeet-mlx,official-build"
             os_type: "macos"
-          - platform: "macos-latest"
+          - platform: "macos-26"
             args: "--target x86_64-apple-darwin --features metal"
             target: x86_64-apple-darwin
             tauri-args: "--target x86_64-apple-darwin --features metal,official-build"
@@ -210,7 +193,7 @@ jobs:
             tauri-args: "--target x86_64-unknown-linux-gnu --features official-build"
             os_type: "linux"
 
-    runs-on: ${{ matrix.platform == 'macos-26' && fromJSON('["self-hosted", "macos-26"]') || matrix.platform == 'windows-desktop-test' && fromJSON('["self-hosted", "windows-desktop-test"]') || matrix.platform }}
+    runs-on: ${{ matrix.platform == 'windows-desktop-test' && fromJSON('["self-hosted", "windows-desktop-test"]') || matrix.platform }}
     timeout-minutes: 120
     steps:
       - name: Detect Xcode version and set Apple Intelligence feature
@@ -227,13 +210,13 @@ jobs:
           SDK_SETTINGS="${SDK_PATH}/SDKSettings.json"
           if [ -f "$SDK_SETTINGS" ] && grep -q '"26\.' "$SDK_SETTINGS"; then
             echo "has_apple_intelligence=true" >> $GITHUB_OUTPUT
-            echo "🧠 macOS 26+ SDK detected — Apple Intelligence enabled"
+            echo "🧠 macOS 26+ SDK detected - Apple Intelligence enabled"
           elif [ -d "${SDK_PATH}/System/Library/Frameworks/FoundationModels.framework" ]; then
             echo "has_apple_intelligence=true" >> $GITHUB_OUTPUT
-            echo "🧠 FoundationModels.framework found — Apple Intelligence enabled"
+            echo "🧠 FoundationModels.framework found - Apple Intelligence enabled"
           else
             echo "has_apple_intelligence=false" >> $GITHUB_OUTPUT
-            echo "ℹ️ macOS SDK < 26 — Apple Intelligence not available (stub will be used)"
+            echo "ℹ️ macOS SDK < 26 - Apple Intelligence not available (stub will be used)"
           fi
 
       - name: Enable Git long paths on Windows
@@ -379,7 +362,7 @@ jobs:
             ${{ runner.os }}-brew-
 
       # Cache binary dependencies (ffmpeg, tesseract, ollama, vcredist, WixTools)
-      # These rarely change — keyed on workflow file hash, not lockfiles
+      # These rarely change - keyed on workflow file hash, not lockfiles
       - name: Cache Binary Dependencies
         uses: actions/cache@v4
         with:
@@ -396,7 +379,7 @@ jobs:
           restore-keys: |
             ${{ matrix.platform }}-${{ matrix.target }}-bins-
 
-      # Cache node_modules and tauri CLI — changes with bun.lockb
+      # Cache node_modules and tauri CLI - changes with bun.lockb
       - name: Cache Node Modules
         id: cache-pre-build
         uses: actions/cache@v4
@@ -485,15 +468,35 @@ jobs:
         if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
         shell: powershell
         run: |
-          winget install Ninja-build.Ninja --accept-package-agreements --accept-source-agreements --silent
+          # The windows-11-arm runner image pre-installs Ninja at C:\Tools\Ninja
+          # but winget is NOT on PATH by default - so blindly calling
+          # `winget install` fails with CommandNotFoundException and kills
+          # the build even though Ninja is already available. Check first,
+          # fall back to winget only if both the pre-installed path AND the
+          # winget CLI are present.
           $paths = @("C:\Program Files\Ninja", "C:\Tools\Ninja")
-          foreach ($p in $paths) {
-            if (Test-Path "$p\ninja.exe") {
-              echo $p | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-              break
+          $found = $paths | Where-Object { Test-Path "$_\ninja.exe" } | Select-Object -First 1
+
+          if (-not $found) {
+            Write-Host "Ninja not found in preinstalled paths, trying winget..."
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+              winget install Ninja-build.Ninja --accept-package-agreements --accept-source-agreements --silent
+              $found = $paths | Where-Object { Test-Path "$_\ninja.exe" } | Select-Object -First 1
+            } else {
+              Write-Host "winget unavailable on this runner - downloading Ninja release zip"
+              $zip = "$env:RUNNER_TEMP\ninja.zip"
+              Invoke-WebRequest -Uri "https://github.com/ninja-build/ninja/releases/latest/download/ninja-winarm64.zip" -OutFile $zip
+              $dest = "C:\Tools\Ninja"
+              New-Item -ItemType Directory -Force -Path $dest | Out-Null
+              Expand-Archive -Path $zip -DestinationPath $dest -Force
+              $found = $dest
             }
           }
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
+          if (-not $found) { throw "Ninja not found and could not be installed" }
+          Write-Host "Using Ninja at: $found"
+          echo $found | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:Path = "$found;" + $env:Path
           ninja --version
 
       - name: Install wget on Windows
@@ -590,7 +593,7 @@ jobs:
             -T /usr/bin/productbuild \
             -k "$BUILD_KC"
 
-          # Set partition list — we own this keychain so this always works
+          # Set partition list - we own this keychain so this always works
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
             -s -k "$BUILD_KC_PASS" \
@@ -636,14 +639,14 @@ jobs:
           # SystemRootCertificates.keychain may not be accessible to codesign.
           # IMPORTANT: Use timeout because `security add-trusted-cert` hangs
           # indefinitely on GH-hosted runners (no SecurityAgent/GUI session).
-          # On GH-hosted runners this will timeout and that's fine — they have
+          # On GH-hosted runners this will timeout and that's fine - they have
           # Apple Root CA in SystemRootCertificates.keychain already.
           echo "=== Setting trust policies ==="
-          timeout 10 security add-trusted-cert -r trustRoot -p codeSign -k "$BUILD_KC" \
+          perl -e 'alarm 10; exec @ARGV' security add-trusted-cert -r trustRoot -p codeSign -k "$BUILD_KC" \
             ~/apple-certs/AppleRootCA.cer 2>&1 || echo "  (trust AppleRootCA: skipped or already set)"
-          timeout 10 security add-trusted-cert -r unspecified -p codeSign -k "$BUILD_KC" \
+          perl -e 'alarm 10; exec @ARGV' security add-trusted-cert -r unspecified -p codeSign -k "$BUILD_KC" \
             ~/apple-certs/DeveloperIDCA.cer 2>&1 || echo "  (trust DeveloperIDCA: skipped or already set)"
-          timeout 10 security add-trusted-cert -r unspecified -p codeSign -k "$BUILD_KC" \
+          perl -e 'alarm 10; exec @ARGV' security add-trusted-cert -r unspecified -p codeSign -k "$BUILD_KC" \
             ~/apple-certs/DeveloperIDG2CA.cer 2>&1 || echo "  (trust DeveloperIDG2CA: skipped or already set)"
 
           # Ensure login keychain + System Roots are in the search list
@@ -668,8 +671,8 @@ jobs:
         shell: bash
         run: |
           ARGS="${{ matrix.tauri-args }}"
-          if [[ "${{ steps.detect-xcode.outputs.has_apple_intelligence }}" == "true" ]]; then
-            # Append apple-intelligence to existing --features flag
+          if [[ "${{ steps.detect-xcode.outputs.has_apple_intelligence }}" == "true" && "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            # Apple Intelligence only works on aarch64 - the crate exports nothing on x86_64
             ARGS=$(echo "$ARGS" | sed 's/--features \([^ ]*\)/--features \1,apple-intelligence/')
             echo "🧠 Tauri build will include Apple Intelligence"
           fi
@@ -703,6 +706,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI: true
+          GGML_NATIVE: "OFF"
+          GGML_AVX512: "OFF"
+          GGML_AVX512_VBMI: "OFF"
+          GGML_AVX512_VNNI: "OFF"
+          GGML_AVX512_BF16: "OFF"
           CMAKE_ARGS: -DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF
           NO_STRIP: true
         run: |
@@ -722,7 +730,7 @@ jobs:
           # Tell linuxdeploy to deploy GTK3 plugin dependencies (bundles libsecret etc.)
           export DEPLOY_GTK_VERSION=3
 
-          # Clean stale bundle artifacts from cache — prevents old .deb/.AppImage
+          # Clean stale bundle artifacts from cache - prevents old .deb/.AppImage
           # files from accumulating and being uploaded alongside the current version
           BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
           echo "Cleaning stale bundle artifacts from ${BUNDLE_DIR}..."
@@ -757,13 +765,28 @@ jobs:
             echo "AppImage repacked successfully"
           ' _ {} \;
 
-      - name: Install AzureSignTool and ensure signtool on PATH (Windows)
+      - name: Install CodeSignTool for SSL.com EV signing (Windows)
         if: matrix.os_type == 'windows'
         shell: powershell
         run: |
-          dotnet tool install --global AzureSignTool
-          # On ARM64, set TAURI_WINDOWS_SIGNTOOL_PATH to bypass Tauri's os_bitness() bug
-          # (Tauri doesn't handle ARM64 in GetNativeSystemInfo, causing "SignTool not found")
+          # 1. CodeSignTool: signs the inner binaries + final NSIS installer
+          #    via SSL.com eSigner (called by Tauri's signCommand wrapper).
+          $cstDest = "$env:RUNNER_TEMP\CodeSignTool"
+          Write-Host "Downloading CodeSignTool..."
+          Invoke-WebRequest -Uri "https://github.com/SSLcom/CodeSignTool/releases/download/v1.3.2/CodeSignTool-v1.3.2-windows.zip" -OutFile "$env:RUNNER_TEMP\cst.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\cst.zip" -DestinationPath "$cstDest" -Force
+          echo "CODESIGNTOOL_PATH=$cstDest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "CodeSignTool installed at $cstDest"
+
+          # 2. signtool.exe (Windows SDK): NEEDED separately on the ARM64
+          #    runner image. Tauri's bundler invokes signtool first to
+          #    detect signing capability before delegating to signCommand;
+          #    on ARM64 the runner image doesn't put signtool on PATH AND
+          #    Tauri's os_bitness() detection fails on ARM64
+          #    (https://github.com/tauri-apps/tao/issues/1171), causing
+          #    "failed to bundle project SignTool not found" right after
+          #    the cargo build succeeds. Setting TAURI_WINDOWS_SIGNTOOL_PATH
+          #    bypasses Tauri's broken auto-detection.
           $target = "${{ matrix.target }}"
           if ($target -match "aarch64") {
             $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue |
@@ -789,12 +812,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI: true
-          # Azure Key Vault code signing
-          AZURE_KEY_VAULT_URI: ${{ secrets.AZURE_KEY_VAULT_URI }}
-          AZURE_KEY_VAULT_CERTIFICATE: ${{ secrets.AZURE_KEY_VAULT_CERTIFICATE }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # SSL.com EV code signing via CodeSignTool - same cert as enterprise build
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
           # Optimize for build speed on Windows
           CARGO_PROFILE_RELEASE_LTO: thin
           CARGO_PROFILE_RELEASE_OPT_LEVEL: "2"
@@ -805,18 +827,92 @@ jobs:
           CARGO_PROFILE_RELEASE_STRIP: none
           CARGO_PROFILE_RELEASE_PANIC: abort
           CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
-          RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C link-arg=/LTCG' || '' }}
-          # Cap MSVC codegen at AVX2 — prevents LTCG from auto-vectorizing C deps
-          # (e.g. sqlite-vec) to AVX-512 on CI Xeon runners. Lunar Lake and other
-          # consumer CPUs lack AVX-512, causing STATUS_ILLEGAL_INSTRUCTION (0xc000001d).
-          # Only set for x86_64 — clang on ARM64 doesn't understand /arch:AVX2.
+          # LTCG removed: MSVC has known bugs where LTCG ignores /arch:AVX2 and
+          # emits AVX-512 instructions on Xeon CI runners, causing STATUS_ILLEGAL_INSTRUCTION
+          # (0xc000001d) on consumer CPUs without AVX-512 (Arrow Lake, Panther Lake, Lunar Lake).
+          # See: https://developercommunity.visualstudio.com/content/problem/848627
+          RUSTFLAGS: ""
           CFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '/arch:AVX2' || '' }}
           CXXFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '/arch:AVX2' || '' }}
-          # Fix whisper.cpp crash on newer CPUs (Lunar Lake, etc.) that lack AVX-512
-          # GGML_NATIVE=ON compiles with -march=native, causing illegal instruction on CPUs without AVX-512
-          CMAKE_ARGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF' || '-DGGML_NATIVE=OFF' }}
+          # Fix whisper.cpp/GGML AVX-512 crash on Lunar Lake, Arrow Lake, etc.
+          # whisper-rs build.rs passes env vars starting with GGML_ as cmake defines.
+          # CMAKE_ARGS as a single string gets passed as -DCMAKE_ARGS="..." which cmake ignores.
+          # Individual GGML_* env vars are the ONLY way to control the whisper-rs cmake build.
+          # Without GGML_NATIVE=OFF, FindSIMD.cmake detects AVX-512 on CI Xeon runners
+          # and overrides GGML_AVX512 to ON, producing 512-bit ZMM instructions that crash
+          # on CPUs without full AVX-512 support (STATUS_ILLEGAL_INSTRUCTION 0xc000001d).
+          GGML_NATIVE: "OFF"
+          GGML_AVX512: "OFF"
+          GGML_AVX512_VBMI: "OFF"
+          GGML_AVX512_VNNI: "OFF"
+          GGML_AVX512_BF16: "OFF"
+          CMAKE_ARGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF -DCMAKE_C_FLAGS=/arch:AVX2 -DCMAKE_CXX_FLAGS=/arch:AVX2' || '-DGGML_NATIVE=OFF' }}
           OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
         run: bunx tauri build --verbose ${{ matrix.tauri-args }}
+
+      - name: Sign NSIS installer with SSL.com EV (Windows)
+        # Tauri's signCommand handles inner binaries, but the final NSIS
+        # installer is built AFTER signCommand runs - so we sign it here
+        # and re-generate the .sig (Tauri Updater signature) since the
+        # installer file content changes after Authenticode signing.
+        if: matrix.os_type == 'windows'
+        shell: powershell
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          $cstDest = $env:CODESIGNTOOL_PATH
+          $jarFile = Get-ChildItem $cstDest -Recurse -Filter "code_sign_tool*.jar" | Select-Object -First 1
+          $javaFile = Get-ChildItem $cstDest -Recurse -Filter "java.exe" | Select-Object -First 1
+          if (-not $jarFile) { throw "CodeSignTool jar not found" }
+          if (-not $javaFile) { throw "Java not found in CodeSignTool" }
+
+          $nsisDir = "apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/nsis"
+          $exe = Get-ChildItem "$nsisDir/*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "No installer exe found in $nsisDir" }
+          Write-Host "Signing installer: $($exe.Name)"
+
+          $signedDir = Join-Path $cstDest "signed_installer"
+          if (Test-Path $signedDir) { Remove-Item $signedDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $signedDir | Out-Null
+
+          Push-Location $cstDest
+          & $javaFile.FullName -jar $jarFile.FullName sign `
+            "-username=$env:ESIGNER_USERNAME" `
+            "-password=$env:ESIGNER_PASSWORD" `
+            "-totp_secret=$env:ESIGNER_TOTP_SECRET" `
+            "-credential_id=$env:ESIGNER_CREDENTIAL_ID" `
+            "-input_file_path=$($exe.FullName)" `
+            "-output_dir_path=$signedDir"
+          Pop-Location
+
+          if ($LASTEXITCODE -ne 0) { throw "Code signing failed with exit code $LASTEXITCODE" }
+
+          $signedExe = Join-Path $signedDir $exe.Name
+          if (-not (Test-Path $signedExe)) { throw "Signed file not found at $signedExe" }
+          Copy-Item $signedExe $exe.FullName -Force
+          Write-Host "Installer signed: $($exe.Name)"
+
+          # Re-generate Tauri Updater signature since the installer content changed
+          $sigFile = "$($exe.FullName).sig"
+          if (Test-Path $sigFile) {
+            Remove-Item $sigFile
+            Push-Location apps/screenpipe-app-tauri
+            # Tauri v2 CLI reads TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+            # from env when --private-key is not passed. We intentionally DO NOT pass
+            # --private-key here: its "path vs contents" auto-detect treats Windows
+            # absolute paths (e.g. D:\...) as base64 because `:` at offset 1 fails
+            # decoding with "Invalid symbol 58, offset 1". Relying on env vars bypasses
+            # that code path entirely. See release v2.4.30 failure (run 24790392363).
+            bunx tauri signer sign $exe.FullName
+            if ($LASTEXITCODE -ne 0) { throw "tauri signer sign failed (exit $LASTEXITCODE) - auto-updater would be broken" }
+            Pop-Location
+            Write-Host "Tauri updater signature regenerated"
+          }
 
       - name: Build (with codesign retry)
         if: matrix.os_type == 'macos'
@@ -827,7 +923,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
           # for release
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # for macos signing — cert is pre-imported into build keychain above,
+          # for macos signing - cert is pre-imported into build keychain above,
           # so we do NOT pass APPLE_CERTIFICATE (which would create a temp keychain
           # that conflicts with our build keychain setup)
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -835,7 +931,10 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           # https://tauri.app/v1/guides/distribution/sign-macos
-          CI: true
+          # CI=false so tauri's DMG bundler renders the background image correctly
+          # (CI=true causes hdiutil to skip the background/icon layout stage)
+          # See: https://github.com/tauri-apps/tauri-action/issues/740
+          CI: false
           # Fix std::filesystem availability - requires macOS 10.15+
           # whisper.cpp ggml uses std::filesystem::path which needs 10.15
           # All these vars needed to ensure cmake picks up the deployment target
@@ -869,12 +968,12 @@ jobs:
           TARGET="${{ matrix.target }}"
           BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
 
-          # Clean stale bundle artifacts from cache — prevents old .deb/.AppImage
+          # Clean stale bundle artifacts from cache - prevents old .deb/.AppImage
           # files from accumulating and being uploaded alongside the current version
           echo "Cleaning stale bundle artifacts..."
           rm -rf "${BUNDLE_DIR}" 2>/dev/null || true
 
-          # Clean cached mlx-sys build — deployment target is baked into CMake cache
+          # Clean cached mlx-sys build - deployment target is baked into CMake cache
           # and won't update if only the env var changes
           echo "Cleaning mlx-sys build cache..."
           find "apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/build" -maxdepth 1 -name "mlx-sys-*" -exec rm -rf {} + 2>/dev/null || true
@@ -900,7 +999,7 @@ jobs:
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
             echo "=== Build attempt $attempt/$MAX_ATTEMPTS ==="
 
-            # Re-unlock keychain before each attempt (macOS) — prevents transient codesign failures
+            # Re-unlock keychain before each attempt (macOS) - prevents transient codesign failures
             if [[ "${{ matrix.os_type }}" == "macos" ]]; then
               BUILD_KC="$HOME/Library/Keychains/build.keychain-db"
               if [ -f "$BUILD_KC" ]; then
@@ -931,7 +1030,7 @@ jobs:
             # Check if it's a transient signing/bundling failure (worth retrying)
             if grep -qiE "failed to sign|codesign.*failed|errSecInternalComponent|failed to bundle|CSSMERR|SecKeychainOpen" /tmp/tauri-build-$attempt.log; then
               echo "⚠️ Transient codesign/bundle failure detected, retrying..."
-              # Clean only bundle output — cargo cache is still warm
+              # Clean only bundle output - cargo cache is still warm
               find "$BUNDLE_DIR" -type f -delete 2>/dev/null || true
               sleep $((attempt * 30))
             else
@@ -978,6 +1077,68 @@ jobs:
               spctl --assess --type open --context context:primary-signature --verbose "$dmg" 2>&1 || true
               echo "✅ $(basename "$dmg") notarized and stapled"
             fi
+          done
+
+      - name: Staple .app and rebuild updater tarball (macOS)
+        if: matrix.os_type == 'macos'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="${GITHUB_WORKSPACE}/apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          MACOS_DIR="${BUNDLE_DIR}/macos"
+
+          # Gatekeeper context:
+          # The DMG is notarized + stapled above, so fresh installs are fine.
+          # Tauri auto-updates ship the .app inside .app.tar.gz - and until now
+          # that .app was never stapled. Gatekeeper then fell back to an online
+          # notarization check on first launch, which intermittently fails and
+          # produces the "app is damaged" dialog after every update.
+          #
+          # Fix: submit the .app to notarytool directly (ticket is keyed to the
+          # code-signature hash, so this is idempotent with the DMG submission),
+          # staple the .app, then rebuild the updater tarball with the stapled
+          # bundle and re-sign it with the Tauri updater ed25519 key (the
+          # existing .sig is for the pre-staple tarball and becomes invalid).
+          shopt -s nullglob
+          apps=( "${MACOS_DIR}"/*.app )
+          if [ ${#apps[@]} -eq 0 ]; then
+            echo "no .app bundle in ${MACOS_DIR}, nothing to staple"
+            exit 0
+          fi
+
+          for app in "${apps[@]}"; do
+            [ -d "$app" ] || continue
+            APP_NAME="$(basename "$app")"
+            echo "=== Notarizing + stapling ${APP_NAME} ==="
+
+            # notarytool only accepts flat archives; zip the .app for submission.
+            APP_ZIP="${MACOS_DIR}/${APP_NAME}.notarize.zip"
+            /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$APP_ZIP"
+            xcrun notarytool submit "$APP_ZIP" \
+              --apple-id "${{ secrets.APPLE_ID }}" \
+              --password "${{ secrets.APPLE_PASSWORD }}" \
+              --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+              --wait --timeout 15m
+            rm -f "$APP_ZIP"
+
+            xcrun stapler staple "$app"
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose "$app" 2>&1 || true
+
+            # Rebuild updater tarball so Tauri updater ships the stapled .app.
+            TARBALL="${MACOS_DIR}/${APP_NAME}.tar.gz"
+            echo "Rebuilding ${APP_NAME}.tar.gz with stapled bundle"
+            ( cd "${MACOS_DIR}" && tar czf "${APP_NAME}.tar.gz" "${APP_NAME}" )
+
+            # Re-sign the tarball - old .sig is for the pre-staple bytes.
+            rm -f "${TARBALL}.sig"
+            echo "Re-signing ${APP_NAME}.tar.gz with Tauri updater key"
+            ( cd "${GITHUB_WORKSPACE}/apps/screenpipe-app-tauri" && bunx tauri signer sign "${TARBALL}" )
+
+            echo "✅ ${APP_NAME} stapled, tarball rebuilt and re-signed"
           done
 
       - name: Upload to Cloudflare R2 (macOS)
@@ -1095,7 +1256,7 @@ jobs:
           done
 
           if [ "$UPLOAD_FAILED" -eq 1 ]; then
-            echo "❌ Some uploads failed — marking step as failed"
+            echo "❌ Some uploads failed - marking step as failed"
             exit 1
           fi
           echo "R2 upload complete for ${TARGET}"
@@ -1238,7 +1399,6 @@ jobs:
 
       - name: Trigger changelog generation on website repo
         uses: peter-evans/repository-dispatch@v3
-        continue-on-error: true
         with:
           token: ${{ secrets.WEBSITE_REPO_TOKEN }}
           repository: screenpipe/website

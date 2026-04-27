@@ -59,6 +59,10 @@ pub struct AudioManagerOptions {
     /// When true, automatically follow system default audio devices
     /// and switch when the system default changes (e.g., device plug/unplug)
     pub use_system_default_audio: bool,
+    /// Experimental: use CoreAudio Process Tap for System Audio (macOS 14.4+).
+    /// When false (default), System Audio uses ScreenCaptureKit as before.
+    /// Has no effect on non-macOS or macOS <14.4 — falls back to SCK.
+    pub experimental_coreaudio_system_audio: bool,
     /// Controls when local Whisper transcription runs.
     /// `Realtime` = immediate (default), `Batch` = accumulate longer chunks for quality.
     pub transcription_mode: TranscriptionMode,
@@ -72,6 +76,8 @@ pub struct AudioManagerOptions {
     pub batch_max_duration_secs: Option<u64>,
     /// Channel capacities for recording and transcription queues.
     pub channel_config: ChannelConfig,
+    /// Disable all audio functionality (no device polling, no model downloads)
+    pub is_disabled: bool,
 }
 
 impl Default for AudioManagerOptions {
@@ -96,11 +102,13 @@ impl Default for AudioManagerOptions {
             use_pii_removal: false,
             filter_music: false,
             use_system_default_audio: true,
+            experimental_coreaudio_system_audio: false,
             transcription_mode: TranscriptionMode::default(),
             meeting_detector: None,
             vocabulary: vec![],
             batch_max_duration_secs: None,
             channel_config: ChannelConfig::default(),
+            is_disabled: false,
         }
     }
 }
@@ -183,6 +191,11 @@ impl AudioManagerBuilder {
         self
     }
 
+    pub fn experimental_coreaudio_system_audio(mut self, enabled: bool) -> Self {
+        self.options.experimental_coreaudio_system_audio = enabled;
+        self
+    }
+
     pub fn use_system_default_audio(mut self, use_system_default_audio: bool) -> Self {
         self.options.use_system_default_audio = use_system_default_audio;
         self
@@ -217,7 +230,7 @@ impl AudioManagerBuilder {
         self.validate_options()?;
         let options = &mut self.options;
 
-        if options.enabled_devices.is_empty() {
+        if !options.is_disabled && options.enabled_devices.is_empty() {
             // Gracefully collect available devices — don't crash if input or output is missing
             // (e.g., Mac Mini with no microphone, headless server with no audio hardware)
             let mut devices = Vec::new();
@@ -236,6 +249,11 @@ impl AudioManagerBuilder {
         }
 
         AudioManager::new(options.clone(), db).await
+    }
+
+    pub fn is_disabled(mut self, is_disabled: bool) -> Self {
+        self.options.is_disabled = is_disabled;
+        self
     }
 
     pub fn output_path(mut self, output_path: PathBuf) -> Self {

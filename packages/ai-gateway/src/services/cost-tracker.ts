@@ -15,12 +15,15 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
   'glm-4.7': { input: 0, output: 0 },
   'glm-5': { input: 0, output: 0 },
   'kimi-k2.5': { input: 0, output: 0 },
+  // Tinfoil — confidential inference (secure enclaves)
+  'gemma4-31b': { input: 0.45, output: 1.00 },
   // Anthropic Claude
   'claude-haiku-4-5': { input: 0.80, output: 4.00 },
   'claude-sonnet-4-5': { input: 3.00, output: 15.00 },
   'claude-opus-4-5': { input: 15.00, output: 75.00 },
   'claude-sonnet-4-6': { input: 3.00, output: 15.00 },
   'claude-opus-4-6': { input: 15.00, output: 75.00 },
+  'claude-opus-4-7': { input: 5.00, output: 25.00 },
   'claude-3-5-sonnet': { input: 3.00, output: 15.00 },
   'claude-3-5-haiku': { input: 0.80, output: 4.00 },
   // OpenRouter models
@@ -41,6 +44,7 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
   'gemini-2.5-pro': { input: 1.25, output: 10.00 },
   'gemini-3-flash': { input: 0.10, output: 0.40 },
   'gemini-3-pro': { input: 1.25, output: 10.00 },
+  'gemini-3.1-flash-lite': { input: 0.25, output: 1.50 },
   'gemini-1.5-flash': { input: 0.075, output: 0.30 },
   'gemini-1.5-pro': { input: 1.25, output: 5.00 },
 };
@@ -135,6 +139,7 @@ export function inferProvider(model: string): string {
   if (lower.includes('claude')) return 'anthropic';
   if (lower.includes('gpt') || lower.includes('o1') || lower.includes('o3')) return 'openai';
   if (lower.includes('gemini')) return 'google';
+  if (lower.includes('gemma4')) return 'tinfoil';
   if (lower.includes('glm-') || lower.includes('kimi-k')) return 'vertex-maas';
   if (lower.includes('deepseek') || lower.includes('llama') || lower.includes('qwen') || lower.includes('mistral') || lower.includes('step-3.5') || lower.includes('stepfun')) return 'openrouter';
   if (lower.includes('screenpipe-event')) return 'screenpipe-vllm';
@@ -152,6 +157,19 @@ const DEFAULT_MAX_DAILY_COST_USD = 5.0;
 
 export function getMaxDailyCostPerUser(env?: Env): number {
   return parseFloat((env as any)?.MAX_DAILY_COST_PER_USER || '') || DEFAULT_MAX_DAILY_COST_USD;
+}
+
+// Tier-aware daily cost cap:
+//   anonymous:  ~5 opus reqs/day  ($1.60)
+//   logged_in:  ~10 opus reqs/day ($3.20)
+//   subscribed: ~109 opus reqs/day ($35)
+export function getTierDailyCostCap(tier: string, env?: Env): number {
+  const baseCap = getMaxDailyCostPerUser(env);
+  switch (tier) {
+    case 'subscribed': return baseCap * 7;   // $35
+    case 'logged_in':  return baseCap * 0.64; // $3.20
+    default:           return baseCap * 0.32; // $1.60 (anonymous)
+  }
 }
 
 /**

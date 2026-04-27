@@ -7,9 +7,13 @@ import { fileURLToPath } from 'node:url';
 import video from 'wdio-video-reporter';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+export function isRecordVideoEnabled(): boolean {
+  return process.env.RECORD_VIDEO === '1' || process.env.RECORD_VIDEO === 'true';
+}
+
 /** When RECORD_VIDEO=1, records one video per spec file. */
 export function getReporters(): unknown[] {
-  const recordVideo = process.env.RECORD_VIDEO === '1' || process.env.RECORD_VIDEO === 'true';
+  const recordVideo = isRecordVideoEnabled();
   const base: unknown[] = ['spec'];
   if (recordVideo) {
     base.push([
@@ -26,5 +30,7 @@ export function getReporters(): unknown[] {
 }
 
 export function getMochaTimeout(): number {
-  return process.env.RECORD_VIDEO === '1' || process.env.RECORD_VIDEO === 'true' ? 300000 : 60000;
+  const base = isRecordVideoEnabled() ? 300000 : 60000;
+  // Double timeout in CI — cold caches, model downloads, slower runners
+  return process.env.CI ? base * 2 : base;
 }

@@ -24,7 +24,10 @@
 //! accompanied by a leave/hangup signal (see `min_signals_required`).
 
 use chrono::{DateTime, Utc};
+use futures::{FutureExt, StreamExt};
 use screenpipe_db::DatabaseManager;
+use screenpipe_events::subscribe_to_event;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +47,10 @@ pub struct AppIdentifiers {
     pub windows_process_names: &'static [&'static str],
     /// URL substrings to match in browser window titles/AXDocument.
     pub browser_url_patterns: &'static [&'static str],
+    /// Page title patterns to match when the URL isn't in the window title.
+    /// Browsers like Arc show the page title (e.g. "Meet") instead of the URL.
+    /// These are matched as exact case-insensitive window title equality.
+    pub browser_title_patterns: &'static [&'static str],
 }
 
 /// A signal that indicates a call is in progress.
@@ -107,9 +114,10 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
         // Microsoft Teams Desktop
         MeetingDetectionProfile {
             app_identifiers: AppIdentifiers {
-                macos_app_names: &["microsoft teams", "teams"],
+                macos_app_names: &["microsoft teams", "teams", "msteams"],
                 windows_process_names: &["ms-teams.exe", "teams.exe"],
                 browser_url_patterns: &["teams.microsoft.com", "teams.live.com", "Microsoft Teams"],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
                 CallSignal::AutomationId("hangup-button"),
@@ -140,9 +148,11 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
         // Meeting controls are available as AXMenuBarItem ("Meeting" menu)
         // and AXMenuItem items with identifiers like "onMuteAudio:".
         //
-        // NOTE: min_signals_required=2 because individual signals can appear
-        // when Zoom is open but idle (e.g. "Meeting" menu bar item may exist
-        // without an active call). Requiring 2 signals reduces false positives.
+        // NOTE: "Meeting" menu bar item alone removed as a signal because it
+        // exists even when Zoom is idle (not in an active call). False positive:
+        // https://github.com/screenpipe/screenpipe/issues/2561
+        // Now only real call control signals (leave, end meeting, Zoom Meeting
+        // window title, etc.) trigger detection.
         // NOTE: "end" alone removed as signal — too broad, matches "Send",
         // "Append", "Calendar End", etc. Use "end meeting" instead.
         // NOTE: onMuteAudio:/onMuteVideo: removed — mute controls can appear
@@ -158,12 +168,9 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     // Browser page title during a Zoom web meeting (URL not in title)
                     "zoom meeting",
                 ],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
-                // macOS menu bar signals (Zoom only exposes AXMenuBar, no AXWindow)
-                CallSignal::MenuBarItem {
-                    title_contains: "Meeting",
-                },
                 // Windows: Zoom meeting window has title "Zoom Meeting" but
                 // exposes NO named buttons — all toolbar controls are unnamed.
                 // The window title is the definitive signal.
@@ -176,9 +183,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 CallSignal::NameContains("In a Zoom Meeting"),
                 // Windows: "Zoom Video Container" pane exists only inside meeting window.
                 CallSignal::NameContains("Zoom Video Container"),
-                // Generic fallbacks for other Windows Zoom versions
-                CallSignal::AutomationIdContains("leave"),
-                CallSignal::KeyboardShortcut("Alt+Q"),
+                // macOS: actual call control buttons (not the idle "Meeting" menu)
                 CallSignal::RoleWithName {
                     role: "AXButton",
                     name_contains: "leave",
@@ -187,8 +192,11 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     role: "AXButton",
                     name_contains: "end meeting",
                 },
+                // Generic fallbacks for other Windows Zoom versions
+                CallSignal::AutomationIdContains("leave"),
+                CallSignal::KeyboardShortcut("Alt+Q"),
             ],
-            min_signals_required: 2,
+            min_signals_required: 1,
         },
         // Google Meet (browser)
         // NOTE: "google meet" removed from url_patterns — it's too broad and matches
@@ -201,6 +209,8 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 macos_app_names: &[],
                 windows_process_names: &[],
                 browser_url_patterns: &["meet.google.com"],
+                // Arc and other browsers show just "Meet" as the page title
+                browser_title_patterns: &["Meet"],
             },
             call_signals: vec![
                 CallSignal::RoleWithName {
@@ -222,6 +232,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 macos_app_names: &["slack"],
                 windows_process_names: &["slack.exe"],
                 browser_url_patterns: &["app.slack.com/huddle"],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
                 CallSignal::RoleWithName {
@@ -241,6 +252,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 macos_app_names: &["facetime"],
                 windows_process_names: &[],
                 browser_url_patterns: &[],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
                 CallSignal::RoleWithName {
@@ -260,6 +272,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 macos_app_names: &["webex", "cisco webex meetings"],
                 windows_process_names: &["webexmta.exe", "ciscowebex.exe"],
                 browser_url_patterns: &["webex.com"],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
                 CallSignal::AutomationIdContains("leave"),
@@ -278,45 +291,133 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
         // Native macOS: Electron exposes 0 windows but menu bar has "Mute"/"Deafen"
         // items ONLY when in a voice channel — these are reliable call signals.
         // Windows: full Electron AX tree works via UIA.
-        // NOTE: Mute/Deafen are NOT used for browser detection because Discord's
-        // web UI shows them permanently in the user panel, even outside voice channels.
+        // NOTE: Mute/Deafen menu items exist even when NOT in a voice channel,
+        // so we require "Disconnect" (only present when connected to voice) as
+        // the primary signal. Mute is kept as a secondary confirmation signal.
         MeetingDetectionProfile {
             app_identifiers: AppIdentifiers {
                 macos_app_names: &["discord"],
                 windows_process_names: &["discord.exe"],
                 browser_url_patterns: &[],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
-                // macOS native: menu items only present during voice channel
+                // "Disconnect" only appears when actually connected to a voice channel
                 CallSignal::MenuBarItem {
-                    title_contains: "Deafen",
+                    title_contains: "Disconnect",
                 },
-                CallSignal::MenuBarItem {
-                    title_contains: "Mute",
-                },
-                // Windows native: buttons in Electron AX tree
                 CallSignal::RoleWithName {
                     role: "AXButton",
                     name_contains: "Disconnect",
                 },
                 CallSignal::NameContains("Disconnect"),
+                // Mute as secondary confirmation (always present, so not sufficient alone)
+                CallSignal::MenuBarItem {
+                    title_contains: "Mute",
+                },
             ],
-            min_signals_required: 1,
+            min_signals_required: 2,
         },
-        // Discord in browser — only match signals specific to active voice channels.
-        // The "Voice Connected" bar and "Disconnect" button only appear when in a call.
-        // Do NOT use Mute/Deafen here — they're always visible in the user panel.
+        // Discord in browser — require BOTH "Voice Connected" bar AND "Disconnect"
+        // button. Either alone can appear without being in a call (e.g. seeing other
+        // users' voice status in channel list). Both together = you are connected.
         MeetingDetectionProfile {
             app_identifiers: AppIdentifiers {
                 macos_app_names: &[],
                 windows_process_names: &[],
                 browser_url_patterns: &["discord.com", "discordapp.com"],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
                 CallSignal::NameContains("Voice Connected"),
                 CallSignal::RoleWithName {
                     role: "AXButton",
                     name_contains: "disconnect",
+                },
+            ],
+            min_signals_required: 2,
+        },
+        // Signal — voice/video calls
+        // macOS: "Signal" app with "End Call" / "Hang Up" button during active calls.
+        // Windows: "Signal.exe" Electron app, same button patterns.
+        // Signal also shows a call status bar with duration when a call is active.
+        MeetingDetectionProfile {
+            app_identifiers: AppIdentifiers {
+                macos_app_names: &["signal"],
+                windows_process_names: &["signal.exe"],
+                browser_url_patterns: &[],
+                browser_title_patterns: &[],
+            },
+            call_signals: vec![
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "end call",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "hang up",
+                },
+                CallSignal::NameContains("End Call"),
+                CallSignal::NameContains("Hang Up"),
+                // Windows UIA button patterns
+                CallSignal::RoleWithName {
+                    role: "Button",
+                    name_contains: "End call",
+                },
+                CallSignal::RoleWithName {
+                    role: "Button",
+                    name_contains: "Hang up",
+                },
+            ],
+            min_signals_required: 1,
+        },
+        // WhatsApp — voice/video calls
+        MeetingDetectionProfile {
+            app_identifiers: AppIdentifiers {
+                macos_app_names: &["whatsapp"],
+                windows_process_names: &["whatsapp.exe"],
+                browser_url_patterns: &["web.whatsapp.com"],
+                browser_title_patterns: &[],
+            },
+            call_signals: vec![
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "end call",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "hang up",
+                },
+                CallSignal::NameContains("End call"),
+                CallSignal::RoleWithName {
+                    role: "Button",
+                    name_contains: "End call",
+                },
+            ],
+            min_signals_required: 1,
+        },
+        // Telegram — voice/video calls
+        MeetingDetectionProfile {
+            app_identifiers: AppIdentifiers {
+                macos_app_names: &["telegram"],
+                windows_process_names: &["telegram.exe"],
+                browser_url_patterns: &["web.telegram.org"],
+                browser_title_patterns: &[],
+            },
+            call_signals: vec![
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "end call",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "hang up",
+                },
+                CallSignal::NameContains("End Call"),
+                CallSignal::NameContains("Hang Up"),
+                CallSignal::RoleWithName {
+                    role: "Button",
+                    name_contains: "End call",
                 },
             ],
             min_signals_required: 1,
@@ -381,6 +482,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     "dialpad.com/meetings",
                     "8x8.vc",
                 ],
+                browser_title_patterns: &[],
             },
             call_signals: vec![
                 CallSignal::RoleWithName {
@@ -650,6 +752,7 @@ impl MeetingUiScanner {
 /// Uses `PrecomputedSignal` to avoid per-signal `.to_lowercase()` allocations.
 /// Lowercases node title/desc/identifier ONCE per node, not once per signal.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn walk_for_signals(
     elem: &cidre::ax::UiElement,
     signals: &[PrecomputedSignal],
@@ -736,12 +839,14 @@ fn walk_for_signals(
 }
 
 /// A signal with pre-lowercased match strings to avoid per-node allocations.
+#[cfg(target_os = "macos")]
 struct PrecomputedSignal {
     signal: CallSignal,
     /// Pre-lowercased match string (the substring to search for).
     lower: String,
 }
 
+#[cfg(target_os = "macos")]
 impl PrecomputedSignal {
     fn from_signals(signals: &[CallSignal]) -> Vec<PrecomputedSignal> {
         signals
@@ -781,15 +886,15 @@ fn check_signal_match(
 ) -> bool {
     match signal {
         CallSignal::AutomationId(id) => {
-            identifier.map_or(false, |ident| ident.eq_ignore_ascii_case(id))
+            identifier.is_some_and(|ident| ident.eq_ignore_ascii_case(id))
         }
-        CallSignal::AutomationIdContains(substr) => identifier.map_or(false, |ident| {
-            ident.to_lowercase().contains(&substr.to_lowercase())
-        }),
+        CallSignal::AutomationIdContains(substr) => {
+            identifier.is_some_and(|ident| ident.to_lowercase().contains(&substr.to_lowercase()))
+        }
         CallSignal::KeyboardShortcut(shortcut) => {
             let shortcut_lower = shortcut.to_lowercase();
-            let in_desc = desc.map_or(false, |d| d.to_lowercase().contains(&shortcut_lower));
-            let in_title = title.map_or(false, |t| t.to_lowercase().contains(&shortcut_lower));
+            let in_desc = desc.is_some_and(|d| d.to_lowercase().contains(&shortcut_lower));
+            let in_title = title.is_some_and(|t| t.to_lowercase().contains(&shortcut_lower));
             in_desc || in_title
         }
         CallSignal::RoleWithName {
@@ -800,8 +905,8 @@ fn check_signal_match(
                 return false;
             }
             let name_lower = name_contains.to_lowercase();
-            let in_title = title.map_or(false, |t| t.to_lowercase().contains(&name_lower));
-            let in_desc = desc.map_or(false, |d| d.to_lowercase().contains(&name_lower));
+            let in_title = title.is_some_and(|t| t.to_lowercase().contains(&name_lower));
+            let in_desc = desc.is_some_and(|d| d.to_lowercase().contains(&name_lower));
             in_title || in_desc
         }
         CallSignal::MenuBarItem { title_contains } => {
@@ -810,32 +915,33 @@ fn check_signal_match(
                 return false;
             }
             let needle = title_contains.to_lowercase();
-            title.map_or(false, |t| t.to_lowercase().contains(&needle))
+            title.is_some_and(|t| t.to_lowercase().contains(&needle))
         }
         CallSignal::MenuItemId(expected_id) => {
             // Match AXMenuItem by automation ID (Zoom's "onMuteAudio:" etc.)
             if role != "AXMenuItem" {
                 return false;
             }
-            identifier.map_or(false, |ident| ident == *expected_id)
+            identifier == Some(*expected_id)
         }
         CallSignal::NameContains(needle) => {
             let needle_lower = needle.to_lowercase();
-            let in_title = title.map_or(false, |t| t.to_lowercase().contains(&needle_lower));
-            let in_desc = desc.map_or(false, |d| d.to_lowercase().contains(&needle_lower));
+            let in_title = title.is_some_and(|t| t.to_lowercase().contains(&needle_lower));
+            let in_desc = desc.is_some_and(|d| d.to_lowercase().contains(&needle_lower));
             in_title || in_desc
         }
         CallSignal::WindowTitle { title_contains } => {
             // WindowTitle is checked separately against the root window element,
             // not during descendant walking. But handle it here for completeness.
             let needle = title_contains.to_lowercase();
-            title.map_or(false, |t| t.to_lowercase().contains(&needle))
+            title.is_some_and(|t| t.to_lowercase().contains(&needle))
         }
     }
 }
 
 /// Optimized signal match using pre-lowercased signal strings and pre-lowercased node fields.
 /// Avoids per-signal and per-node `.to_lowercase()` allocations on the hot path.
+#[cfg(target_os = "macos")]
 fn check_signal_match_precomputed(
     ps: &PrecomputedSignal,
     role: &str,
@@ -845,46 +951,46 @@ fn check_signal_match_precomputed(
 ) -> bool {
     match &ps.signal {
         CallSignal::AutomationId(id) => {
-            identifier_lower.map_or(false, |ident| ident.eq_ignore_ascii_case(id))
+            identifier_lower.is_some_and(|ident| ident.eq_ignore_ascii_case(id))
         }
         CallSignal::AutomationIdContains(_) => {
-            identifier_lower.map_or(false, |ident| ident.contains(&ps.lower[..]))
+            identifier_lower.is_some_and(|ident| ident.contains(&ps.lower[..]))
         }
         CallSignal::KeyboardShortcut(_) => {
-            let in_desc = desc_lower.map_or(false, |d| d.contains(&ps.lower[..]));
-            let in_title = title_lower.map_or(false, |t| t.contains(&ps.lower[..]));
+            let in_desc = desc_lower.is_some_and(|d| d.contains(&ps.lower[..]));
+            let in_title = title_lower.is_some_and(|t| t.contains(&ps.lower[..]));
             in_desc || in_title
         }
         CallSignal::RoleWithName { role: r, .. } => {
             if role != *r {
                 return false;
             }
-            let in_title = title_lower.map_or(false, |t| t.contains(&ps.lower[..]));
-            let in_desc = desc_lower.map_or(false, |d| d.contains(&ps.lower[..]));
+            let in_title = title_lower.is_some_and(|t| t.contains(&ps.lower[..]));
+            let in_desc = desc_lower.is_some_and(|d| d.contains(&ps.lower[..]));
             in_title || in_desc
         }
         CallSignal::MenuBarItem { .. } => {
             if role != "AXMenuBarItem" {
                 return false;
             }
-            title_lower.map_or(false, |t| t.contains(&ps.lower[..]))
+            title_lower.is_some_and(|t| t.contains(&ps.lower[..]))
         }
         CallSignal::MenuItemId(_) => {
             if role != "AXMenuItem" {
                 return false;
             }
-            identifier_lower.map_or(false, |ident| ident == &ps.lower[..])
+            identifier_lower.is_some_and(|ident| ident == &ps.lower[..])
         }
         CallSignal::NameContains(_) => {
             // Role-agnostic: match any element whose title or description contains the text
-            let in_title = title_lower.map_or(false, |t| t.contains(&ps.lower[..]));
-            let in_desc = desc_lower.map_or(false, |d| d.contains(&ps.lower[..]));
+            let in_title = title_lower.is_some_and(|t| t.contains(&ps.lower[..]));
+            let in_desc = desc_lower.is_some_and(|d| d.contains(&ps.lower[..]));
             in_title || in_desc
         }
         CallSignal::WindowTitle { .. } => {
             // Checked separately against root window element, not during tree walk.
             // But support it here for completeness (matches on title).
-            title_lower.map_or(false, |t| t.contains(&ps.lower[..]))
+            title_lower.is_some_and(|t| t.contains(&ps.lower[..]))
         }
     }
 }
@@ -942,7 +1048,7 @@ fn get_ax_identifier(elem: &cidre::ax::UiElement) -> Option<String> {
     // Try AXIdentifier (native apps)
     let ident_name = cidre::cf::String::from_str("AXIdentifier");
     let ident_attr = cidre::ax::Attr::with_string(&ident_name);
-    if let Some(val) = get_ax_string_attr(elem, &ident_attr) {
+    if let Some(val) = get_ax_string_attr(elem, ident_attr) {
         if !val.is_empty() {
             return Some(val);
         }
@@ -951,7 +1057,7 @@ fn get_ax_identifier(elem: &cidre::ax::UiElement) -> Option<String> {
     // Try AXDOMIdentifier (web content in browsers/Electron)
     let dom_ident_name = cidre::cf::String::from_str("AXDOMIdentifier");
     let dom_ident_attr = cidre::ax::Attr::with_string(&dom_ident_name);
-    if let Some(val) = get_ax_string_attr(elem, &dom_ident_attr) {
+    if let Some(val) = get_ax_string_attr(elem, dom_ident_attr) {
         if !val.is_empty() {
             return Some(val);
         }
@@ -1345,6 +1451,8 @@ pub enum MeetingState {
         app: String,
         started_at: DateTime<Utc>,
         last_seen: Instant,
+        /// Whether this meeting was detected in a browser (longer grace period on end).
+        is_browser: bool,
     },
     /// Meeting controls disappeared — waiting before marking ended.
     Ending {
@@ -1352,6 +1460,8 @@ pub enum MeetingState {
         app: String,
         started_at: DateTime<Utc>,
         since: Instant,
+        /// Whether this meeting was detected in a browser (longer grace period on end).
+        is_browser: bool,
     },
 }
 
@@ -1373,13 +1483,37 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for ending a meeting (how long controls must be absent before we end).
 const ENDING_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longer timeout for browser-based meetings — tab switching hides AX controls,
+/// so we wait much longer before declaring the meeting ended.
+const ENDING_TIMEOUT_BROWSER: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Check if an app name is a known browser.
+fn is_browser_app(app_name: &str) -> bool {
+    let lower = app_name.to_lowercase();
+    BROWSER_NAMES.iter().any(|b| lower.contains(b))
+        || lower.ends_with(".exe")
+            && [
+                "chrome.exe",
+                "firefox.exe",
+                "msedge.exe",
+                "brave.exe",
+                "opera.exe",
+            ]
+            .iter()
+            .any(|b| lower.contains(b))
+}
+
 /// Advance the state machine based on scan results.
 ///
 /// Returns the new state plus an optional action to perform (DB insert/update).
 /// This function is pure — it does not perform side effects, making it easy to test.
+///
+/// `has_output_audio`: when true, audio output device has recent data — keeps
+/// browser meetings alive even when AX controls are hidden (tab switched).
 pub fn advance_state(
     state: MeetingState,
     scan_results: &[ScanResult],
+    has_output_audio: bool,
 ) -> (MeetingState, Option<StateAction>) {
     // Find the best scan result (one that found the most signals and is in-call)
     let best_active = scan_results
@@ -1413,9 +1547,10 @@ pub fn advance_state(
             profile_index,
         } => {
             if let Some(result) = best_active {
+                let browser = is_browser_app(&result.app_name);
                 info!(
-                    "meeting v2: Confirming -> Active (app={}, signals={})",
-                    result.app_name, result.signals_found
+                    "meeting v2: Confirming -> Active (app={}, signals={}, browser={})",
+                    result.app_name, result.signals_found, browser
                 );
                 (
                     // meeting_id=-1 is a placeholder; the loop fills it after DB insert
@@ -1424,6 +1559,7 @@ pub fn advance_state(
                         app: result.app_name.clone(),
                         started_at: Utc::now(),
                         last_seen: Instant::now(),
+                        is_browser: browser,
                     },
                     Some(StateAction::StartMeeting {
                         app: result.app_name.clone(),
@@ -1453,6 +1589,7 @@ pub fn advance_state(
             meeting_id,
             app,
             started_at,
+            is_browser,
             ..
         } => {
             if let Some(result) = best_active {
@@ -1466,13 +1603,19 @@ pub fn advance_state(
                         app: result.app_name.clone(),
                         started_at,
                         last_seen: Instant::now(),
+                        is_browser,
                     },
                     None,
                 )
             } else {
+                let timeout = if is_browser {
+                    ENDING_TIMEOUT_BROWSER
+                } else {
+                    ENDING_TIMEOUT
+                };
                 info!(
-                    "meeting v2: Active -> Ending (no controls, app={}, id={})",
-                    app, meeting_id
+                    "meeting v2: Active -> Ending (no controls, app={}, id={}, grace={:?})",
+                    app, meeting_id, timeout
                 );
                 (
                     MeetingState::Ending {
@@ -1480,6 +1623,7 @@ pub fn advance_state(
                         app,
                         started_at,
                         since: Instant::now(),
+                        is_browser,
                     },
                     None,
                 )
@@ -1491,7 +1635,13 @@ pub fn advance_state(
             app,
             started_at,
             since,
+            is_browser,
         } => {
+            let timeout = if is_browser {
+                ENDING_TIMEOUT_BROWSER
+            } else {
+                ENDING_TIMEOUT
+            };
             if let Some(result) = best_active {
                 info!(
                     "meeting v2: Ending -> Active (controls reappeared, app={}, id={})",
@@ -1503,13 +1653,37 @@ pub fn advance_state(
                         app: result.app_name.clone(),
                         started_at, // preserve original start time
                         last_seen: Instant::now(),
+                        is_browser,
                     },
                     None,
                 )
-            } else if since.elapsed() >= ENDING_TIMEOUT {
+            } else if has_output_audio {
+                // Audio output is still active — the user likely just switched
+                // tabs/apps, minimized the window, or switched to another meeting app.
+                // Keep the meeting alive regardless of whether UI controls are visible.
+                // This prevents false positives when:
+                // - Browser tab is switched (controls not in focused window)
+                // - App is minimized (AX tree not exposed)
+                // - Sharing screen in Zoom (controls move to floating toolbar)
+                // - Multiple desktops/Spaces (AX scanner can't reach inactive space)
                 info!(
-                    "meeting v2: Ending -> Idle (timeout, app={}, id={})",
+                    "meeting v2: Ending -> Active (output audio still active, app={}, id={})",
                     app, meeting_id
+                );
+                (
+                    MeetingState::Active {
+                        meeting_id,
+                        app,
+                        started_at,
+                        last_seen: Instant::now(),
+                        is_browser,
+                    },
+                    None,
+                )
+            } else if since.elapsed() >= timeout {
+                info!(
+                    "meeting v2: Ending -> Idle (timeout={:?}, app={}, id={})",
+                    timeout, app, meeting_id
                 );
                 (
                     MeetingState::Idle,
@@ -1517,10 +1691,11 @@ pub fn advance_state(
                 )
             } else {
                 debug!(
-                    "meeting v2: Ending (app={}, id={}, elapsed={:?})",
+                    "meeting v2: Ending (app={}, id={}, elapsed={:?}/{:?})",
                     app,
                     meeting_id,
-                    since.elapsed()
+                    since.elapsed(),
+                    timeout,
                 );
                 (
                     MeetingState::Ending {
@@ -1528,6 +1703,7 @@ pub fn advance_state(
                         app,
                         started_at,
                         since,
+                        is_browser,
                     },
                     None,
                 )
@@ -1645,16 +1821,15 @@ pub fn find_running_meeting_apps(
                 // Check browser URL patterns — only if this is a browser
                 if !profile.app_identifiers.browser_url_patterns.is_empty()
                     && BROWSER_NAMES.iter().any(|b| name_lower.contains(b))
+                    && has_browser_meeting_url(pid, profile.app_identifiers.browser_url_patterns)
                 {
-                    if has_browser_meeting_url(pid, &profile.app_identifiers.browser_url_patterns) {
-                        results.push(RunningMeetingApp {
-                            pid,
-                            app_name: name.clone(),
-                            profile_index: idx,
-                            browser_url: None,
-                        });
-                        break;
-                    }
+                    results.push(RunningMeetingApp {
+                        pid,
+                        app_name: name.clone(),
+                        profile_index: idx,
+                        browser_url: None,
+                    });
+                    break;
                 }
             }
         }
@@ -1732,12 +1907,7 @@ pub fn find_running_meeting_apps(
     profiles: &[MeetingDetectionProfile],
     currently_tracking: Option<&ActiveTracking>,
 ) -> Vec<RunningMeetingApp> {
-    use std::collections::{HashMap, HashSet};
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    };
+    use std::collections::HashSet;
 
     let mut results = Vec::new();
     let mut seen_pids = HashSet::new();
@@ -1820,7 +1990,9 @@ pub fn find_running_meeting_apps(
     ];
 
     for (idx, profile) in profiles.iter().enumerate() {
-        if profile.app_identifiers.browser_url_patterns.is_empty() {
+        if profile.app_identifiers.browser_url_patterns.is_empty()
+            && profile.app_identifiers.browser_title_patterns.is_empty()
+        {
             continue;
         }
 
@@ -1842,12 +2014,17 @@ pub fn find_running_meeting_apps(
             }
 
             let title_lower = title.to_lowercase();
-            if profile
+            let url_match = profile
                 .app_identifiers
                 .browser_url_patterns
                 .iter()
-                .any(|p| title_lower.contains(&p.to_lowercase()))
-            {
+                .any(|p| title_lower.contains(&p.to_lowercase()));
+            let title_match = profile
+                .app_identifiers
+                .browser_title_patterns
+                .iter()
+                .any(|p| title_lower == p.to_lowercase());
+            if url_match || title_match {
                 results.push(RunningMeetingApp {
                     pid: *pid,
                     app_name: proc_name.unwrap_or_default(),
@@ -1902,27 +2079,44 @@ async fn db_find_browser_meetings(
     profiles: &[MeetingDetectionProfile],
 ) -> Result<Vec<RunningMeetingApp>, sqlx::Error> {
     let mut results = Vec::new();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT DISTINCT app_name, window_name FROM frames \
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT app_name, window_name, browser_url FROM frames \
          WHERE timestamp > datetime('now', '-30 seconds') \
          AND app_name IS NOT NULL AND window_name IS NOT NULL",
     )
     .fetch_all(&db.pool)
     .await?;
 
-    for (app_name, window_name) in &rows {
+    for (app_name, window_name, browser_url) in &rows {
         let window_lower = window_name.to_lowercase();
+        #[cfg(target_os = "macos")]
         let app_lower = app_name.to_lowercase();
+        let url_lower = browser_url.as_deref().unwrap_or("").to_lowercase();
         for (idx, profile) in profiles.iter().enumerate() {
-            if profile.app_identifiers.browser_url_patterns.is_empty() {
+            let has_url_patterns = !profile.app_identifiers.browser_url_patterns.is_empty();
+            let has_title_patterns = !profile.app_identifiers.browser_title_patterns.is_empty();
+            if !has_url_patterns && !has_title_patterns {
                 continue;
             }
-            let matches = profile
-                .app_identifiers
-                .browser_url_patterns
-                .iter()
-                .any(|p| window_lower.contains(&p.to_lowercase()));
-            if matches {
+            // Check URL patterns against window_name AND browser_url
+            let url_match = has_url_patterns
+                && profile
+                    .app_identifiers
+                    .browser_url_patterns
+                    .iter()
+                    .any(|p| {
+                        let p_lower = p.to_lowercase();
+                        window_lower.contains(&p_lower) || url_lower.contains(&p_lower)
+                    });
+            // Check title patterns as exact match against window_name
+            // (e.g. window title "Meet" matches pattern "Meet")
+            let title_match = has_title_patterns
+                && profile
+                    .app_identifiers
+                    .browser_title_patterns
+                    .iter()
+                    .any(|p| window_lower == p.to_lowercase());
+            if url_match || title_match {
                 #[cfg(target_os = "macos")]
                 let pid = cidre::objc::ar_pool(|| -> i32 {
                     let ws = cidre::ns::Workspace::shared();
@@ -1978,10 +2172,11 @@ pub async fn run_meeting_detection_loop(
     let mut current_interval = base_interval;
     let mut idle_scan_count: u64 = 0;
 
-    // Check if any profile uses browser URL patterns (to gate DB query)
-    let has_browser_profiles = profiles
-        .iter()
-        .any(|p| !p.app_identifiers.browser_url_patterns.is_empty());
+    // Check if any profile uses browser URL or title patterns (to gate DB query)
+    let has_browser_profiles = profiles.iter().any(|p| {
+        !p.app_identifiers.browser_url_patterns.is_empty()
+            || !p.app_identifiers.browser_title_patterns.is_empty()
+    });
 
     // Close any orphaned meetings from a prior crash
     match db.close_orphaned_meetings().await {
@@ -1989,6 +2184,11 @@ pub async fn run_meeting_detection_loop(
         Ok(n) => info!("meeting v2: closed {} orphaned meeting(s)", n),
         Err(e) => warn!("meeting v2: failed to close orphaned meetings: {}", e),
     }
+
+    // Calendar enrichment: subscribe to calendar events from the event bus.
+    // If the calendar isn't connected, this stream simply never yields — safe no-op.
+    let mut cal_sub = subscribe_to_event::<Vec<CalendarEventSignal>>("calendar_events");
+    let mut calendar_events: Vec<CalendarEventSignal> = Vec::new();
 
     info!(
         "meeting v2: detection loop started (base_interval={:?}, profiles={})",
@@ -2017,6 +2217,12 @@ pub async fn run_meeting_detection_loop(
                 sync_meeting_flag(false, &in_meeting_flag, &detector);
                 return;
             }
+        }
+
+        // Drain pending calendar events (non-blocking).
+        // Each publish replaces the full list, so we keep only the latest.
+        while let Some(event) = cal_sub.next().now_or_never().flatten() {
+            calendar_events = event.data.into_iter().filter(|e| !e.is_all_day).collect();
         }
 
         // Skip if manual meeting is active
@@ -2085,8 +2291,18 @@ pub async fn run_meeting_detection_loop(
             state = new_state;
             if let Some(meeting_id) = ended_id {
                 let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                if let Err(e) = db.end_meeting(meeting_id, &now).await {
-                    error!("meeting v2: failed to end meeting {}: {}", meeting_id, e);
+                match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
+                    Ok(()) => {
+                        if let Err(e) = screenpipe_events::send_event(
+                            "meeting_ended",
+                            serde_json::json!({ "meeting_id": meeting_id }),
+                        ) {
+                            warn!("meeting v2: failed to emit meeting_ended event: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("meeting v2: failed to end meeting {}: {}", meeting_id, e);
+                    }
                 }
             }
             sync_meeting_flag(
@@ -2100,7 +2316,7 @@ pub async fn run_meeting_detection_loop(
                 current_interval = IDLE_NO_APPS_SCAN_INTERVAL;
                 idle_scan_count += 1;
                 // Periodic summary every ~60s (2 cycles at 30s)
-                if idle_scan_count % 2 == 0 {
+                if idle_scan_count.is_multiple_of(2) {
                     debug!(
                         "meeting v2: idle, no meeting apps (scans={})",
                         idle_scan_count
@@ -2140,8 +2356,20 @@ pub async fn run_meeting_detection_loop(
             scan_results.iter().filter(|r| r.is_in_call).count()
         );
 
+        // 2b. Check output audio when in Ending state for browser meetings.
+        // If the audio output device still has data, the meeting is likely
+        // still going — the user just switched tabs/apps or minimized the window.
+        // This applies to both browser meetings (e.g., Google Meet via Arc) and
+        // native meeting apps (e.g., Zoom). Audio activity is a strong signal
+        // that the user is still in the meeting even if UI controls are hidden.
+        let has_output_audio = if matches!(state, MeetingState::Ending { .. }) {
+            db.has_recent_output_audio(30).await.unwrap_or(false)
+        } else {
+            false
+        };
+
         // 3. Advance state machine
-        let (new_state, action) = advance_state(state, &scan_results);
+        let (new_state, action) = advance_state(state, &scan_results, has_output_audio);
         state = new_state;
 
         // Adaptive interval based on state
@@ -2155,6 +2383,11 @@ pub async fn run_meeting_detection_loop(
         if let Some(action) = action {
             match action {
                 StateAction::StartMeeting { app } => {
+                    // Calendar enrichment: find overlapping calendar event
+                    let (cal_title, cal_attendees) =
+                        find_overlapping_calendar_event(&calendar_events);
+                    let attendees_str = cal_attendees.as_ref().map(|a| a.join(", "));
+
                     // Try to merge with recently-ended meeting
                     let meeting_id = match db.find_recent_meeting_for_app(&app, 120).await {
                         Ok(Some(recent)) => match db.reopen_meeting(recent.id).await {
@@ -2163,17 +2396,59 @@ pub async fn run_meeting_detection_loop(
                                     "meeting v2: reopened recent meeting (id={}, app={})",
                                     recent.id, app
                                 );
+                                // Enrich reopened meeting with calendar data if it has none
+                                if cal_title.is_some()
+                                    && recent.title.as_ref().is_none_or(|t| t.is_empty())
+                                {
+                                    if let Err(e) = db
+                                        .update_meeting(
+                                            recent.id,
+                                            None,
+                                            None,
+                                            cal_title.as_deref(),
+                                            attendees_str.as_deref(),
+                                            None,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            "meeting v2: failed to enrich reopened meeting {}: {}",
+                                            recent.id, e
+                                        );
+                                    }
+                                }
                                 recent.id
                             }
                             Err(e) => {
                                 warn!("meeting v2: failed to reopen meeting {}: {}", recent.id, e);
-                                insert_new_meeting(&db, &app).await
+                                insert_new_meeting(
+                                    &db,
+                                    &app,
+                                    cal_title.as_deref(),
+                                    attendees_str.as_deref(),
+                                )
+                                .await
                             }
                         },
-                        Ok(None) => insert_new_meeting(&db, &app).await,
+                        Ok(None) => {
+                            insert_new_meeting(
+                                &db,
+                                &app,
+                                cal_title.as_deref(),
+                                attendees_str.as_deref(),
+                            )
+                            .await
+                        }
                         Err(e) => {
                             warn!("meeting v2: failed to find recent meeting: {}", e);
-                            insert_new_meeting(&db, &app).await
+                            insert_new_meeting(
+                                &db,
+                                &app,
+                                cal_title.as_deref(),
+                                attendees_str.as_deref(),
+                            )
+                            .await
                         }
                     };
 
@@ -2182,6 +2457,7 @@ pub async fn run_meeting_detection_loop(
                         app: ref a,
                         started_at,
                         last_seen,
+                        is_browser,
                         ..
                     } = state
                     {
@@ -2190,19 +2466,23 @@ pub async fn run_meeting_detection_loop(
                             app: a.clone(),
                             started_at,
                             last_seen,
+                            is_browser,
                         };
                     }
-
-                    // Calendar enrichment removed — the old MeetingDetector
-                    // no longer holds calendar state. Can be re-added when
-                    // calendar events are stored in the DB.
                 }
                 StateAction::EndMeeting { meeting_id } => {
                     if meeting_id >= 0 {
                         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                        match db.end_meeting(meeting_id, &now).await {
+                        match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
                             Ok(()) => {
                                 info!("meeting v2: meeting ended (id={})", meeting_id);
+                                // Emit event so triggered pipes can react
+                                if let Err(e) = screenpipe_events::send_event(
+                                    "meeting_ended",
+                                    serde_json::json!({ "meeting_id": meeting_id }),
+                                ) {
+                                    warn!("meeting v2: failed to emit meeting_ended event: {}", e);
+                                }
                             }
                             Err(e) => {
                                 error!("meeting v2: failed to end meeting {}: {}", meeting_id, e);
@@ -2251,6 +2531,8 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
             started_at,
             ..
         } => {
+            // When the app process exits, use a short timeout (not the browser one)
+            // because the process is actually gone, not just a tab switch.
             info!(
                 "meeting v2: Active -> Ending (app process exited, app={})",
                 app
@@ -2261,6 +2543,7 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
                     app,
                     started_at,
                     since: Instant::now(),
+                    is_browser: false, // process exited → use short timeout
                 },
                 None,
             )
@@ -2277,9 +2560,18 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
             since,
             app,
             started_at,
+            is_browser,
         } => {
-            if since.elapsed() >= ENDING_TIMEOUT {
-                info!("meeting v2: Ending -> Idle (timeout, app={})", app);
+            let timeout = if is_browser {
+                ENDING_TIMEOUT_BROWSER
+            } else {
+                ENDING_TIMEOUT
+            };
+            if since.elapsed() >= timeout {
+                info!(
+                    "meeting v2: Ending -> Idle (timeout={:?}, app={})",
+                    timeout, app
+                );
                 let ended_id = if meeting_id >= 0 {
                     Some(meeting_id)
                 } else {
@@ -2293,6 +2585,7 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
                         since,
                         app,
                         started_at,
+                        is_browser,
                     },
                     None,
                 )
@@ -2314,11 +2607,68 @@ fn sync_meeting_flag(
     }
 }
 
-/// Insert a new meeting into the database. Returns the meeting ID, or -1 on failure.
-async fn insert_new_meeting(db: &DatabaseManager, app: &str) -> i64 {
-    match db.insert_meeting(app, "ui_scan", None, None).await {
+/// Calendar event signal received from the event bus (published by calendar.rs in src-tauri).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CalendarEventSignal {
+    pub title: String,
+    pub start: String,
+    pub end: String,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    #[serde(default)]
+    pub is_all_day: bool,
+}
+
+/// Check if any non-all-day calendar event overlaps with the current time.
+/// Returns (title, attendees) of the first matching event, or (None, None).
+fn find_overlapping_calendar_event(
+    events: &[CalendarEventSignal],
+) -> (Option<String>, Option<Vec<String>>) {
+    let now = Utc::now();
+    for cal_event in events {
+        if let (Ok(start), Ok(end)) = (
+            DateTime::parse_from_rfc3339(&cal_event.start),
+            DateTime::parse_from_rfc3339(&cal_event.end),
+        ) {
+            let start_utc = start.with_timezone(&Utc);
+            let end_utc = end.with_timezone(&Utc);
+            if start_utc <= now && end_utc >= now {
+                return (
+                    Some(cal_event.title.clone()),
+                    if cal_event.attendees.is_empty() {
+                        None
+                    } else {
+                        Some(cal_event.attendees.clone())
+                    },
+                );
+            }
+        }
+    }
+    (None, None)
+}
+
+/// Insert a new meeting into the database with optional calendar enrichment.
+/// Returns the meeting ID, or -1 on failure.
+async fn insert_new_meeting(
+    db: &DatabaseManager,
+    app: &str,
+    title: Option<&str>,
+    attendees: Option<&str>,
+) -> i64 {
+    match db.insert_meeting(app, "ui_scan", title, attendees).await {
         Ok(id) => {
-            info!("meeting v2: meeting started (id={}, app={})", id, app);
+            info!(
+                "meeting v2: meeting started (id={}, app={}, title={:?})",
+                id, app, title
+            );
+            // Emit event so triggered pipes can react
+            if let Err(e) = screenpipe_events::send_event(
+                "meeting_started",
+                serde_json::json!({ "meeting_id": id, "app": app, "title": title }),
+            ) {
+                warn!("meeting v2: failed to emit meeting_started event: {}", e);
+            }
             id
         }
         Err(e) => {
@@ -2365,6 +2715,14 @@ mod tests {
                 .contains(&"microsoft teams")
         });
         assert!(teams.is_some(), "Teams profile not found");
+        let teams_profile = teams.unwrap();
+        assert!(
+            teams_profile
+                .app_identifiers
+                .macos_app_names
+                .contains(&"msteams"),
+            "MSTeams not added to macos_app_names"
+        );
     }
 
     #[test]
@@ -2547,7 +2905,7 @@ mod tests {
     fn test_idle_to_confirming() {
         let state = MeetingState::Idle;
         let results = vec![make_scan_result("Zoom", true, 1)];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(new_state, MeetingState::Confirming { .. }));
         assert!(action.is_none());
@@ -2557,7 +2915,7 @@ mod tests {
     fn test_idle_stays_idle_no_results() {
         let state = MeetingState::Idle;
         let results: Vec<ScanResult> = vec![];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(new_state, MeetingState::Idle));
         assert!(action.is_none());
@@ -2567,7 +2925,7 @@ mod tests {
     fn test_idle_stays_idle_no_call() {
         let state = MeetingState::Idle;
         let results = vec![make_scan_result("Zoom", false, 0)];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(new_state, MeetingState::Idle));
         assert!(action.is_none());
@@ -2581,7 +2939,7 @@ mod tests {
             profile_index: 0,
         };
         let results = vec![make_scan_result("Zoom", true, 2)];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(new_state, MeetingState::Active { .. }));
         assert!(matches!(action, Some(StateAction::StartMeeting { .. })));
@@ -2590,12 +2948,14 @@ mod tests {
     #[test]
     fn test_confirming_to_idle_timeout() {
         let state = MeetingState::Confirming {
-            since: Instant::now() - CONFIRM_TIMEOUT - Duration::from_secs(1),
+            since: Instant::now()
+                .checked_sub(CONFIRM_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
             app: "Zoom".to_string(),
             profile_index: 0,
         };
         let results: Vec<ScanResult> = vec![];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(new_state, MeetingState::Idle));
         assert!(action.is_none());
@@ -2610,7 +2970,7 @@ mod tests {
             profile_index: 0,
         };
         let results: Vec<ScanResult> = vec![];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(new_state, MeetingState::Confirming { .. }));
         assert!(action.is_none());
@@ -2623,9 +2983,10 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: Utc::now(),
             last_seen: Instant::now(),
+            is_browser: false,
         };
         let results = vec![make_scan_result("Zoom", true, 1)];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(
             new_state,
@@ -2641,9 +3002,10 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: Utc::now(),
             last_seen: Instant::now(),
+            is_browser: false,
         };
         let results: Vec<ScanResult> = vec![];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(
             new_state,
@@ -2660,14 +3022,15 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: original_start,
             last_seen: Instant::now(),
+            is_browser: false,
         };
         // Transition to Ending
         let results: Vec<ScanResult> = vec![];
-        let (ending_state, _) = advance_state(state, &results);
+        let (ending_state, _) = advance_state(state, &results, false);
 
         // Transition back to Active (controls reappear)
         let results = vec![make_scan_result("Zoom", true, 1)];
-        let (active_again, _) = advance_state(ending_state, &results);
+        let (active_again, _) = advance_state(ending_state, &results, false);
 
         if let MeetingState::Active { started_at, .. } = active_again {
             assert_eq!(
@@ -2687,9 +3050,10 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: started,
             since: Instant::now(),
+            is_browser: false,
         };
         let results = vec![make_scan_result("Zoom", true, 1)];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(
             new_state,
@@ -2704,10 +3068,13 @@ mod tests {
             meeting_id: 42,
             app: "Zoom".to_string(),
             started_at: Utc::now(),
-            since: Instant::now() - ENDING_TIMEOUT - Duration::from_secs(1),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+            is_browser: false,
         };
         let results: Vec<ScanResult> = vec![];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(new_state, MeetingState::Idle));
         assert!(matches!(
@@ -2724,15 +3091,88 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: Utc::now(),
             since,
+            is_browser: false,
         };
         let results: Vec<ScanResult> = vec![];
-        let (new_state, action) = advance_state(state, &results);
+        let (new_state, action) = advance_state(state, &results, false);
 
         assert!(matches!(
             new_state,
             MeetingState::Ending { meeting_id: 42, .. }
         ));
         assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_browser_ending_stays_active_with_output_audio() {
+        // Browser meeting: user switched tabs but audio output is still active
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Google Chrome".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now(),
+            is_browser: true,
+        };
+        let results: Vec<ScanResult> = vec![];
+        let (new_state, action) = advance_state(state, &results, true);
+
+        assert!(
+            matches!(
+                new_state,
+                MeetingState::Active {
+                    meeting_id: 42,
+                    is_browser: true,
+                    ..
+                }
+            ),
+            "browser meeting should stay Active when output audio is flowing"
+        );
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_native_ending_respects_output_audio() {
+        // Native app (e.g., Zoom): output audio SHOULD keep meeting alive
+        // This handles cases where:
+        // - User minimizes Zoom but is still in the meeting
+        // - Zoom controls move to floating toolbar (not detected by scanner)
+        // - User is sharing screen (controls move to secondary toolbar)
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Zoom".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
+            is_browser: false,
+        };
+        let results: Vec<ScanResult> = vec![];
+        let (new_state, action) = advance_state(state, &results, true);
+
+        // Even though timeout hasn't elapsed, audio presence keeps it Active
+        assert!(matches!(new_state, MeetingState::Active { .. }));
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_native_ending_no_audio_times_out() {
+        // Native app with no audio output: should still end after timeout
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Zoom".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+            is_browser: false,
+        };
+        let results: Vec<ScanResult> = vec![];
+        let (new_state, action) = advance_state(state, &results, false);
+
+        // No audio + timeout elapsed → should end
+        assert!(matches!(new_state, MeetingState::Idle));
+        assert!(matches!(
+            action,
+            Some(StateAction::EndMeeting { meeting_id: 42 })
+        ));
     }
 
     // ── Edge case tests ────────────────────────────────────────────────
@@ -2745,10 +3185,11 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: Utc::now(),
             last_seen: Instant::now(),
+            is_browser: false,
         };
 
         // First: Active -> Ending (no controls found)
-        let (state, action) = advance_state(state, &[]);
+        let (state, action) = advance_state(state, &[], false);
         assert!(matches!(state, MeetingState::Ending { .. }));
         assert!(action.is_none());
 
@@ -2757,9 +3198,12 @@ mod tests {
             meeting_id: 42,
             app: "Zoom".to_string(),
             started_at: Utc::now(),
-            since: Instant::now() - ENDING_TIMEOUT - Duration::from_secs(1),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+            is_browser: false,
         };
-        let (state, action) = advance_state(state, &[]);
+        let (state, action) = advance_state(state, &[], false);
         assert!(matches!(state, MeetingState::Idle));
         assert!(matches!(
             action,
@@ -2775,17 +3219,17 @@ mod tests {
         // Scan 1: Teams detected
         let state = MeetingState::Idle;
         let results = vec![make_scan_result("Teams", true, 1)];
-        let (state, _) = advance_state(state, &results);
+        let (state, _) = advance_state(state, &results, false);
         assert!(matches!(state, MeetingState::Confirming { .. }));
 
         // Scan 2: No controls (switched to VS Code, Teams AX tree inaccessible)
-        let (state, _) = advance_state(state, &[]);
+        let (state, _) = advance_state(state, &[], false);
         // Still confirming (within timeout)
         assert!(matches!(state, MeetingState::Confirming { .. }));
 
         // Scan 3: Teams detected again
         let results = vec![make_scan_result("Teams", true, 1)];
-        let (state, action) = advance_state(state, &results);
+        let (state, action) = advance_state(state, &results, false);
         // Should transition to Active
         assert!(matches!(state, MeetingState::Active { .. }));
         assert!(matches!(action, Some(StateAction::StartMeeting { .. })));
@@ -2797,7 +3241,7 @@ mod tests {
         // Should stay Idle.
         let state = MeetingState::Idle;
         let results = vec![make_scan_result("Teams", false, 0)];
-        let (state, _) = advance_state(state, &results);
+        let (state, _) = advance_state(state, &results, false);
         assert!(matches!(state, MeetingState::Idle));
     }
 
@@ -2808,6 +3252,7 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: Utc::now(),
             last_seen: Instant::now(),
+            is_browser: false,
         };
         let (new_state, ended_id) = handle_no_apps_running(state);
         assert!(matches!(new_state, MeetingState::Ending { .. }));
@@ -2832,7 +3277,10 @@ mod tests {
             meeting_id: 42,
             app: "Zoom".to_string(),
             started_at: Utc::now(),
-            since: Instant::now() - ENDING_TIMEOUT - Duration::from_secs(1),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+            is_browser: false,
         };
         let (new_state, ended_id) = handle_no_apps_running(state);
         assert!(matches!(new_state, MeetingState::Idle));
@@ -2846,6 +3294,7 @@ mod tests {
             app: "Zoom".to_string(),
             started_at: Utc::now(),
             since: Instant::now(),
+            is_browser: false,
         };
         let (new_state, ended_id) = handle_no_apps_running(state);
         assert!(matches!(new_state, MeetingState::Ending { .. }));
@@ -2859,7 +3308,10 @@ mod tests {
             meeting_id: -1,
             app: "Zoom".to_string(),
             started_at: Utc::now(),
-            since: Instant::now() - ENDING_TIMEOUT - Duration::from_secs(1),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+            is_browser: false,
         };
         let (_, ended_id) = handle_no_apps_running(state);
         assert!(ended_id.is_none(), "should not end meeting with id=-1");
@@ -2911,7 +3363,7 @@ mod tests {
             make_scan_result("Zoom", true, 3),
             make_scan_result("Chrome", false, 0),
         ];
-        let (new_state, _) = advance_state(state, &results);
+        let (new_state, _) = advance_state(state, &results, false);
         if let MeetingState::Confirming { app, .. } = new_state {
             assert_eq!(app, "Zoom", "should pick the result with most signals");
         } else {
@@ -2921,36 +3373,9 @@ mod tests {
 
     // ── Zoom menu bar signal tests ────────────────────────────────────
 
-    #[test]
-    fn test_zoom_menu_bar_item_meeting() {
-        // Zoom on macOS exposes "Meeting" as an AXMenuBarItem during active calls
-        let signal = CallSignal::MenuBarItem {
-            title_contains: "Meeting",
-        };
-        assert!(check_signal_match(
-            &signal,
-            "AXMenuBarItem",
-            Some("Meeting"),
-            None,
-            None
-        ));
-        // Should not match other menu bar items
-        assert!(!check_signal_match(
-            &signal,
-            "AXMenuBarItem",
-            Some("View"),
-            None,
-            None
-        ));
-        // Should not match non-menu-bar roles
-        assert!(!check_signal_match(
-            &signal,
-            "AXButton",
-            Some("Meeting"),
-            None,
-            None
-        ));
-    }
+    // NOTE: test_zoom_menu_bar_item_meeting removed because "Meeting" menu bar
+    // item exists even when Zoom is idle, causing false positives (#2561).
+    // Now we only use real call control signals.
 
     #[test]
     fn test_zoom_menu_item_id_mute_audio() {
@@ -3001,22 +3426,28 @@ mod tests {
     }
 
     #[test]
-    fn test_zoom_profile_has_menu_bar_signals() {
+    fn test_zoom_profile_has_leave_signals() {
+        // After #2561 fix, Zoom profile uses real call control signals
+        // (leave button, end meeting button) instead of idle "Meeting" menu bar item.
         let profiles = load_detection_profiles();
         let zoom = profiles
             .iter()
             .find(|p| p.app_identifiers.macos_app_names.contains(&"zoom.us"))
             .expect("Zoom profile not found");
 
-        let has_menu_bar = zoom.call_signals.iter().any(|s| {
+        let has_leave_signals = zoom.call_signals.iter().any(|s| {
             matches!(
                 s,
-                CallSignal::MenuBarItem { .. } | CallSignal::MenuItemId(_)
+                CallSignal::RoleWithName { name_contains, .. }
+                    if name_contains.contains("leave") || name_contains.contains("end meeting")
+            ) || matches!(
+                s,
+                CallSignal::AutomationIdContains(id) if id.contains("leave")
             )
         });
         assert!(
-            has_menu_bar,
-            "Zoom profile must have menu bar signals for macOS detection"
+            has_leave_signals,
+            "Zoom profile must have 'leave' or 'end meeting' signals for call detection"
         );
     }
 
@@ -3175,21 +3606,27 @@ mod tests {
     // ── Zoom false positive prevention tests ────────────────────────
 
     #[test]
-    fn test_zoom_requires_two_signals() {
-        // Zoom must require at least 2 signals to avoid false positives
-        // when Zoom is open but idle (e.g. "Meeting" menu bar item exists
-        // without an active call).
+    fn test_zoom_no_idle_menu_bar_item() {
+        // After fix for #2561, Zoom profile should NOT use the idle
+        // "Meeting" menu bar item as a signal. Only real call control signals
+        // (leave, end meeting, window title) should trigger detection.
         let profiles = load_detection_profiles();
         let zoom = profiles
             .iter()
             .find(|p| p.app_identifiers.macos_app_names.contains(&"zoom.us"))
             .expect("Zoom profile not found");
 
+        let has_menu_bar_meeting = zoom.call_signals.iter().any(|s| {
+            matches!(
+                s,
+                CallSignal::MenuBarItem { title_contains } if title_contains.contains("Meeting")
+            )
+        });
+
         assert!(
-            zoom.min_signals_required >= 2,
-            "Zoom must require >= 2 signals (got {}). A single signal like \
-             'Meeting' menu bar item can appear when Zoom is idle.",
-            zoom.min_signals_required
+            !has_menu_bar_meeting,
+            "Zoom profile must NOT use 'Meeting' menu bar item signal (#2561). \
+             It exists even when Zoom is idle."
         );
     }
 
@@ -3239,7 +3676,7 @@ mod tests {
         // Simulate Zoom idle: only "Meeting" menu bar item found (1 signal).
         // With min_signals_required=2, this should NOT trigger detection.
         let profiles = load_detection_profiles();
-        let zoom = profiles
+        let _zoom = profiles
             .iter()
             .find(|p| p.app_identifiers.macos_app_names.contains(&"zoom.us"))
             .expect("Zoom profile not found");
@@ -3253,7 +3690,7 @@ mod tests {
             signals_found: 1,
             matched_signals: vec!["menu_bar_item=Meeting".to_string()],
         }];
-        let (new_state, _) = advance_state(state, &results);
+        let (new_state, _) = advance_state(state, &results, false);
         assert!(
             matches!(new_state, MeetingState::Idle),
             "Zoom with only 1 signal should stay Idle, got {:?}",
@@ -3276,7 +3713,7 @@ mod tests {
                 "role=AXButton name=End Meeting".to_string(),
             ],
         }];
-        let (new_state, _) = advance_state(state, &results);
+        let (new_state, _) = advance_state(state, &results, false);
         assert!(
             matches!(new_state, MeetingState::Confirming { .. }),
             "Zoom with 2 signals should transition to Confirming, got {:?}",
@@ -3327,8 +3764,7 @@ mod tests {
         let has_broad_pattern = meet
             .app_identifiers
             .browser_url_patterns
-            .iter()
-            .any(|p| *p == "google meet");
+            .contains(&"google meet");
         assert!(
             !has_broad_pattern,
             "Google Meet browser_url_patterns must NOT include bare 'google meet' — \
@@ -3435,7 +3871,7 @@ mod tests {
         // Cmd+D / Ctrl+D should NOT match any meeting signal for browser-based
         // profiles, because it's the universal bookmark shortcut.
         let signal_cmd_d = CallSignal::KeyboardShortcut("\u{2318}D");
-        let signal_ctrl_d = CallSignal::KeyboardShortcut("Ctrl+D");
+        let _signal_ctrl_d = CallSignal::KeyboardShortcut("Ctrl+D");
 
         // A random AXButton with ⌘D in its description (e.g. bookmark button)
         // should not be detected as a meeting signal
@@ -3483,7 +3919,7 @@ mod tests {
         // Patterns without dots should NOT match titles
         let non_domain_patterns = ["google meet", "zoom meeting", "slack huddle"];
         let title = "Join with Google Meet - Calendar";
-        let title_lower = title.to_lowercase();
+        let _title_lower = title.to_lowercase();
 
         for pattern in &non_domain_patterns {
             // Domain-only filter: patterns without dots are excluded from title matching

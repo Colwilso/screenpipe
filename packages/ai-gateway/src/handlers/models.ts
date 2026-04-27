@@ -4,7 +4,7 @@
 
 import { Env, UserTier } from '../types';
 import { createSuccessResponse, createErrorResponse, addCorsHeaders } from '../utils/cors';
-import { getTierConfig } from '../services/usage-tracker';
+import { getTierConfig, getModelWeight } from '../services/usage-tracker';
 import { listAnthropicModels } from '../providers/anthropic-proxy';
 import { getModelHealth, ModelHealthStatus } from '../services/model-health';
 
@@ -29,6 +29,15 @@ interface ModelEntry {
   warning?: string;
   /** Live health status from rolling 5-minute error rate */
   health?: ModelHealthStatus;
+  /**
+   * How many "daily query" units one message on this model consumes.
+   * 0 = doesn't count against the user's daily cap (free-tier Vertex,
+   * auto, gemini-3-flash, etc.). Higher = fewer messages before cap.
+   * UI uses `floor(remaining / query_weight)` to warn when the user is
+   * about to run out for a weighted model. Populated server-side from
+   * `getModelWeight()` so client doesn't have to mirror the table.
+   */
+  query_weight?: number;
 }
 
 /** Curated model catalog — single source of truth */
@@ -95,6 +104,9 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'free',
     recommended_for: ['pipes', 'chat'],
   },
+  // minimax-m2 not yet exposed — Vertex's openapi endpoint rejects both
+  // the publisher-prefixed and bare-model-id formats. Re-add once the
+  // correct invocation shape is verified in Model Garden.
   {
     id: 'llama-4-maverick',
     object: 'model',
@@ -125,6 +137,82 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'free',
     recommended_for: ['pipes', 'chat'],
   },
+  // glm-5.1 still pending — released 2026-04-07 on HuggingFace, not yet on Vertex MaaS.
+  {
+    id: 'deepseek-r1',
+    object: 'model',
+    owned_by: 'vertex-maas',
+    name: 'DeepSeek R1',
+    description: 'deep reasoning, 671B MoE',
+    tags: ['free', 'reasoning'],
+    free: true,
+    context_window: 128000,
+    best_for: ['complex reasoning', 'math', 'analysis'],
+    speed: 'slow',
+    intelligence: 'highest',
+    cost_tier: 'free',
+    recommended_for: ['chat', 'analysis'],
+  },
+  {
+    id: 'deepseek-v3.2',
+    object: 'model',
+    owned_by: 'vertex-maas',
+    name: 'DeepSeek V3.2',
+    description: 'fast general-purpose, 671B MoE',
+    tags: ['free', 'general'],
+    free: true,
+    context_window: 128000,
+    best_for: ['general', 'coding', 'chat'],
+    speed: 'fast',
+    intelligence: 'high',
+    cost_tier: 'free',
+    recommended_for: ['pipes', 'chat', 'coding'],
+  },
+  {
+    id: 'qwen3-coder',
+    object: 'model',
+    owned_by: 'vertex-maas',
+    name: 'Qwen3 Coder',
+    description: 'coding specialist, 480B MoE',
+    tags: ['free', 'coding'],
+    free: true,
+    context_window: 128000,
+    best_for: ['coding', 'tool use'],
+    speed: 'medium',
+    intelligence: 'high',
+    cost_tier: 'free',
+    recommended_for: ['pipes', 'coding'],
+  },
+  {
+    id: 'qwen3-next',
+    object: 'model',
+    owned_by: 'vertex-maas',
+    name: 'Qwen3 Next',
+    description: '80B instruct, fast and capable',
+    tags: ['free', 'general'],
+    free: true,
+    context_window: 128000,
+    best_for: ['general', 'chat'],
+    speed: 'fast',
+    intelligence: 'high',
+    cost_tier: 'free',
+    recommended_for: ['pipes', 'chat'],
+  },
+  {
+    id: 'qwen3-next-thinking',
+    object: 'model',
+    owned_by: 'vertex-maas',
+    name: 'Qwen3 Next Thinking',
+    description: '80B reasoning model',
+    tags: ['free', 'reasoning'],
+    free: true,
+    context_window: 128000,
+    best_for: ['reasoning', 'analysis'],
+    speed: 'medium',
+    intelligence: 'high',
+    cost_tier: 'free',
+    recommended_for: ['chat', 'analysis'],
+  },
   {
     id: 'gemini-3-flash',
     object: 'model',
@@ -140,13 +228,59 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'free',
     recommended_for: ['pipes', 'chat'],
   },
+  {
+    id: 'gemini-3.1-flash-lite',
+    object: 'model',
+    owned_by: 'google',
+    name: 'Gemini 3.1 Flash-Lite',
+    description: 'cheapest multimodal — high-volume, low-latency',
+    tags: ['free', 'general', 'vision'],
+    free: true,
+    context_window: 1000000,
+    best_for: ['high-volume', 'extraction', 'general'],
+    speed: 'fast',
+    intelligence: 'standard',
+    cost_tier: 'free',
+    recommended_for: ['pipes', 'chat'],
+  },
+  // ── Confidential inference (Tinfoil — secure enclaves) ──
+  {
+    id: 'gemma4-31b',
+    object: 'model',
+    owned_by: 'tinfoil',
+    name: 'Gemma 4 31B (Confidential)',
+    description: 'runs in secure enclaves — your data stays encrypted, even from the provider. text only.',
+    tags: ['confidential', 'private', 'encrypted'],
+    free: false,
+    context_window: 256000,
+    best_for: ['private queries', 'sensitive data', 'general'],
+    speed: 'medium',
+    intelligence: 'high',
+    cost_tier: 'low',
+    recommended_for: ['chat', 'analysis'],
+  },
   // ── Included with screenpipe ──
+  {
+    id: 'claude-opus-4-7',
+    object: 'model',
+    owned_by: 'anthropic',
+    name: 'Claude Opus 4.7',
+    description: 'most intelligent, best reasoning — latest opus',
+    tags: ['premium', 'reasoning', 'new'],
+    free: false,
+    context_window: 200000,
+    best_for: ['complex tasks', 'analysis', 'agentic coding'],
+    speed: 'slow',
+    intelligence: 'highest',
+    cost_tier: 'medium',
+    recommended_for: ['chat', 'analysis', 'coding'],
+  },
   {
     id: 'claude-opus-4-6',
     object: 'model',
     owned_by: 'anthropic',
     name: 'Claude Opus 4.6',
-    description: 'most intelligent, best reasoning',
+    description: 'previous opus — still very capable',
     tags: ['premium', 'reasoning'],
     free: false,
     context_window: 200000,
@@ -203,21 +337,7 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'low',
     recommended_for: ['pipes', 'chat'],
   },
-  {
-    id: 'deepseek/deepseek-chat',
-    object: 'model',
-    owned_by: 'openrouter',
-    name: 'DeepSeek V3.2',
-    description: 'strong reasoning, great value',
-    tags: ['reasoning', 'value'],
-    free: false,
-    context_window: 128000,
-    best_for: ['reasoning', 'coding'],
-    speed: 'medium',
-    intelligence: 'high',
-    cost_tier: 'low',
-    recommended_for: ['pipes', 'chat', 'coding'],
-  },
+  // deepseek/deepseek-chat removed — use deepseek-v3.2 on Vertex MaaS (GCP infra, free, no China data risk)
   {
     id: 'deepseek/deepseek-v3.2-speciale',
     object: 'model',
@@ -248,36 +368,8 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'high',
     recommended_for: ['chat', 'analysis'],
   },
-  {
-    id: 'meta-llama/llama-4-scout',
-    object: 'model',
-    owned_by: 'openrouter',
-    name: 'Llama 4 Scout',
-    description: 'fast open-source model',
-    tags: ['fast', 'open-source'],
-    free: false,
-    context_window: 512000,
-    best_for: ['general', 'pipes'],
-    speed: 'fast',
-    intelligence: 'standard',
-    cost_tier: 'low',
-    recommended_for: ['pipes', 'chat'],
-  },
-  {
-    id: 'meta-llama/llama-4-maverick',
-    object: 'model',
-    owned_by: 'openrouter',
-    name: 'Llama 4 Maverick',
-    description: 'strong open-source reasoning',
-    tags: ['reasoning', 'open-source'],
-    free: false,
-    context_window: 256000,
-    best_for: ['reasoning', 'coding'],
-    speed: 'medium',
-    intelligence: 'high',
-    cost_tier: 'medium',
-    recommended_for: ['chat', 'coding'],
-  },
+  // meta-llama/llama-4-scout and meta-llama/llama-4-maverick removed
+  // — use llama-4-scout / llama-4-maverick on Vertex MaaS (GCP infra, free, no China data risk)
   {
     id: 'gemini-3.1-pro',
     object: 'model',
@@ -321,6 +413,10 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
         model.health = health[model.id];
       }
       // Default: healthy (no data = no errors)
+
+      // Attach per-message query weight so UIs can warn the user before
+      // they run out for a weighted model. 0 means "doesn't count."
+      model.query_weight = getModelWeight(model.id);
     }
 
     return addCorsHeaders(createSuccessResponse({

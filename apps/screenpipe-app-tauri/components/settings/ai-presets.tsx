@@ -11,6 +11,16 @@ import {
   DEFAULT_PROMPT,
   useSettings,
 } from "@/lib/hooks/use-settings";
+import {
+  useUsageStatus,
+  messagesLeftForModel,
+  shouldWarnLowQuota,
+  formatResetTime,
+} from "@/lib/hooks/use-usage-status";
+import {
+  buildChatTestBody,
+  shouldRetryWithMaxCompletionTokens,
+} from "@/lib/utils/chat-test-body";
 import { Label } from "../ui/label";
 import { Input } from "../ui/input";
 import { ValidatedInput } from "../ui/validated-input";
@@ -36,6 +46,7 @@ import {
   ChevronDown,
   ChevronUp,
   GripVertical,
+  Share2,
 } from "lucide-react";
 import {
   DndContext,
@@ -75,6 +86,7 @@ import { toast } from "../ui/use-toast";
 import { Card, CardContent } from "../ui/card";
 import { AIProviderType } from "@/lib/hooks/use-settings";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import { useTeam } from "@/lib/hooks/use-team";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -104,6 +116,16 @@ const formatPresetName = (name: string): string => {
     return `Preset ${name.slice(0, 8)}...`;
   }
   return name;
+};
+
+const isLocalhostUrl = (url?: string): boolean => {
+  if (!url) return false;
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  } catch {
+    return false;
+  }
 };
 
 type DiagnosticStatus = "pass" | "fail" | "skip" | "pending" | "running";
@@ -161,6 +183,9 @@ export interface AIModel {
   cost_tier?: 'free' | 'low' | 'medium' | 'high' | 'very_high';
   recommended_for?: string[];
   warning?: string;
+  /** How many daily-quota units one message on this model consumes.
+   *  0 = free / doesn't count. Populated by the screenpipe worker. */
+  query_weight?: number;
 }
 
 export const AIProviderCard = ({
@@ -220,6 +245,9 @@ const AISection = ({
 }) => {
   const { settings, updateSettings } = useSettings();
   const isEnterprise = useIsEnterpriseBuild();
+  // Daily quota snapshot — drives the "N left today" chip on weighted
+  // models. Null on BYOK providers; we render nothing in that case.
+  const usage = useUsageStatus();
   const [settingsPreset, setSettingsPreset] = useState<
     Partial<AIPreset> | undefined
   >(preset);
@@ -443,14 +471,20 @@ const AISection = ({
     return null; // unknown model, don't change
   }, []);
 
+  // Only auto-set max tokens when the user actually changes the model name,
+  // not on mount — otherwise the saved maxTokens value gets overwritten.
+  const prevModelRef = useRef(settingsPreset?.model);
   useEffect(() => {
     const model = settingsPreset?.model;
     if (!model) return;
+    if (model === prevModelRef.current) return; // no change — preserve saved value
+    prevModelRef.current = model;
+    if (settingsPreset?.provider === "screenpipe-cloud") return;
     const tokens = getDefaultMaxTokens(model);
-    if (tokens && (settingsPreset as any)?.maxTokens !== tokens) {
+    if (tokens) {
       updateSettingsPreset({ maxTokens: tokens } as any);
     }
-  }, [settingsPreset?.model]);
+  }, [settingsPreset?.model, settingsPreset?.provider, getDefaultMaxTokens, updateSettingsPreset]);
 
   const handleCustomPromptChange = useCallback((value: string, isValid: boolean) => {
     updateSettingsPreset({ prompt: value });
@@ -584,7 +618,11 @@ const AISection = ({
         chat: { status: "running", message: "Sending test message..." },
       }));
     } else {
-      const modelsFetchFn = fetch;
+      // Local custom providers often do not implement browser CORS preflight on /models.
+      const modelsFetchFn =
+        settingsPreset?.provider === "custom" && isLocalhostUrl(settingsPreset?.url)
+          ? tauriFetch
+          : fetch;
       try {
         modelsResponse = await modelsFetchFn(modelsUrl, {
           headers,
@@ -690,11 +728,14 @@ const AISection = ({
       chatUrl = `${settingsPreset?.url}/chat/completions`;
     }
 
-    const chatBody = isChatGpt
+    // For OpenAI-compatible endpoints, start with `max_tokens` (broadest
+    // compatibility) but retry with `max_completion_tokens` if the endpoint
+    // rejects it (GPT-5, o-series, Azure Foundry, etc.).
+    const chatBody: any = isChatGpt
       ? { model: settingsPreset?.model || "", instructions: "reply briefly", input: [{ role: "user", content: "say hi" }], store: false, stream: true }
       : isAnthropic
       ? { model: settingsPreset?.model || "", messages: [{ role: "user", content: "say hi" }], max_tokens: 50 }
-      : { model: settingsPreset?.model || "", messages: [{ role: "user", content: "say hi" }], max_tokens: 50 };
+      : buildChatTestBody(settingsPreset?.model || "", "say hi", 50, "max_tokens");
 
     // For ChatGPT Codex endpoint, extract account ID from JWT and add required headers
     const chatHeaders: Record<string, string> = {
@@ -718,12 +759,33 @@ const AISection = ({
 
     const chatStart = performance.now();
     try {
-      const chatResponse = await fetchFn(chatUrl, {
+      let chatResponse = await fetchFn(chatUrl, {
         method: "POST",
         headers: chatHeaders,
         body: JSON.stringify(chatBody),
         signal: abort.signal,
       });
+
+      // Retry with max_completion_tokens for newer OpenAI-compatible endpoints
+      // (GPT-5, o-series, Azure Foundry) that reject max_tokens. Only for the
+      // generic OpenAI-compatible path — Anthropic/ChatGPT use different params.
+      if (!chatResponse.ok && !isChatGpt && !isAnthropic) {
+        const errText = await chatResponse.clone().text().catch(() => "");
+        if (shouldRetryWithMaxCompletionTokens(errText)) {
+          const retryBody = buildChatTestBody(
+            settingsPreset?.model || "",
+            "say hi",
+            50,
+            "max_completion_tokens",
+          );
+          chatResponse = await fetchFn(chatUrl, {
+            method: "POST",
+            headers: chatHeaders,
+            body: JSON.stringify(retryBody),
+            signal: abort.signal,
+          });
+        }
+      }
 
       const latencyMs = Math.round(performance.now() - chatStart);
 
@@ -831,7 +893,8 @@ const AISection = ({
           break;
         case "custom":
           try {
-            const customResponse = await fetch(
+            const customFetchFn = isLocalhostUrl(settingsPreset?.url) ? tauriFetch : fetch;
+            const customResponse = await customFetchFn(
               `${settingsPreset?.url}/models`,
               {
                 headers: settingsPreset.apiKey
@@ -1000,6 +1063,7 @@ const AISection = ({
             { id: "claude-sonnet-4-5", name: "Sonnet 4.5 (balanced)", provider: "screenpipe" },
             { id: "claude-opus-4-6", name: "Opus 4.6 (powerful, pro)", provider: "screenpipe" },
             { id: "gemini-3-flash", name: "Gemini 3 Flash (fast)", provider: "screenpipe" },
+            { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite (cheapest)", provider: "screenpipe" },
             { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro (balanced)", provider: "screenpipe" },
             { id: "qwen/qwen3.5-flash-02-23", name: "Qwen3.5 Flash (cheapest, 1M ctx)", provider: "screenpipe" },
             { id: "deepseek/deepseek-chat", name: "DeepSeek V3.2 (fast)", provider: "screenpipe" },
@@ -1088,6 +1152,28 @@ const AISection = ({
           </Label>
         </div>
         <div className="grid grid-cols-2 gap-4 mb-4 mt-4">
+          <AIProviderCard
+            type="openai-chatgpt"
+            title="ChatGPT"
+            description="Sign in with your ChatGPT Plus/Pro subscription"
+            imageSrc="/images/openai.png"
+            selected={settingsPreset?.provider === "openai-chatgpt"}
+            onClick={() => handleAiProviderChange("openai-chatgpt")}
+          />
+
+          <AIProviderCard
+            type="anthropic"
+            title="Claude API"
+            description="Use your Anthropic API key"
+            imageSrc="/images/claude-ai.svg"
+            selected={(settingsPreset?.provider as string) === "anthropic"}
+            onClick={() => {
+              if ((settingsPreset?.provider as string) !== "anthropic") {
+                handleAiProviderChange("anthropic");
+              }
+            }}
+          />
+
           <AIProviderCard
             type="bedrock"
             title="AWS Bedrock"
@@ -1390,6 +1476,18 @@ const AISection = ({
                                 <div className="flex items-center gap-1 ml-2">
                                   {costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
                                   {model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
+                                  {/* Low-quota warning — only renders when the user is within
+                                      ~30% of exhausting their daily cap for this specific model.
+                                      Silent otherwise (normal state = no extra clutter). */}
+                                  {shouldWarnLowQuota(usage, model.query_weight) && (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-[10px] bg-yellow-500/10 text-yellow-700 border-yellow-500/40 dark:text-yellow-400"
+                                      title={`approaching daily limit${usage?.resets_at ? ` — resets ${formatResetTime(usage.resets_at)}` : ""}`}
+                                    >
+                                      ≈ {messagesLeftForModel(usage, model.query_weight)} left
+                                    </Badge>
+                                  )}
                                 </div>
                               </div>
                               <span className="text-xs text-muted-foreground">
@@ -1682,7 +1780,9 @@ function SortablePresetCard({
   onDuplicate,
   onSetDefault,
   onDelete,
+  onShareToTeam,
   isLoading,
+  isTeamAdmin,
 }: {
   preset: AIPreset;
   isDefault: boolean;
@@ -1691,7 +1791,9 @@ function SortablePresetCard({
   onDuplicate: () => void;
   onSetDefault: () => void;
   onDelete: () => void;
+  onShareToTeam?: () => void;
   isLoading: boolean;
+  isTeamAdmin?: boolean;
 }) {
   const {
     attributes,
@@ -1767,6 +1869,18 @@ function SortablePresetCard({
           <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onSetDefault(); }} disabled={isLoading || isDefault}>
             <Star className="w-3 h-3 mr-1" />{isDefault ? "default" : "set default"}
           </Button>
+          {isTeamAdmin && onShareToTeam && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={(e) => { e.stopPropagation(); onShareToTeam(); }} disabled={isLoading}>
+                    <Share2 className="w-3 h-3" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>share to team (e2e encrypted)</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
           {!isDefault && (
             <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2 text-destructive hover:text-destructive ml-auto" onClick={(e) => { e.stopPropagation(); onDelete(); }} disabled={isLoading}>
               <Trash2 className="w-3 h-3" />
@@ -1790,6 +1904,17 @@ export const AIPresets = () => {
   const [isDuplicating, setIsDuplicating] = useState(false);
   const isEnterprise = useIsEnterpriseBuild();
   const [piAvailable, setPiAvailable] = useState(false);
+  const team = useTeam();
+  const isTeamAdmin = !!team.team && team.role === "admin";
+
+  const sharePresetToTeam = async (preset: AIPreset) => {
+    try {
+      await team.pushConfig("ai_provider", preset.id, preset);
+      toast({ title: "shared to team", description: `"${formatPresetName(preset.id)}" is now available to all team members (e2e encrypted)` });
+    } catch (err: any) {
+      toast({ title: "failed to share to team", description: err.message, variant: "destructive" });
+    }
+  };
 
   // Drag-and-drop sensors with activation distance to avoid conflicts with clicks
   const sensors = useSensors(
@@ -2044,7 +2169,9 @@ export const AIPresets = () => {
                 onDuplicate={() => duplicatePreset(preset.id)}
                 onSetDefault={() => setPresetToSetDefault(preset.id)}
                 onDelete={() => setPresetToDelete(preset.id)}
+                onShareToTeam={isTeamAdmin ? () => sharePresetToTeam(preset) : undefined}
                 isLoading={isLoading}
+                isTeamAdmin={isTeamAdmin}
               />
             ))}
           </div>

@@ -5,7 +5,6 @@
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -17,7 +16,12 @@ import {
   GitMerge,
   ArrowUpDown,
   Sparkles,
+  Keyboard,
 } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { showChatWithPrefill } from "@/lib/chat-utils";
+import { localFetch } from "@/lib/api";
 
 interface MeetingRecord {
   id: number;
@@ -144,6 +148,7 @@ function MeetingsSkeleton() {
 
 export function MeetingsSection() {
   const { toast } = useToast();
+  const { settings, updateSettings } = useSettings();
   const [meetings, setMeetings] = useState<MeetingRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -176,8 +181,8 @@ export function MeetingsSection() {
       }
 
       try {
-        const res = await fetch(
-          `http://localhost:3030/meetings?limit=${PAGE_SIZE}&offset=${offset}`,
+        const res = await localFetch(
+          `/meetings?limit=${PAGE_SIZE}&offset=${offset}`,
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data: MeetingRecord[] = await res.json();
@@ -270,8 +275,8 @@ export function MeetingsSection() {
       try {
         const hoursBack = Math.ceil((Date.now() - new Date(meeting.meeting_start).getTime()) / 3600000) + 1;
         const hoursAhead = Math.max(1, Math.ceil((new Date(meeting.meeting_end || Date.now()).getTime() - Date.now()) / 3600000) + 1);
-        const calRes = await fetch(
-          `http://localhost:3030/connections/calendar/events?hours_back=${hoursBack}&hours_ahead=${hoursAhead}`
+        const calRes = await localFetch(
+          `/connections/calendar/events?hours_back=${hoursBack}&hours_ahead=${hoursAhead}`
         );
         if (calRes.ok) {
           const calData = await calRes.json();
@@ -291,8 +296,8 @@ export function MeetingsSection() {
 
       // Source 2: audio speakers during meeting
       try {
-        const audioRes = await fetch(
-          `http://localhost:3030/search?content_type=audio&start_time=${startTime}&end_time=${endTime}&limit=100`
+        const audioRes = await localFetch(
+          `/search?content_type=audio&start_time=${startTime}&end_time=${endTime}&limit=100`
         );
         if (audioRes.ok) {
           const audioData = await audioRes.json();
@@ -323,6 +328,41 @@ export function MeetingsSection() {
     }
   };
 
+  const summarizeMeeting = async (meeting: MeetingRecord) => {
+    const start = new Date(meeting.meeting_start);
+    const end = meeting.meeting_end ? new Date(meeting.meeting_end) : null;
+    const duration = end
+      ? `${Math.round((end.getTime() - start.getTime()) / 60000)} minutes`
+      : "ongoing";
+
+    const parts: string[] = [
+      `app: ${meeting.meeting_app}`,
+      `time: ${start.toISOString()}${end ? ` to ${end.toISOString()}` : ""} (${duration})`,
+    ];
+    if (meeting.title) parts.push(`title: ${meeting.title}`);
+    if (meeting.attendees) parts.push(`attendees: ${meeting.attendees}`);
+    if (meeting.note) parts.push(`notes: ${meeting.note}`);
+
+    const prompt = `search screenpipe for what happened during this meeting and summarize it: key topics, decisions, action items. then suggest which of my connected integrations would be useful to share this with and draft a message for each.\n\nmeeting:\n${parts.join("\n")}`;
+
+    try {
+      await showChatWithPrefill({
+        context: "",
+        prompt,
+        autoSend: true,
+        source: "meeting-summarize",
+        useHomeChat: true,
+      });
+    } catch (err) {
+      console.error("failed to launch meeting summary chat", err);
+      toast({
+        title: "failed to summarize meeting",
+        description: "could not open home chat. please try again.",
+        variant: "destructive",
+      });
+    }
+  };
+
   const cancelEdit = () => {
     setEditingId(null);
   };
@@ -339,7 +379,7 @@ export function MeetingsSection() {
       if (editState.meeting_end) {
         body.meeting_end = new Date(editState.meeting_end).toISOString();
       }
-      const res = await fetch(`http://localhost:3030/meetings/${id}`, {
+      const res = await localFetch(`/meetings/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -364,7 +404,7 @@ export function MeetingsSection() {
     setDeletingId(id);
     setConfirmDeleteId(null);
     try {
-      const res = await fetch(`http://localhost:3030/meetings/${id}`, {
+      const res = await localFetch(`/meetings/${id}`, {
         method: "DELETE",
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -391,7 +431,7 @@ export function MeetingsSection() {
     if (ids.length < 2) return;
     setMerging(true);
     try {
-      const res = await fetch("http://localhost:3030/meetings/merge", {
+      const res = await localFetch("/meetings/merge", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids }),
@@ -417,7 +457,7 @@ export function MeetingsSection() {
     if (ids.length === 0) return;
     setBulkDeleting(true);
     try {
-      const res = await fetch("http://localhost:3030/meetings/bulk-delete", {
+      const res = await localFetch("/meetings/bulk-delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids }),
@@ -440,7 +480,15 @@ export function MeetingsSection() {
 
   return (
     <div className="space-y-4 h-full flex flex-col">
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-between">
+        <label className="flex items-center gap-2 cursor-pointer" title="automatically append everything you typed during a meeting to its notes">
+          <Switch
+            checked={Boolean(settings.appendTypedTextToMeetingNotes ?? true)}
+            onCheckedChange={(checked) => updateSettings({ appendTypedTextToMeetingNotes: checked })}
+          />
+          <Keyboard className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs text-muted-foreground">auto-capture typed text</span>
+        </label>
         {loading ? (
           <Skeleton className="h-8 w-28 rounded-md" />
         ) : (
@@ -614,12 +662,6 @@ export function MeetingsSection() {
                             {meeting.meeting_app}
                           </span>
                         )}
-                        <Badge
-                          variant="outline"
-                          className="text-[10px] px-1 py-0 font-normal"
-                        >
-                          {meeting.detection_source}
-                        </Badge>
                       </div>
                       <div className="text-xs text-muted-foreground mt-0.5">
                         {formatTime(meeting.meeting_start)}
@@ -685,6 +727,15 @@ export function MeetingsSection() {
                     </>
                   ) : (
                     <>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
+                        onClick={() => summarizeMeeting(meeting)}
+                        title="summarize with AI"
+                      >
+                        <Sparkles className="h-3.5 w-3.5 text-muted-foreground" />
+                      </Button>
                       <Button
                         size="icon"
                         variant="ghost"

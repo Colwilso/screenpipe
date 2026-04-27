@@ -20,7 +20,7 @@ pub enum WalkTier {
     Moderate,
     /// 150–250ms avg — significantly reduced
     Heavy,
-    /// > 250ms avg or repeated truncations — minimal walking
+    /// > 250ms avg or repeated truncations — minimal walking (60s interval)
     Critical,
 }
 
@@ -65,7 +65,9 @@ impl AppCost {
         Self {
             durations: Vec::with_capacity(WINDOW_SIZE),
             truncation_count: 0,
-            last_walk: Instant::now() - Duration::from_secs(600), // allow first walk immediately
+            last_walk: Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .unwrap_or(Instant::now()), // allow first walk immediately
             tier: WalkTier::Light,
         }
     }
@@ -165,7 +167,7 @@ impl AppWalkBudget {
                 Duration::from_millis(150),
             ),
             WalkTier::Critical => (
-                Duration::from_secs(15),
+                Duration::from_secs(60),
                 500usize,
                 Duration::from_millis(100),
             ),

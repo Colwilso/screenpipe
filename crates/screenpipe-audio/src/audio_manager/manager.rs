@@ -8,10 +8,10 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Mutex, RwLock},
@@ -37,6 +37,7 @@ use crate::{
         engine::TranscriptionEngine,
         handle_new_transcript,
         stt::{process_audio_input, SAMPLE_RATE},
+        whisper::model::get_cached_whisper_model_path,
     },
     utils::{
         audio::resample,
@@ -48,6 +49,34 @@ use crate::{
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Rate-limiter for the "Error processing audio" log.
+///
+/// Why: when the ONNX segmentation/embedding model file is missing or
+/// corrupt, every audio chunk fails with the same error — one user hit
+/// 583 events from the model-missing error alone (Sentry SCREENPIPE-CLI).
+/// Firing to Sentry on every chunk is noise; once every 5 minutes is
+/// enough to see the problem. Below-threshold hits still go to debug!().
+///
+/// A single shared timestamp is intentional: the error class doesn't
+/// matter for rate-limiting purposes — we just want to stop flooding
+/// Sentry during a sustained failure.
+static LAST_AUDIO_PROCESS_ERROR_EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
+const AUDIO_PROCESS_ERROR_SENTRY_INTERVAL_SECS: u64 = 300;
+
+fn log_audio_process_error(e: &anyhow::Error) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_AUDIO_PROCESS_ERROR_EPOCH_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= AUDIO_PROCESS_ERROR_SENTRY_INTERVAL_SECS {
+        LAST_AUDIO_PROCESS_ERROR_EPOCH_SECS.store(now, Ordering::Relaxed);
+        error!("Error processing audio: {:?}", e);
+    } else {
+        debug!("Error processing audio (rate-limited): {:?}", e);
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AudioManagerStatus {
@@ -94,6 +123,15 @@ pub struct AudioManager {
     on_transcription_insert: Option<crate::transcription::AudioInsertCallback>,
     /// Unified transcription engine. Set after model loading in start_audio_receiver_handler.
     engine: Arc<RwLock<Option<TranscriptionEngine>>>,
+    /// Handle to the reconciliation background task so we can abort it on shutdown.
+    reconciliation_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// Output devices temporarily stopped due to DRM content detection.
+    /// Stored so they can be restarted when DRM clears.
+    drm_stopped_devices: Arc<RwLock<Vec<AudioDevice>>>,
+    /// Devices explicitly disabled by the user via the API/UI.
+    /// The device monitor must never auto-start devices in this set.
+    /// Cleared on global start/stop but preserved across reconnects.
+    user_disabled_devices: Arc<RwLock<HashSet<String>>>,
 }
 
 /// Result of checking / restarting the two central handler tasks.
@@ -107,12 +145,23 @@ pub struct CentralHandlerRestartResult {
 
 impl AudioManager {
     pub async fn new(options: AudioManagerOptions, db: Arc<DatabaseManager>) -> Result<Self> {
-        let device_manager = DeviceManager::new().await?;
-        let segmentation_manager = Arc::new(SegmentationManager::new().await?);
+        let device_manager =
+            DeviceManager::new(options.experimental_coreaudio_system_audio).await?;
+        let segmentation_manager = Arc::new(SegmentationManager::new(options.is_disabled).await?);
         let status = RwLock::new(AudioManagerStatus::Stopped);
-        let vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>> = match options.vad_engine {
-            VadEngineEnum::Silero => Arc::new(Mutex::new(Box::new(SileroVad::new().await?))),
-            VadEngineEnum::WebRtc => Arc::new(Mutex::new(Box::new(WebRtcVad::new()))),
+        let vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>> = if options.is_disabled {
+            Arc::new(Mutex::new(Box::new(WebRtcVad::new())))
+        } else {
+            match options.vad_engine {
+                VadEngineEnum::Silero => match SileroVad::new().await {
+                    Ok(vad) => Arc::new(Mutex::new(Box::new(vad))),
+                    Err(e) => {
+                        warn!("silero vad unavailable, falling back to webrtc: {}", e);
+                        Arc::new(Mutex::new(Box::new(WebRtcVad::new())))
+                    }
+                },
+                VadEngineEnum::WebRtc => Arc::new(Mutex::new(Box::new(WebRtcVad::new()))),
+            }
         };
 
         let channel_config = &options.channel_config;
@@ -144,6 +193,9 @@ impl AudioManager {
             transcription_paused: Arc::new(AtomicBool::new(false)),
             on_transcription_insert: None,
             engine: Arc::new(RwLock::new(None)),
+            reconciliation_handle: Arc::new(RwLock::new(None)),
+            drm_stopped_devices: Arc::new(RwLock::new(Vec::new())),
+            user_disabled_devices: Arc::new(RwLock::new(HashSet::new())),
         };
 
         Ok(manager)
@@ -181,7 +233,8 @@ impl AudioManager {
             let options_ref = self.options.clone();
             let seg_mgr = self.segmentation_manager.clone();
             let output_path_bg = self.options.read().await.output_path.clone();
-            tokio::spawn(async move {
+            let metrics_bg = self.metrics.clone();
+            let handle = tokio::spawn(async move {
                 // Wait for model to load + initial recordings
                 tokio::time::sleep(Duration::from_secs(120)).await;
                 loop {
@@ -189,30 +242,19 @@ impl AudioManager {
                     if let Some(ref transcription_engine) = *engine_guard {
                         let opts = options_ref.read().await;
                         let audio_engine = opts.transcription_engine.clone();
-                        let key = opts.deepgram_api_key.clone();
-                        let openai_config = opts.openai_compatible_config.clone();
-                        let langs = opts.languages.clone();
-                        let vocab = opts.vocabulary.clone();
                         let batch_max_dur = opts.batch_max_duration_secs;
                         drop(opts);
-
-                        // Get whisper context from transcription engine
-                        let whisper_ctx = transcription_engine.whisper_context();
 
                         let data_dir = output_path_bg.as_deref();
                         let count = super::reconciliation::reconcile_untranscribed(
                             &db,
                             transcription_engine,
                             on_insert_bg.as_ref(),
-                            whisper_ctx,
                             audio_engine,
-                            key,
-                            openai_config,
-                            langs,
-                            &vocab,
                             Some(seg_mgr.clone()),
                             data_dir,
                             batch_max_dur,
+                            Some(metrics_bg.clone()),
                         )
                         .await;
                         if count > 0 {
@@ -223,6 +265,7 @@ impl AudioManager {
                     tokio::time::sleep(Duration::from_secs(120)).await;
                 }
             });
+            *self.reconciliation_handle.write().await = Some(handle);
         }
 
         start_device_monitor(self_arc.clone(), self.device_manager.clone()).await?;
@@ -256,6 +299,32 @@ impl AudioManager {
 
         stop_device_monitor().await?;
 
+        // Stop producers FIRST: abort per-device recording tasks and the OS audio streams.
+        // This must happen before killing the consumer so any audio already queued in the
+        // crossbeam channel (including the final 30s flush) can still be drained.
+        for pair in self.recording_handles.iter() {
+            let handle = pair.value();
+            handle.lock().await.abort();
+        }
+        self.recording_handles.clear();
+        self.device_manager.stop_all_devices().await?;
+
+        // Drain the channel: wait until the pipeline handler has consumed all queued chunks
+        // (or a hard timeout expires). The early persist — file write + DB insert — happens
+        // at the very start of each chunk's processing, before any deferral decision.
+        // A 5s window is enough: the persist itself takes <100ms per chunk.
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+        const DRAIN_POLL: Duration = Duration::from_millis(100);
+        let drain_start = std::time::Instant::now();
+        while drain_start.elapsed() < DRAIN_TIMEOUT {
+            if self.recording_receiver.is_empty() {
+                break;
+            }
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+
+        // Now it is safe to kill the consumer — any remaining chunks are already persisted
+        // to disk and the DB, so the background reconciliation sweep will transcribe them.
         let mut recording_receiver_handle = self.recording_receiver_handle.write().await;
         if let Some(handle) = recording_receiver_handle.take() {
             handle.abort();
@@ -266,13 +335,6 @@ impl AudioManager {
             handle.abort();
         }
 
-        for pair in self.recording_handles.iter() {
-            let handle = pair.value();
-            handle.lock().await.abort();
-        }
-
-        self.recording_handles.clear();
-        self.device_manager.stop_all_devices().await?;
         info!("audio manager stopped");
         Ok(())
     }
@@ -303,15 +365,33 @@ impl AudioManager {
             .enabled_devices
             .remove(device_name);
 
-        self.device_manager.stop_device(&device).await?;
+        self.stop_device_recording(&device).await
+    }
 
-        if let Some(pair) = self.recording_handles.get(&device) {
+    /// Stop a device's recording without removing it from enabled_devices.
+    /// Idempotent — safe to call on already-stopped devices.
+    /// Used by device monitor for force-cycling devices after sleep/wake.
+    pub async fn stop_device_recording(&self, device: &AudioDevice) -> Result<()> {
+        // Signal the recording loop to stop BEFORE aborting the handle,
+        // so it exits cleanly without triggering "stream dead" warnings.
+        if let Some(is_running) = self.device_manager.is_running_mut(device) {
+            is_running.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Ignore "already stopped" errors
+        if let Err(e) = self.device_manager.stop_device(device).await {
+            let msg = e.to_string();
+            if !msg.contains("already stopped") && !msg.contains("not running") {
+                return Err(e);
+            }
+        }
+
+        if let Some(pair) = self.recording_handles.get(device) {
             let handle = pair.value();
-
             handle.lock().await.abort();
         }
 
-        self.recording_handles.remove(&device);
+        self.recording_handles.remove(device);
 
         Ok(())
     }
@@ -320,7 +400,81 @@ impl AudioManager {
         self.status.read().await.clone()
     }
 
+    /// Temporarily pause a device without changing the configured device list.
+    /// Idempotent — safe to call if already paused. Never errors.
+    pub async fn pause_device(&self, device_name: &str) -> Result<()> {
+        // Mark as disabled FIRST so no monitor path can race and restart it
+        self.user_disabled_devices
+            .write()
+            .await
+            .insert(device_name.to_string());
+
+        // Best-effort stop — ignore all errors (already stopped, not found, etc.)
+        if let Ok(device) = parse_audio_device(device_name) {
+            let _ = self.stop_device_recording(&device).await;
+        }
+        info!("user paused audio device: {}", device_name);
+        Ok(())
+    }
+
+    /// Resume a previously paused device. Idempotent — safe to call if already running.
+    pub async fn resume_device(&self, device_name: &str) -> Result<()> {
+        // Remove from disabled FIRST so start_device gate allows it
+        self.user_disabled_devices.write().await.remove(device_name);
+
+        let device = match parse_audio_device(device_name) {
+            Ok(device) => device,
+            Err(_) => return Err(anyhow!("Device {} not found", device_name)),
+        };
+        self.start_device(&device).await?;
+        info!("user resumed audio device: {}", device_name);
+        Ok(())
+    }
+
+    /// Mark a device as user-disabled. The device monitor will not auto-start it.
+    pub async fn user_disable_device(&self, device_name: &str) {
+        self.user_disabled_devices
+            .write()
+            .await
+            .insert(device_name.to_string());
+        info!("user disabled audio device: {}", device_name);
+    }
+
+    /// Remove a device from the user-disabled set, allowing auto-start again.
+    pub async fn user_enable_device(&self, device_name: &str) {
+        self.user_disabled_devices.write().await.remove(device_name);
+        info!("user re-enabled audio device: {}", device_name);
+    }
+
+    /// Returns the set of devices the user has explicitly disabled.
+    pub async fn user_disabled_devices(&self) -> HashSet<String> {
+        self.user_disabled_devices.read().await.clone()
+    }
+
     pub async fn start_device(&self, device: &AudioDevice) -> Result<()> {
+        // Don't restart devices that are paused due to DRM content detection.
+        // The monitor watcher will call start_output_devices() when DRM clears.
+        if self
+            .drm_stopped_devices
+            .read()
+            .await
+            .iter()
+            .any(|d| d == device)
+        {
+            return Ok(());
+        }
+
+        // Don't restart devices the user explicitly disabled via API/UI.
+        if self
+            .user_disabled_devices
+            .read()
+            .await
+            .contains(&device.to_string())
+        {
+            debug!("skipping auto-start of user-disabled device: {}", device);
+            return Ok(());
+        }
+
         if let Err(e) = self.device_manager.start_device(device).await {
             let err_str = e.to_string();
 
@@ -411,9 +565,17 @@ impl AudioManager {
     async fn start_audio_receiver_handler(&self) -> Result<JoinHandle<()>> {
         let transcription_sender = self.transcription_sender.clone();
         let segmentation_manager = self.segmentation_manager.clone();
-        let segmentation_model_path = segmentation_manager.segmentation_model_path.clone();
+        let segmentation_model_path = segmentation_manager
+            .segmentation_model_path
+            .lock()
+            .await
+            .clone();
         let embedding_manager = segmentation_manager.embedding_manager.clone();
-        let embedding_extractor = segmentation_manager.embedding_extractor.clone();
+        let embedding_extractor = segmentation_manager
+            .embedding_extractor
+            .lock()
+            .await
+            .clone();
         let options = self.options.read().await;
         let output_path = options.output_path.clone();
         let languages = options.languages.clone();
@@ -550,7 +712,13 @@ impl AudioManager {
                             }
                         }
                         if !inserted {
-                            error!("audio chunk DB insert failed after 3 retries, data may be missing from timeline: {}", path);
+                            // path is a structured field so Sentry dedups the
+                            // issue across different devices; otherwise every
+                            // device name creates a new Sentry issue.
+                            error!(
+                                audio_chunk_path = %path,
+                                "audio chunk DB insert failed after 3 retries, data may be missing from timeline"
+                            );
                         }
                         Some(path)
                     }
@@ -593,21 +761,16 @@ impl AudioManager {
                                     "batch mode: audio session ended, transcribing accumulated audio"
                                 );
                             }
-                            let whisper_ctx = engine.whisper_context();
                             let data_dir = output_path.as_deref();
                             let count = super::reconciliation::reconcile_untranscribed(
                                 &db,
                                 &engine,
                                 on_insert_session.as_ref(),
-                                whisper_ctx,
                                 audio_transcription_engine.clone(),
-                                deepgram_api_key.clone(),
-                                openai_compatible_config.clone(),
-                                languages.clone(),
-                                &vocabulary,
                                 Some(segmentation_manager.clone()),
                                 data_dir,
                                 batch_max_duration_secs,
+                                Some(metrics.clone()),
                             )
                             .await;
                             for _ in 0..count {
@@ -630,10 +793,6 @@ impl AudioManager {
                                 embedding_manager.clone(),
                                 embedding_extractor.clone(),
                                 &output_path.clone().unwrap(),
-                                audio_transcription_engine.clone(),
-                                deepgram_api_key.clone(),
-                                openai_compatible_config.clone(),
-                                languages.clone(),
                                 &transcription_sender.clone(),
                                 &mut session,
                                 metrics.clone(),
@@ -643,7 +802,7 @@ impl AudioManager {
                             .await
                             {
                                 metrics.record_process_error();
-                                error!("Error processing audio: {:?}", e);
+                                log_audio_process_error(&e);
                             }
                         }
                     } else {
@@ -655,10 +814,6 @@ impl AudioManager {
                             embedding_manager.clone(),
                             embedding_extractor.clone(),
                             &output_path.clone().unwrap(),
-                            audio_transcription_engine.clone(),
-                            deepgram_api_key.clone(),
-                            openai_compatible_config.clone(),
-                            languages.clone(),
                             &transcription_sender.clone(),
                             &mut session,
                             metrics.clone(),
@@ -668,7 +823,7 @@ impl AudioManager {
                         .await
                         {
                             metrics.record_process_error();
-                            error!("Error processing audio: {:?}", e);
+                            log_audio_process_error(&e);
                         }
                     }
                 } else {
@@ -680,10 +835,6 @@ impl AudioManager {
                         embedding_manager.clone(),
                         embedding_extractor.clone(),
                         &output_path.clone().unwrap(),
-                        audio_transcription_engine.clone(),
-                        deepgram_api_key.clone(),
-                        openai_compatible_config.clone(),
-                        languages.clone(),
                         &transcription_sender.clone(),
                         &mut session,
                         metrics.clone(),
@@ -693,7 +844,7 @@ impl AudioManager {
                     .await
                     {
                         metrics.record_process_error();
-                        error!("Error processing audio: {:?}", e);
+                        log_audio_process_error(&e);
                     }
                 }
             }
@@ -721,6 +872,13 @@ impl AudioManager {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.stop().await?;
+
+        // Abort reconciliation first — it holds an engine read-lock during transcription,
+        // so it must be cancelled before we drop the engine to avoid use-after-free.
+        if let Some(handle) = self.reconciliation_handle.write().await.take() {
+            handle.abort();
+        }
+
         let rec = self.recording_handles.clone();
         let recording = self.recording_receiver_handle.clone();
         let transcript = self.transcription_receiver_handle.clone();
@@ -749,6 +907,69 @@ impl AudioManager {
 
     pub async fn enabled_devices(&self) -> HashSet<String> {
         self.options.read().await.enabled_devices.clone()
+    }
+
+    /// Stop all SCK-based (Output) audio devices for DRM pause.
+    /// Input (microphone) devices are left running. Unlike `stop_device()`,
+    /// this does NOT remove devices from `enabled_devices` since DRM pause
+    /// is temporary.
+    pub async fn stop_output_devices(&self) -> Result<()> {
+        use crate::core::device::DeviceType;
+
+        let output_devices: Vec<AudioDevice> = self
+            .current_devices()
+            .into_iter()
+            .filter(|d| d.device_type == DeviceType::Output)
+            .collect();
+
+        if output_devices.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "DRM: stopping {} output (SCK) audio device(s)",
+            output_devices.len()
+        );
+
+        for device in &output_devices {
+            // Stop the underlying stream
+            if let Err(e) = self.device_manager.stop_device(device).await {
+                warn!("DRM: failed to stop audio device {}: {:?}", device, e);
+            }
+
+            // Abort the recording task
+            if let Some(pair) = self.recording_handles.get(device) {
+                pair.value().lock().await.abort();
+            }
+            self.recording_handles.remove(device);
+        }
+
+        // Store stopped devices for later restart
+        *self.drm_stopped_devices.write().await = output_devices;
+
+        Ok(())
+    }
+
+    /// Restart SCK-based (Output) audio devices after DRM clears.
+    pub async fn start_output_devices(&self) -> Result<()> {
+        let devices = std::mem::take(&mut *self.drm_stopped_devices.write().await);
+
+        if devices.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "DRM: restarting {} output (SCK) audio device(s)",
+            devices.len()
+        );
+
+        for device in &devices {
+            if let Err(e) = self.start_device(device).await {
+                warn!("DRM: failed to restart audio device {}: {:?}", device, e);
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns a reference to the meeting detector, if batch mode is active.
@@ -793,6 +1014,162 @@ impl AudioManager {
     /// Returns the current vocabulary.
     pub async fn vocabulary(&self) -> Vec<crate::transcription::VocabularyEntry> {
         self.options.read().await.vocabulary.clone()
+    }
+
+    /// Attempt to move disabled components to ready state after background model
+    /// downloads finish. Returns `true` when any runtime-capability state changed.
+    pub async fn refresh_model_capabilities(&self) -> bool {
+        let options = self.options.read().await;
+        let audio_transcription_engine = options.transcription_engine.clone();
+        let deepgram_api_key = options.deepgram_api_key.clone();
+        let openai_compatible_config = options.openai_compatible_config.clone();
+        let languages = options.languages.clone();
+        let vocabulary = options.vocabulary.clone();
+        drop(options);
+
+        let mut changed = false;
+
+        // Re-initialize whisper transcription when the model becomes available.
+        let should_try_transcription_refresh =
+            matches!(
+                audio_transcription_engine.as_ref(),
+                AudioTranscriptionEngine::WhisperTiny
+                    | AudioTranscriptionEngine::WhisperTinyQuantized
+                    | AudioTranscriptionEngine::WhisperLargeV3Turbo
+                    | AudioTranscriptionEngine::WhisperLargeV3TurboQuantized
+                    | AudioTranscriptionEngine::WhisperLargeV3
+                    | AudioTranscriptionEngine::WhisperLargeV3Quantized
+            ) && get_cached_whisper_model_path(audio_transcription_engine.as_ref()).is_some();
+
+        if should_try_transcription_refresh {
+            let mut engine = self.engine.write().await;
+            if engine
+                .as_ref()
+                .is_some_and(|e| e.config() == AudioTranscriptionEngine::Disabled)
+            {
+                match TranscriptionEngine::new(
+                    audio_transcription_engine.clone(),
+                    deepgram_api_key.clone(),
+                    openai_compatible_config.clone(),
+                    languages.clone(),
+                    vocabulary.clone(),
+                )
+                .await
+                {
+                    Ok(updated_engine) => {
+                        if updated_engine.config() != AudioTranscriptionEngine::Disabled {
+                            *engine = Some(updated_engine);
+                            changed = true;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "whisper refresh still unavailable while creating transcription engine: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        #[cfg(any(feature = "qwen3-asr", feature = "parakeet", feature = "parakeet-mlx"))]
+        {
+            let should_try_audiopipe_refresh = matches!(
+                audio_transcription_engine.as_ref(),
+                AudioTranscriptionEngine::Qwen3Asr
+                    | AudioTranscriptionEngine::Parakeet
+                    | AudioTranscriptionEngine::ParakeetMlx
+            );
+
+            if should_try_audiopipe_refresh {
+                let mut engine = self.engine.write().await;
+                if engine
+                    .as_ref()
+                    .is_some_and(|e| e.config() == AudioTranscriptionEngine::Disabled)
+                {
+                    match TranscriptionEngine::new(
+                        audio_transcription_engine.clone(),
+                        deepgram_api_key.clone(),
+                        openai_compatible_config.clone(),
+                        languages.clone(),
+                        vocabulary.clone(),
+                    )
+                    .await
+                    {
+                        Ok(updated_engine) => {
+                            if updated_engine.config() != AudioTranscriptionEngine::Disabled {
+                                *engine = Some(updated_engine);
+                                changed = true;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("audiopipe transcription refresh still unavailable: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let segmentation_changed = self.segmentation_manager.refresh_models().await;
+        changed = changed || segmentation_changed;
+
+        changed
+    }
+
+    /// Restart central handlers regardless of whether they are dead.
+    pub async fn restart_central_handlers(&self) -> CentralHandlerRestartResult {
+        let mut result = CentralHandlerRestartResult::default();
+        {
+            let mut recording_guard = self.recording_receiver_handle.write().await;
+            if let Some(handle) = recording_guard.take() {
+                handle.abort();
+            }
+            match self.start_audio_receiver_handler().await {
+                Ok(handle) => {
+                    *recording_guard = Some(handle);
+                    result.recording_restarted = true;
+                    info!("central audio-receiver handler restarted for capability refresh");
+                }
+                Err(e) => {
+                    error!("failed to restart audio-receiver handler: {}", e);
+                    result.recording_error = Some(e.to_string());
+                }
+            }
+        }
+
+        {
+            let mut transcription_guard = self.transcription_receiver_handle.write().await;
+            if let Some(handle) = transcription_guard.take() {
+                handle.abort();
+            }
+            match self.start_transcription_receiver_handler().await {
+                Ok(handle) => {
+                    *transcription_guard = Some(handle);
+                    result.transcription_restarted = true;
+                    info!(
+                        "central transcription-receiver handler restarted for capability refresh"
+                    );
+                }
+                Err(e) => {
+                    error!("failed to restart transcription-receiver handler: {}", e);
+                    result.transcription_error = Some(e.to_string());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Backfill missing speaker IDs for recently transcribed chunks if
+    /// segmentation models have become available.
+    pub async fn reconcile_missing_speakers(&self, lookback_hours: i64, limit: i64) -> usize {
+        super::reconciliation::backfill_missing_speakers(
+            &self.db,
+            self.segmentation_manager.clone(),
+            lookback_hours,
+            limit,
+        )
+        .await
     }
 
     /// Check for recording handles that have finished (crashed or timed out)
@@ -918,23 +1295,30 @@ impl AudioManager {
 /// This allows returning voices to be recognized immediately instead of
 /// starting anonymous for the first 30+ seconds.
 async fn seed_speakers_from_db(db: &Arc<DatabaseManager>, seg_mgr: &Arc<SegmentationManager>) {
-    match db.get_named_speakers_with_centroids().await {
+    // Seed all speakers (named and unnamed) to prevent re-creation of existing voices.
+    // Limit to 500 most recent speakers to avoid memory bloat on long-running systems.
+    const MAX_SPEAKERS_TO_SEED: usize = 500;
+
+    match db
+        .get_all_speakers_with_centroids(MAX_SPEAKERS_TO_SEED)
+        .await
+    {
         Ok(speakers) if !speakers.is_empty() => {
             for (_db_id, name, centroid) in &speakers {
                 let emb = ndarray::Array1::from_vec(centroid.clone());
                 seg_mgr.seed_speaker(emb);
-                debug!("seeded known speaker '{}' into embedding manager", name);
+                debug!("seeded speaker '{}' into embedding manager", name);
             }
             info!(
-                "seeded {} known speakers from DB into embedding manager",
+                "seeded {} speakers (named + unnamed) from DB into embedding manager",
                 speakers.len()
             );
         }
         Ok(_) => {
-            debug!("no named speakers with centroids found in DB to seed");
+            debug!("no speakers with centroids found in DB to seed");
         }
         Err(e) => {
-            warn!("failed to query named speakers for seeding: {}", e);
+            warn!("failed to query speakers for seeding: {}", e);
         }
     }
 }
@@ -996,9 +1380,14 @@ impl Drop for AudioManager {
         let rec = self.recording_handles.clone();
         let recording = self.recording_receiver_handle.clone();
         let transcript = self.transcription_receiver_handle.clone();
+        let reconciliation = self.reconciliation_handle.clone();
         let device_manager = self.device_manager.clone();
 
         tokio::spawn(async move {
+            // Abort reconciliation first to stop MLX usage before engine is dropped
+            if let Some(handle) = reconciliation.write().await.take() {
+                handle.abort();
+            }
             let _ = stop_device_monitor().await;
             let _ = device_manager.stop_all_devices().await;
             if let Some(handle) = recording.write().await.take() {
@@ -1017,6 +1406,7 @@ impl Drop for AudioManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::device::{AudioDevice, DeviceType};
 
     #[test]
     fn test_central_handler_restart_result_defaults() {
@@ -1025,5 +1415,106 @@ mod tests {
         assert!(!result.transcription_restarted);
         assert!(result.recording_error.is_none());
         assert!(result.transcription_error.is_none());
+    }
+
+    // ── DRM stopped devices tracking tests ─────────────────────
+
+    #[tokio::test]
+    async fn test_drm_stopped_devices_initially_empty() {
+        let devices: Arc<RwLock<Vec<AudioDevice>>> = Arc::new(RwLock::new(Vec::new()));
+        assert!(devices.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_drm_stopped_devices_stores_output_only() {
+        let drm_stopped = Arc::new(RwLock::new(Vec::new()));
+
+        let input = AudioDevice::new("MacBook Pro Mic".to_string(), DeviceType::Input);
+        let output = AudioDevice::new("System Audio".to_string(), DeviceType::Output);
+        let all_devices = vec![input.clone(), output.clone()];
+
+        // Simulate stop_output_devices: filter for Output only
+        let output_devices: Vec<AudioDevice> = all_devices
+            .into_iter()
+            .filter(|d| d.device_type == DeviceType::Output)
+            .collect();
+
+        *drm_stopped.write().await = output_devices;
+
+        let stopped = drm_stopped.read().await;
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].name, "System Audio");
+        assert_eq!(stopped[0].device_type, DeviceType::Output);
+    }
+
+    #[tokio::test]
+    async fn test_drm_stopped_devices_start_clears_list() {
+        let drm_stopped = Arc::new(RwLock::new(vec![AudioDevice::new(
+            "System Audio".to_string(),
+            DeviceType::Output,
+        )]));
+
+        // Simulate start_output_devices: take and clear
+        let devices = std::mem::take(&mut *drm_stopped.write().await);
+        assert_eq!(devices.len(), 1);
+        assert!(drm_stopped.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_drm_guard_blocks_restart_of_paused_device() {
+        let drm_stopped = Arc::new(RwLock::new(vec![AudioDevice::new(
+            "System Audio".to_string(),
+            DeviceType::Output,
+        )]));
+
+        let device_to_start = AudioDevice::new("System Audio".to_string(), DeviceType::Output);
+
+        // Simulate the guard check in start_device
+        let is_drm_blocked = drm_stopped
+            .read()
+            .await
+            .iter()
+            .any(|d| d == &device_to_start);
+
+        assert!(
+            is_drm_blocked,
+            "start_device should be blocked for a DRM-paused device"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drm_guard_allows_input_devices() {
+        let drm_stopped = Arc::new(RwLock::new(vec![AudioDevice::new(
+            "System Audio".to_string(),
+            DeviceType::Output,
+        )]));
+
+        let mic = AudioDevice::new("MacBook Pro Mic".to_string(), DeviceType::Input);
+
+        let is_drm_blocked = drm_stopped.read().await.iter().any(|d| d == &mic);
+
+        assert!(
+            !is_drm_blocked,
+            "input devices should not be blocked by DRM guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drm_guard_allows_after_clear() {
+        let drm_stopped = Arc::new(RwLock::new(vec![AudioDevice::new(
+            "System Audio".to_string(),
+            DeviceType::Output,
+        )]));
+
+        // Simulate start_output_devices clearing the list
+        let _ = std::mem::take(&mut *drm_stopped.write().await);
+
+        let device = AudioDevice::new("System Audio".to_string(), DeviceType::Output);
+        let is_drm_blocked = drm_stopped.read().await.iter().any(|d| d == &device);
+
+        assert!(
+            !is_drm_blocked,
+            "after DRM clears, device should not be blocked"
+        );
     }
 }

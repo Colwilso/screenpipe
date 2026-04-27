@@ -263,14 +263,10 @@ pub async fn stt(
 pub async fn process_audio_input(
     audio: AudioInput,
     vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>>,
-    segmentation_model_path: PathBuf,
+    segmentation_model_path: Option<PathBuf>,
     embedding_manager: Arc<StdMutex<EmbeddingManager>>,
-    embedding_extractor: Arc<StdMutex<EmbeddingExtractor>>,
+    embedding_extractor: Option<Arc<StdMutex<EmbeddingExtractor>>>,
     output_path: &PathBuf,
-    audio_transcription_engine: Arc<AudioTranscriptionEngine>,
-    deepgram_api_key: Option<String>,
-    openai_compatible_config: Option<OpenAICompatibleConfig>,
-    languages: Vec<Language>,
     output_sender: &crossbeam::channel::Sender<TranscriptionResult>,
     session: &mut TranscriptionSession,
     metrics: Arc<AudioPipelineMetrics>,
@@ -300,7 +296,7 @@ pub async fn process_audio_input(
     let (mut segments, speech_ratio_ok, speech_ratio) = prepare_segments(
         &audio_data,
         vad_engine,
-        &segmentation_model_path,
+        segmentation_model_path.as_ref(),
         embedding_manager,
         embedding_extractor,
         &audio.device.to_string(),
@@ -337,18 +333,8 @@ pub async fn process_audio_input(
 
     while let Some(segment) = segments.recv().await {
         let path = file_path.clone();
-        let transcription_result = run_stt(
-            segment,
-            audio.device.clone(),
-            audio_transcription_engine.clone(),
-            deepgram_api_key.clone(),
-            openai_compatible_config.clone(),
-            languages.clone(),
-            path,
-            timestamp,
-            session,
-        )
-        .await?;
+        let transcription_result =
+            run_stt(segment, audio.device.clone(), path, timestamp, session).await?;
 
         if output_sender.send(transcription_result).is_err() {
             break;
@@ -361,10 +347,6 @@ pub async fn process_audio_input(
 pub async fn run_stt(
     segment: SpeechSegment,
     device: Arc<AudioDevice>,
-    _audio_transcription_engine: Arc<AudioTranscriptionEngine>,
-    _deepgram_api_key: Option<String>,
-    _openai_compatible_config: Option<OpenAICompatibleConfig>,
-    _languages: Vec<Language>,
     path: String,
     timestamp: u64,
     session: &mut TranscriptionSession,

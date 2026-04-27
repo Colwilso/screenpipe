@@ -20,5 +20,6 @@ pub mod speakers;
 pub mod streaming;
 pub mod time;
 pub mod timezone;
+pub mod transcribe;
 pub mod vault;
 pub mod websocket;

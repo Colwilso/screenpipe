@@ -10,7 +10,13 @@ import SwiftUI
 
 struct NotificationAction: Codable {
     let label: String
-    let action: String
+    // `action` was a required legacy field; many current callers send `id` + `type`
+    // instead and omit it entirely, which was failing JSON decode and forcing
+    // every notification with actions to fall back to the webview panel.
+    // The field is never read by the Swift side — only `id`, `type`, `primary`,
+    // `url`, `label` are — so making it optional restores native rendering
+    // without breaking the legacy callers that still send it.
+    var action: String?
     var primary: Bool?
     var id: String?
     var type: String?
@@ -221,11 +227,14 @@ struct NotificationContentView: View {
                 .padding(.horizontal, 14)
                 .padding(.top, 8)
 
-            // Body — render basic markdown inline
-            MarkdownText(payload.body)
-                .padding(.horizontal, 14)
-                .padding(.top, 4)
-                .padding(.bottom, 8)
+            // Body — render basic markdown inline, scrollable when long
+            ScrollView(.vertical, showsIndicators: true) {
+                MarkdownText(payload.body)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 4)
+                    .padding(.bottom, 8)
+            }
+            .frame(maxHeight: 200)
 
             // Action buttons
             if !payload.actions.isEmpty {
@@ -320,7 +329,8 @@ struct MarkdownText: View {
     let raw: String
 
     init(_ text: String) {
-        self.raw = text
+        // Replace literal \n sequences with actual newlines
+        self.raw = text.replacingOccurrences(of: "\\n", with: "\n")
     }
 
     var body: some View {
@@ -657,8 +667,8 @@ class NotificationPanelController: NSObject {
             if NSMouseInRect(mouseLocation, screen.frame, false) {
                 let visible = screen.visibleFrame
                 let panelHeight = panel.frame.height
-                let x = visible.origin.x + visible.size.width - Self.panelWidth
-                let y = visible.origin.y + visible.size.height - panelHeight
+                let x = visible.origin.x + visible.size.width - Self.panelWidth - 16
+                let y = visible.origin.y + visible.size.height - panelHeight - 16
                 panel.setFrameOrigin(NSPoint(x: x, y: y))
                 break
             }
@@ -760,8 +770,15 @@ public func notifFreeString(_ ptr: UnsafeMutablePointer<CChar>?) {
 @_cdecl("notif_show")
 public func notifShow(_ jsonPtr: UnsafePointer<CChar>) -> Int32 {
     let json = String(cString: jsonPtr)
-    guard let data = json.data(using: .utf8),
-          let payload = try? JSONDecoder().decode(NotificationPayload.self, from: data) else {
+    guard let data = json.data(using: .utf8) else {
+        NSLog("[screenpipe-notif] failed to convert json to utf8 data")
+        return -1
+    }
+    let payload: NotificationPayload
+    do {
+        payload = try JSONDecoder().decode(NotificationPayload.self, from: data)
+    } catch {
+        NSLog("[screenpipe-notif] json decode failed: \(error) — json: \(json.prefix(500))")
         return -1
     }
     if #available(macOS 13.0, *) {

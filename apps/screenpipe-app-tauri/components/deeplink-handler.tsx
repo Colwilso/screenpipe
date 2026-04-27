@@ -57,6 +57,33 @@ export function DeeplinkHandler() {
         }
       }
 
+      // Handle subscription activation deep link.
+      // Louis's email/success page can include:
+      //   screenpipe://subscription-success?purchase_token=<token>
+      // This lets existing app users activate pro without re-logging in.
+      if (
+        parsedUrl.host === "subscription-success" ||
+        parsedUrl.pathname?.includes("subscription-success")
+      ) {
+        const purchaseToken = parsedUrl.searchParams.get("purchase_token");
+        if (purchaseToken) {
+          try {
+            await loadUser(purchaseToken);
+            toast({
+              title: "welcome to screenpipe pro!",
+              description: "your subscription is now active",
+            });
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            toast({
+              title: "activation failed",
+              description: msg || "try logging out and back in",
+              variant: "destructive",
+            });
+          }
+        }
+      }
+
       // Handle Google Calendar OAuth callback
       if (
         parsedUrl.host === "auth" &&
@@ -193,7 +220,7 @@ export function DeeplinkHandler() {
       }),
 
       listen("shortcut-start-recording", async () => {
-        await commands.spawnScreenpipe(null);
+        await commands.startCapture();
 
         toast({
           title: "recording started",
@@ -202,11 +229,11 @@ export function DeeplinkHandler() {
       }),
 
       listen("shortcut-stop-recording", async () => {
-        await commands.stopScreenpipe();
+        await commands.stopCapture();
 
         toast({
-          title: "recording stopped",
-          description: "screen recording has been stopped",
+          title: "recording paused",
+          description: "capture paused — pipes and search still available",
         });
       }),
 

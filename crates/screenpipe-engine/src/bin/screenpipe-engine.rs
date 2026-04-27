@@ -161,7 +161,14 @@ fn setup_logging(
             .add_directive("rusty_tesseract=error".parse().unwrap())
             .add_directive("symphonia=error".parse().unwrap())
             .add_directive("hf_hub=error".parse().unwrap())
-            .add_directive("whisper_rs=error".parse().unwrap());
+            .add_directive("whisper_rs=error".parse().unwrap())
+            .add_directive("audiopipe=warn".parse().unwrap())
+            // ORT (ONNX Runtime) is extremely chatty at INFO — emits hundreds
+            // of "Reserving memory in BFCArena", "GraphTransformer modified",
+            // "Saving initialized tensors" lines per session init. Suppress
+            // unless the user asks for real issues (warn+) or overrides via
+            // SCREENPIPE_LOG=ort=info.
+            .add_directive("ort=warn".parse().unwrap());
 
         #[cfg(target_os = "windows")]
         let filter = filter
@@ -289,12 +296,38 @@ async fn main() -> anyhow::Result<()> {
             screenpipe_engine::cli::vault::handle_vault_command(subcommand).await?;
             return Ok(());
         }
+        Command::Install {
+            ref url,
+            allow_untrusted,
+        } => {
+            screenpipe_engine::cli::install::handle_install(url, allow_untrusted).await?;
+            return Ok(());
+        }
         Command::Login => {
             screenpipe_engine::cli::login::handle_login_command().await?;
             return Ok(());
         }
+        Command::Logout => {
+            screenpipe_engine::cli::login::handle_logout_command().await?;
+            return Ok(());
+        }
         Command::Whoami => {
             screenpipe_engine::cli::login::handle_whoami_command().await?;
+            return Ok(());
+        }
+        Command::Auth { ref subcommand } => {
+            screenpipe_engine::cli::auth::handle_auth_command(subcommand).await?;
+            return Ok(());
+        }
+        Command::Db { ref subcommand } => {
+            screenpipe_engine::cli::db::handle_db_command(subcommand).await?;
+            return Ok(());
+        }
+        Command::Backup {
+            ref subcommand,
+            ref data_dir,
+        } => {
+            screenpipe_engine::cli::backup::handle_backup_command(subcommand, data_dir).await?;
             return Ok(());
         }
         Command::Doctor => {
@@ -343,6 +376,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async {
         check_for_updates().await;
     });
+
+    // Periodic terminal nudge to install the desktop app (CLI-only).
+    screenpipe_engine::cli_reminder::spawn();
 
     // Initialize Sentry only if telemetry is enabled
     let _sentry_guard = if !record_args.disable_telemetry {
@@ -427,6 +463,9 @@ async fn main() -> anyhow::Result<()> {
                         json!(record_args.sync_interval_secs),
                     );
                     map.insert("debug".into(), json!(record_args.debug));
+                    map.insert("api_auth".into(), json!(record_args.api_auth));
+                    map.insert("encrypt_secrets".into(), json!(record_args.encrypt_secrets));
+                    map.insert("retention_days".into(), json!(record_args.retention_days));
                     // Only send counts for privacy-sensitive lists (not actual values)
                     map.insert(
                         "audio_device_count".into(),
@@ -467,7 +506,8 @@ async fn main() -> anyhow::Result<()> {
     // Build unified RecordingConfig from CLI args
     let config = record_args
         .clone()
-        .into_recording_config(local_data_dir.clone());
+        .into_recording_config(local_data_dir.clone())
+        .await;
 
     // Replace the current conditional check with:
     let ffmpeg_path = find_ffmpeg_path();
@@ -587,7 +627,14 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("port already in use"));
     }
 
-    let all_monitors = list_monitors().await;
+    // Only enumerate monitors when vision is enabled — on macOS, calling
+    // SCK's ShareableContent::current() triggers the "Currently Sharing"
+    // indicator in Control Center even if we never capture a frame (#2897).
+    let all_monitors = if config.disable_vision {
+        Vec::new()
+    } else {
+        list_monitors().await
+    };
 
     let mut audio_devices = Vec::new();
 
@@ -646,6 +693,12 @@ async fn main() -> anyhow::Result<()> {
     // earlier init step (like DB) fails and the process exits.
     start_sleep_monitor();
 
+    // Start the permission monitor — polls OS permission state and emits
+    // `permission_lost` / `permission_restored` on the shared event bus.
+    // Capture modules emit loss events eagerly on OS errors; this task covers
+    // accessibility transitions and confirms restorations across all three.
+    let _permission_monitor_handle = screenpipe_engine::permission_monitor::start();
+
     // Start cloud sync service if enabled
     let sync_service_handle = if record_args.enable_sync {
         match start_sync_service(&record_args, db.clone()).await {
@@ -665,7 +718,10 @@ async fn main() -> anyhow::Result<()> {
     let db_server = db.clone();
 
     let warning_audio_transcription_engine_clone = record_args.audio_transcription_engine.clone();
-    let monitor_ids: Vec<u32> = if config.monitor_ids.is_empty() {
+    let monitor_ids: Vec<u32> = if config.use_all_monitors || config.monitor_ids.is_empty() {
+        all_monitors.iter().map(|m| m.id()).collect::<Vec<_>>()
+    } else if config.monitor_ids == vec!["default"] {
+        // "default" means primary monitor only — show all for display, VisionManager filters
         all_monitors.iter().map(|m| m.id()).collect::<Vec<_>>()
     } else {
         config
@@ -678,6 +734,10 @@ async fn main() -> anyhow::Result<()> {
     let languages = config.languages.clone();
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    // Reset schedule pause flag before (optionally) starting the monitor.
+    // Ensures a clean state on every startup.
+    screenpipe_engine::schedule_monitor::reset_schedule_paused();
 
     // Start work-hours schedule monitor if enabled
     if config.schedule_enabled {
@@ -792,6 +852,11 @@ async fn main() -> anyhow::Result<()> {
         let trigger_tx = vision_manager.trigger_sender();
 
         let vm_clone = vision_manager.clone();
+        let audio_manager_for_drm = if !config.disable_audio {
+            Some((*audio_manager).clone())
+        } else {
+            None
+        };
         let shutdown_tx_clone2 = shutdown_tx_clone.clone();
         let runtime = &tokio::runtime::Handle::current();
         let h = runtime.spawn(async move {
@@ -803,8 +868,8 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
 
-            // Start MonitorWatcher for dynamic detection
-            if let Err(e) = start_monitor_watcher(vm_clone.clone()).await {
+            // Start MonitorWatcher for dynamic detection (with audio DRM pause support)
+            if let Err(e) = start_monitor_watcher(vm_clone.clone(), audio_manager_for_drm).await {
                 error!("Failed to start monitor watcher: {:?}", e);
             }
 
@@ -832,9 +897,24 @@ async fn main() -> anyhow::Result<()> {
     let manual_meeting: std::sync::Arc<tokio::sync::RwLock<Option<i64>>> =
         std::sync::Arc::new(tokio::sync::RwLock::new(None));
 
+    if config.listen_address.is_loopback() {
+        info!(
+            "API server listening on 127.0.0.1:{} (localhost only)",
+            config.port
+        );
+    } else {
+        warn!(
+            "API server listening on {}:{} — accessible from the network",
+            config.listen_address, config.port
+        );
+    }
+    if config.api_auth {
+        info!("API auth enabled — run `screenpipe auth token` to view your key");
+    }
+
     let mut server = SCServer::new(
         db_server,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port),
+        SocketAddr::new(IpAddr::V4(config.listen_address), config.port),
         local_data_dir_clone_2,
         config.disable_vision,
         config.disable_audio,
@@ -847,6 +927,74 @@ async fn main() -> anyhow::Result<()> {
     server.hot_frame_cache = Some(hot_frame_cache);
     server.power_manager = Some(power_manager);
     server.manual_meeting = Some(manual_meeting.clone());
+    server.api_auth = config.api_auth;
+    server.api_auth_key = config.api_auth_key.clone();
+
+    // Initialize secret store for unified credential management
+    let encryption_requested =
+        config.encrypt_secrets || screenpipe_secrets::is_encryption_requested(&local_data_dir);
+
+    {
+        // Read-only keychain access: pick up existing key without triggering modals.
+        // Use --encrypt-secrets / explicit on-disk opt-in to create/use a key.
+        let secret_key = if encryption_requested {
+            if config.encrypt_secrets {
+                match screenpipe_secrets::keychain::get_or_create_key() {
+                    Some(k) => {
+                        info!("keychain: encryption key ready (--encrypt-secrets)");
+                        Some(k)
+                    }
+                    None => {
+                        warn!("keychain: failed to create encryption key — secrets will be stored unencrypted");
+                        None
+                    }
+                }
+            } else {
+                match screenpipe_secrets::keychain::get_key() {
+                    screenpipe_secrets::keychain::KeyResult::Found(k) => {
+                        info!("keychain: using existing encryption key");
+                        Some(k)
+                    }
+                    _ => None,
+                }
+            }
+        } else {
+            None
+        };
+        let secret_store_result =
+            screenpipe_secrets::SecretStore::new(db.pool.clone(), secret_key).await;
+        match secret_store_result {
+            Ok(store) => {
+                // Run startup permission sweep
+                let fixed = screenpipe_secrets::fix_secret_file_permissions(&local_data_dir);
+                if fixed > 0 {
+                    info!("fixed permissions on {} credential files", fixed);
+                }
+
+                // Run legacy migration
+                match screenpipe_secrets::migrate_legacy_secrets(&store, &local_data_dir).await {
+                    Ok(report) => {
+                        if !report.migrated.is_empty() {
+                            info!(
+                                "migrated {} legacy secrets: {:?}",
+                                report.migrated.len(),
+                                report.migrated
+                            );
+                        }
+                        if !report.errors.is_empty() {
+                            warn!("secret migration errors: {:?}", report.errors);
+                        }
+                    }
+                    Err(e) => warn!("legacy secret migration failed: {}", e),
+                }
+
+                server.secret_store = Some(Arc::new(store));
+            }
+            Err(e) => {
+                warn!("failed to initialize secret store: {}", e);
+            }
+        }
+    }
 
     // Attach sync handle if sync is enabled
     let server = if let Some(ref handle) = sync_service_handle {
@@ -899,6 +1047,38 @@ async fn main() -> anyhow::Result<()> {
             analytics::capture_event_nonblocking("pipe_scheduled_run", props);
         },
     ));
+    // Gate scheduled pipe runs on connection readiness — same predicate the
+    // manual /pipes/:id/run endpoint uses (pipes_api.rs). Avoids running
+    // pipes that are still in "setup mode" (declared connections not paired).
+    {
+        let secret_store_for_check = server.secret_store.clone();
+        let screenpipe_dir_for_check = local_data_dir.clone();
+        pipe_manager.set_connection_check(std::sync::Arc::new(move |required| {
+            let ss = secret_store_for_check.clone();
+            let dir = screenpipe_dir_for_check.clone();
+            Box::pin(async move {
+                let mut missing = Vec::new();
+                for conn_id in required {
+                    let configured = screenpipe_connect::connections::load_connection(
+                        ss.as_deref(),
+                        &dir,
+                        &conn_id,
+                    )
+                    .await
+                    .map(|c| c.enabled && !c.credentials.is_empty())
+                    .unwrap_or(false);
+                    if !configured {
+                        missing.push(conn_id);
+                    }
+                }
+                missing
+            })
+        }));
+    }
+    // Inject local API key so pipe subprocesses can authenticate to localhost
+    if config.api_auth {
+        pipe_manager.set_local_api_key(config.api_auth_key.clone());
+    }
     pipe_manager.install_builtin_pipes().ok();
     if let Err(e) = pipe_manager.load_pipes().await {
         tracing::warn!("failed to load pipes: {}", e);
@@ -922,7 +1102,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n\n{}", DISPLAY.truecolor(147, 112, 219).bold());
     println!(
         "\n{}",
-        "build ai apps that have the full context"
+        "power AI by everything you've seen, said or heard"
             .bright_yellow()
             .italic()
     );
@@ -946,6 +1126,10 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "│ vision disabled        │ {:<34} │",
         record_args.disable_vision
+    );
+    println!(
+        "│ pause on DRM content   │ {:<34} │",
+        record_args.pause_on_drm_content
     );
     println!(
         "│ audio engine           │ {:<34} │",
@@ -1002,6 +1186,30 @@ async fn main() -> anyhow::Result<()> {
             "set (masked)"
         } else {
             "not set"
+        }
+    );
+    println!(
+        "│ api auth               │ {:<34} │",
+        if record_args.api_auth {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "│ encrypt secrets        │ {:<34} │",
+        if encryption_requested {
+            "enabled (--encrypt-secrets)"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "│ retention days         │ {:<34} │",
+        if record_args.retention_days == 0 {
+            "forever".to_string()
+        } else {
+            format!("{}", record_args.retention_days)
         }
     );
 
@@ -1142,9 +1350,18 @@ async fn main() -> anyhow::Result<()> {
     // start recording after all this text
     if !config.disable_audio {
         let audio_manager_clone = audio_manager.clone();
+        let drm_pause = config.pause_on_drm_content;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
             audio_manager_clone.start().await.unwrap();
+            // If DRM content was already focused at launch, the DRM callback
+            // fired before audio was ready. Stop the output device now so we
+            // don't hold an SCK session while DRM is active.
+            if drm_pause && screenpipe_engine::drm_detector::drm_content_paused() {
+                if let Err(e) = audio_manager_clone.stop_output_devices().await {
+                    tracing::warn!("failed to stop SCK audio after late DRM detection: {:?}", e);
+                }
+            }
         });
     }
 
@@ -1152,7 +1369,14 @@ async fn main() -> anyhow::Result<()> {
     let ui_recorder_handle = {
         if ui_recorder_config.enabled {
             info!("starting UI event capture");
-            match start_ui_recording(db.clone(), ui_recorder_config, capture_trigger_tx).await {
+            match start_ui_recording(
+                db.clone(),
+                ui_recorder_config,
+                capture_trigger_tx,
+                record_args.ignored_windows.clone(),
+            )
+            .await
+            {
                 Ok(handle) => Some(handle),
                 Err(e) => {
                     error!("failed to start UI event recording: {}", e);
@@ -1187,12 +1411,18 @@ async fn main() -> anyhow::Result<()> {
     let server_future = server.start();
     pin_mut!(server_future);
 
-    // Auto-enable local data retention (14 days) for CLI users.
+    // Auto-enable local data retention for CLI users.
     // The Tauri app does this via auto_start_retention(); for CLI we hit the
     // same HTTP endpoint after a short delay to let the server bind.
     {
         let port = config.port;
+        let retention_days = record_args.retention_days;
+        let retention_enabled = retention_days > 0;
         tokio::spawn(async move {
+            if !retention_enabled {
+                tracing::info!("local retention disabled (--retention-days 0)");
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = reqwest::Client::new();
             let url = format!("http://localhost:{}/retention/configure", port);
@@ -1200,13 +1430,13 @@ async fn main() -> anyhow::Result<()> {
                 .post(&url)
                 .json(&serde_json::json!({
                     "enabled": true,
-                    "retention_days": 14,
+                    "retention_days": retention_days,
                 }))
                 .send()
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    tracing::info!("local retention auto-enabled (14 days)");
+                    tracing::info!("local retention auto-enabled ({} days)", retention_days);
                 }
                 Ok(r) => {
                     tracing::debug!("retention configure returned {}", r.status());

@@ -20,21 +20,44 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{Pool, Sqlite};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum writes per batch. Caps transaction size to avoid holding
 /// the write lock too long and starving readers.
 const MAX_BATCH_SIZE: usize = 500;
 
-/// How often the drain loop wakes up to flush buffered writes.
-const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
-
 /// Channel capacity. 4096 provides headroom for burst writes without
 /// backpressure reaching capture threads.
 const CHANNEL_CAPACITY: usize = 4096;
+
+// ── Sleep/wake pause mechanism ───────────────────────────────────────────
+
+/// When true, the drain loop holds pending writes instead of executing them.
+/// Set by the sleep monitor before macOS sleep, cleared on wake.
+static WRITE_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Notifies the drain loop to resume after being paused.
+static RESUME_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+/// Pause the write queue. Safe to call from any thread (including ObjC callbacks).
+/// The drain loop will finish its current in-flight batch, then block.
+pub fn request_write_pause() {
+    WRITE_PAUSED.store(true, Ordering::SeqCst);
+    info!("write_queue: pause requested (sleep)");
+}
+
+/// Resume the write queue. Safe to call from any thread.
+pub fn request_write_resume() {
+    WRITE_PAUSED.store(false, Ordering::SeqCst);
+    if let Some(notify) = RESUME_NOTIFY.get() {
+        notify.notify_one();
+    }
+    info!("write_queue: resume requested (wake)");
+}
 
 // ── Write operation definitions ──────────────────────────────────────────
 
@@ -349,52 +372,57 @@ async fn drain_loop(
     write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
 ) {
-    let mut batch: Vec<PendingWrite> = Vec::with_capacity(256);
-    let mut interval = tokio::time::interval(DRAIN_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
 
     loop {
-        // Wait for either: interval tick OR first write arriving
-        tokio::select! {
-            _ = interval.tick() => {},
-            item = rx.recv() => {
-                match item {
-                    Some(pw) => batch.push(pw),
-                    None => break, // channel closed = shutdown
+        // Block until at least one write arrives, then take up to MAX_BATCH_SIZE
+        // in a single atomic call. No periodic wake-ups — the previous
+        // `tokio::select!` + 100ms interval added nothing under load (recv
+        // usually won the race anyway) and cost idle wake-ups otherwise.
+        let n = rx.recv_many(&mut batch, MAX_BATCH_SIZE).await;
+        if n == 0 {
+            // Channel closed — all senders dropped.
+            break;
+        }
+
+        // ── Sleep/wake pause gate ──
+        // If paused (system going to sleep), hold all pending writes
+        // until resumed. This prevents WAL corruption from I/O errors
+        // during sleep transitions.
+        if WRITE_PAUSED.load(Ordering::SeqCst) {
+            if !batch.is_empty() {
+                info!(
+                    "write_queue: paused for sleep, holding {} writes",
+                    batch.len()
+                );
+            }
+            let notify = RESUME_NOTIFY.get_or_init(|| tokio::sync::Notify::new());
+            tokio::select! {
+                _ = notify.notified() => {
+                    info!("write_queue: resumed after sleep, {} pending", batch.len());
+                }
+                _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                    warn!("write_queue: pause timed out after 120s, auto-resuming");
+                    WRITE_PAUSED.store(false, Ordering::SeqCst);
                 }
             }
         }
 
-        // Drain all currently buffered writes (non-blocking)
-        while batch.len() < MAX_BATCH_SIZE {
-            match rx.try_recv() {
-                Ok(pw) => batch.push(pw),
-                Err(_) => break,
-            }
-        }
-
-        if batch.is_empty() {
-            continue;
-        }
-
-        let batch_size = batch.len();
-        debug!("write_queue: draining batch of {} writes", batch_size);
-
+        debug!("write_queue: draining batch of {} writes", batch.len());
         execute_batch(&write_pool, &write_semaphore, &mut batch).await;
         batch.clear();
     }
 
     // Shutdown: drain remaining writes
     rx.close();
-    while let Some(pw) = rx.recv().await {
-        batch.push(pw);
-    }
-    if !batch.is_empty() {
+    let mut tail_batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
+    while rx.recv_many(&mut tail_batch, MAX_BATCH_SIZE).await > 0 {
         debug!(
             "write_queue: shutdown — flushing {} remaining writes",
-            batch.len()
+            tail_batch.len()
         );
-        execute_batch(&write_pool, &write_semaphore, &mut batch).await;
+        execute_batch(&write_pool, &write_semaphore, &mut tail_batch).await;
+        tail_batch.clear();
     }
     debug!("write_queue: drain loop exited");
 }
@@ -423,25 +451,73 @@ async fn execute_batch(
         }
     };
 
-    // Acquire connection
-    let mut conn = match tokio::time::timeout(Duration::from_secs(5), write_pool.acquire()).await {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => {
+    // Acquire connection and BEGIN IMMEDIATE with retry logic
+    let max_retries = 3;
+    let mut last_error = None;
+    let mut conn_opt = None;
+
+    for attempt in 1..=max_retries {
+        let mut conn =
+            match tokio::time::timeout(Duration::from_secs(5), write_pool.acquire()).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    send_error_to_all(batch, e);
+                    return;
+                }
+                Err(_) => {
+                    send_error_to_all(batch, sqlx::Error::PoolTimedOut);
+                    return;
+                }
+            };
+
+        match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
+            Ok(_) => {
+                conn_opt = Some(conn);
+                break;
+            }
+            Err(e) if is_nested_transaction_error(&e) => {
+                warn!("write_queue: BEGIN IMMEDIATE hit stuck transaction (attempt {}/{}), rolling back", attempt, max_retries);
+                match sqlx::query("ROLLBACK").execute(&mut *conn).await {
+                    Ok(_) => {
+                        debug!("write_queue: stuck transaction rolled back, connection recovered");
+                        drop(conn);
+                    }
+                    Err(rb_err) => {
+                        warn!("write_queue: ROLLBACK failed ({}), detaching connection as last resort", rb_err);
+                        let _raw = conn.detach();
+                    }
+                }
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) if attempt < max_retries && is_busy_error(&e) => {
+                warn!(
+                    "write_queue: BEGIN IMMEDIATE busy (attempt {}/{}), retrying...",
+                    attempt, max_retries
+                );
+                drop(conn);
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                continue;
+            }
+            Err(e) => {
+                warn!("write_queue: BEGIN IMMEDIATE failed: {}", e);
+                send_error_to_all(batch, e);
+                return;
+            }
+        }
+    }
+
+    let mut conn = match conn_opt {
+        Some(c) => c,
+        None => {
+            let e = last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut);
+            warn!("write_queue: BEGIN IMMEDIATE exhausted retries: {}", e);
             send_error_to_all(batch, e);
             return;
         }
-        Err(_) => {
-            send_error_to_all(batch, sqlx::Error::PoolTimedOut);
-            return;
-        }
     };
-
-    // BEGIN IMMEDIATE
-    if let Err(e) = sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
-        warn!("write_queue: BEGIN IMMEDIATE failed: {}", e);
-        send_error_to_all(batch, e);
-        return;
-    }
 
     // Execute each write, collecting results
     let mut results: Vec<Result<WriteResult, sqlx::Error>> = Vec::with_capacity(batch.len());
@@ -471,22 +547,36 @@ async fn execute_batch(
 
     // COMMIT or ROLLBACK
     if any_fatal {
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        if let Err(e) = sqlx::query("ROLLBACK").execute(&mut *conn).await {
+            warn!("write_queue: ROLLBACK failed: {}, detaching connection", e);
+            let _raw = conn.detach();
+        }
         // All results become errors on rollback
         for result in results.iter_mut() {
             if result.is_ok() {
                 *result = Err(sqlx::Error::WorkerCrashed);
             }
         }
-    } else {
-        if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
-            warn!("write_queue: COMMIT failed: {}", e);
-            // All results become the commit error
-            for pw in batch.drain(..) {
-                let _ = pw.respond.send(Err(sqlx::Error::WorkerCrashed));
-            }
-            return;
+    } else if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+        warn!("write_queue: COMMIT failed: {}", e);
+        // Always detach. The previous code skipped detaching when the
+        // error was "cannot commit - no transaction is active" on the
+        // theory that a connection without an active txn is fine to
+        // reuse. It isn't: that error means SQLite already implicit-
+        // rolled-back a prior write inside the batch, leaving the
+        // connection's page cache stale. Returning it to the pool is
+        // exactly how the next batch borrowed it and got "(code: 11)
+        // database disk image is malformed" (incident 2026-04-26
+        // 17:25-17:39 — 11 audio chunks lost). A fresh connection
+        // costs ~ms; a poisoned one corrupts every subsequent batch
+        // until its lifetime ends.
+        warn!("write_queue: detaching connection due to commit failure");
+        let _raw = conn.detach();
+        // All results become the commit error
+        for pw in batch.drain(..) {
+            let _ = pw.respond.send(Err(sqlx::Error::WorkerCrashed));
         }
+        return;
     }
 
     // Send results to callers
@@ -689,6 +779,11 @@ async fn execute_single_write(
 
             // Insert OCR text in same transaction (always — needed for search)
             // Element inserts are deferred to a separate transaction (see caller).
+            // Duplicate app_name/window_name/focused from the frame onto the OCR
+            // row so queries like `SELECT ... FROM ocr_text WHERE app_name='Obsidian'`
+            // actually return results. Without these binds the columns fall back
+            // to their schema defaults ('' / NULL / false), making OCR data
+            // effectively untagged even though the parent frame has the metadata.
             if let (Some(text), Some(text_json), Some(engine)) = (
                 ocr_text.as_deref(),
                 ocr_text_json.as_deref(),
@@ -696,13 +791,16 @@ async fn execute_single_write(
             ) {
                 let text_length = text.len() as i64;
                 sqlx::query(
-                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .bind(id)
                 .bind(text)
                 .bind(text_json)
                 .bind(engine)
                 .bind(text_length)
+                .bind(app_name.as_deref().unwrap_or(""))
+                .bind(window_name.as_deref())
+                .bind(focused)
                 .execute(&mut **conn)
                 .await?;
             }
@@ -1094,16 +1192,20 @@ async fn execute_single_write(
                 .await?
                 .last_insert_rowid();
 
-                // Insert OCR text
+                // Insert OCR text — duplicate app/window/focused from frame so
+                // OCR rows are filterable (see handler above for rationale).
                 let text_length = window.text.len() as i64;
                 sqlx::query(
-                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .bind(frame_id)
                 .bind(&window.text)
                 .bind(&window.text_json)
                 .bind(ocr_engine_str.as_str())
                 .bind(text_length)
+                .bind(window.app_name.as_deref().unwrap_or(""))
+                .bind(window.window_name.as_deref())
+                .bind(window.focused)
                 .execute(&mut **conn)
                 .await?;
 
@@ -1172,18 +1274,18 @@ async fn execute_single_write(
                    VALUES (?, 'queued', ?, ?, ?, ?)
                    RETURNING id"#,
             )
-            .bind(&pipe_name)
-            .bind(&trigger_type)
-            .bind(&model)
-            .bind(&provider)
-            .bind(&started_at)
+            .bind(pipe_name)
+            .bind(trigger_type)
+            .bind(model)
+            .bind(provider)
+            .bind(started_at)
             .fetch_one(&mut **conn)
             .await?;
             Ok(WriteResult::Id(row))
         }
 
         WriteOp::PipeUpdateExecution { sql, binds } => {
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sql);
             for bind in binds {
                 match bind {
                     PipeBindValue::Text(v) => {
@@ -1241,11 +1343,53 @@ fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
     error!("write_queue: batch failed: {}", error);
 }
 
+/// Lowercased-message check shared with `is_connection_error`. Pulled
+/// out so it's directly unit-testable without faking a `DatabaseError`
+/// impl — see `is_fatal_sqlite_message_*` tests below.
+///
+/// SQLite returns disk-I/O failures (code 522) and corruption signals
+/// (code 11) via `sqlx::Error::Database`. Both leave the current
+/// connection's page cache inconsistent with disk: SQLite's implicit
+/// rollback discards the failed write, but any subsequent COMMIT (or
+/// even SELECT) on the same handle can return "database disk image is
+/// malformed" until the connection is dropped. Treat them as fatal so
+/// the batch loop drops the connection instead of reusing it for
+/// follow-on writes that will all fail in confusing ways.
+fn is_fatal_sqlite_message(msg_lower: &str) -> bool {
+    msg_lower.contains("disk i/o error") || msg_lower.contains("malformed")
+}
+
 fn is_connection_error(e: &sqlx::Error) -> bool {
-    matches!(
+    if matches!(
         e,
         sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut
-    )
+    ) {
+        return true;
+    }
+    if let sqlx::Error::Database(db) = e {
+        return is_fatal_sqlite_message(&db.message().to_lowercase());
+    }
+    false
+}
+
+fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db_err) => db_err
+            .message()
+            .to_lowercase()
+            .contains("cannot start a transaction within a transaction"),
+        _ => false,
+    }
+}
+
+fn is_busy_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db_err) => {
+            let msg = db_err.message().to_lowercase();
+            msg.contains("database is locked") || msg.contains("database table is locked")
+        }
+        _ => false,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1734,5 +1878,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tx_count.0, 0);
+    }
+
+    /// Regression: 2026-04-26 17:25-17:39 incident.
+    /// SQLite I/O (522) and corruption (11) errors arrive as
+    /// `sqlx::Error::Database` and previously slipped through
+    /// `is_connection_error`. The batch loop kept reusing the poisoned
+    /// connection and minutes later we'd see "malformed" cascades plus
+    /// lost audio chunks (`audio chunk DB insert failed after 3
+    /// retries`). Pin both the message-substring decision and the
+    /// transport-variant fast paths.
+    #[test]
+    fn is_fatal_sqlite_message_recognises_io_and_corruption() {
+        // The two failure modes from the incident.
+        assert!(is_fatal_sqlite_message("disk i/o error"));
+        assert!(is_fatal_sqlite_message(
+            "error returned from database: (code: 522) disk i/o error"
+        ));
+        assert!(is_fatal_sqlite_message("database disk image is malformed"));
+        assert!(is_fatal_sqlite_message(
+            "error returned from database: (code: 11) database disk image is malformed"
+        ));
+
+        // Non-fatal per-row errors must NOT be classified as fatal.
+        // Misclassifying these would force whole batches to roll back
+        // over a single constraint violation.
+        assert!(!is_fatal_sqlite_message("no such table: foo"));
+        assert!(!is_fatal_sqlite_message("unique constraint failed"));
+        assert!(!is_fatal_sqlite_message("database is locked"));
+        assert!(!is_fatal_sqlite_message(""));
+    }
+
+    #[test]
+    fn is_connection_error_classifies_transport_variants() {
+        assert!(is_connection_error(&sqlx::Error::PoolClosed));
+        assert!(is_connection_error(&sqlx::Error::PoolTimedOut));
+        assert!(is_connection_error(&sqlx::Error::Io(
+            std::io::Error::other("broken pipe")
+        )));
+    }
+
+    /// `Database` errors flow through `is_fatal_sqlite_message`: a
+    /// genuinely benign one (no such table) must NOT be classified as
+    /// a connection error or the batch loop would discard whole
+    /// batches on ordinary schema/constraint mistakes.
+    #[tokio::test]
+    async fn is_connection_error_treats_per_row_errors_as_non_fatal() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let per_row = sqlx::query("SELECT * FROM does_not_exist")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(per_row, sqlx::Error::Database(_)));
+        assert!(!is_connection_error(&per_row));
     }
 }

@@ -10,6 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use screenpipe_core::pipes::PipeManager;
+use screenpipe_secrets::SecretStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -26,6 +27,11 @@ pub type SharedPipeManager = Arc<Mutex<PipeManager>>;
 #[derive(Deserialize)]
 pub struct EnableRequest {
     pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct FavoriteRequest {
+    pub favorite: bool,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +72,7 @@ pub async fn list_pipes(
     }
     if query.include_executions.unwrap_or(false) {
         let pipes_with_execs = mgr.list_pipes_with_executions(5).await;
+        let total = pipes_with_execs.len();
         let data: Vec<Value> = pipes_with_execs
             .into_iter()
             .map(|(status, execs)| {
@@ -76,10 +83,11 @@ pub async fn list_pipes(
                 obj
             })
             .collect();
-        Json(json!({ "data": data }))
+        Json(json!({ "data": data, "total": total }))
     } else {
         let pipes = mgr.list_pipes().await;
-        Json(json!({ "data": pipes }))
+        let total = pipes.len();
+        Json(json!({ "data": pipes, "total": total }))
     }
 }
 
@@ -123,6 +131,7 @@ pub struct RunPipeBody {
 /// Accepts an optional JSON body with `notification_context` to inject into the pipe prompt.
 pub async fn run_pipe_now(
     State(pm): State<SharedPipeManager>,
+    secret_store: Option<axum::Extension<Arc<SecretStore>>>,
     Path(id): Path<String>,
     body: Option<Json<RunPipeBody>>,
 ) -> Json<Value> {
@@ -163,17 +172,18 @@ pub async fn run_pipe_now(
                 .parent()
                 .unwrap_or(mgr.pipes_dir())
                 .to_path_buf();
-            let store = screenpipe_connect::connections::load_store(&screenpipe_dir);
-            let missing: Vec<&str> = required
-                .iter()
-                .filter(|conn_id| {
-                    !store
-                        .get(conn_id.as_str())
+            let ss = secret_store.as_ref().map(|e| e.0.as_ref());
+            let mut missing = Vec::new();
+            for conn_id in required {
+                let configured =
+                    screenpipe_connect::connections::load_connection(ss, &screenpipe_dir, conn_id)
+                        .await
                         .map(|c| c.enabled && !c.credentials.is_empty())
-                        .unwrap_or(false)
-                })
-                .map(|s| s.as_str())
-                .collect();
+                        .unwrap_or(false);
+                if !configured {
+                    missing.push(conn_id.as_str());
+                }
+            }
             if !missing.is_empty() {
                 return Json(json!({
                     "error": format!(
@@ -323,6 +333,41 @@ pub async fn delete_pipe(
     let mgr = pm.lock().await;
     match mgr.delete_pipe(&id).await {
         Ok(()) => Json(json!({ "success": true })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Favorites
+// ---------------------------------------------------------------------------
+
+/// GET /pipes/favorites — list pipe names the user has starred.
+///
+/// Returns `{"data": ["pipe-a", "pipe-b"]}` in insertion order so the UI
+/// can render most-recently-starred last if it wants to. The list is a
+/// pure UI preference (local to this machine) and is never blocked on
+/// pipe I/O.
+pub async fn list_favorites(State(pm): State<SharedPipeManager>) -> Json<Value> {
+    let mgr = pm.lock().await;
+    let dir = mgr.pipes_dir().to_path_buf();
+    drop(mgr); // favorites is disk-only; don't hold the pipe lock
+    let favorites = screenpipe_core::pipes::favorites::load(&dir);
+    Json(json!({ "data": favorites }))
+}
+
+/// POST /pipes/:id/favorite — mark or unmark a pipe as favorite.
+/// Body: `{"favorite": true}` to star, `{"favorite": false}` to unstar.
+/// Idempotent on both sides. Returns the new full favorites list.
+pub async fn set_pipe_favorite(
+    State(pm): State<SharedPipeManager>,
+    Path(id): Path<String>,
+    Json(body): Json<FavoriteRequest>,
+) -> Json<Value> {
+    let mgr = pm.lock().await;
+    let dir = mgr.pipes_dir().to_path_buf();
+    drop(mgr);
+    match screenpipe_core::pipes::favorites::set(&dir, &id, body.favorite) {
+        Ok(list) => Json(json!({ "success": true, "data": list })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }
