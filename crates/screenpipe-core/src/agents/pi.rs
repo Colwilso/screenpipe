@@ -1193,6 +1193,20 @@ pub fn find_bun_executable() -> Option<String> {
         if let Some(exe_folder) = exe_path.parent() {
             let bundled = exe_folder.join(if cfg!(windows) { "bun.exe" } else { "bun" });
             if bundled.exists() {
+                // Tauri's bundler may strip the execute bit during packaging.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&bundled) {
+                        let mode = meta.permissions().mode();
+                        if mode & 0o111 == 0 {
+                            let _ = std::fs::set_permissions(
+                                &bundled,
+                                std::fs::Permissions::from_mode(mode | 0o755),
+                            );
+                        }
+                    }
+                }
                 return Some(bundled.to_string_lossy().to_string());
             }
         }
