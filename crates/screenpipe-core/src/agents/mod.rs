@@ -118,4 +118,10 @@ pub trait AgentExecutor: Send + Sync {
     fn user_token(&self) -> Option<&str> {
         None
     }
+
+    /// Set AWS credentials for Bedrock provider (profile, region).
+    /// Called before run/run_streaming for pipes using a Bedrock preset.
+    /// Note: callers must ensure set + run are not interleaved with other
+    /// set calls on the same executor instance.
+    fn set_aws_credentials(&self, _profile: Option<String>, _region: Option<String>) {}
 }

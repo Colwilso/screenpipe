@@ -120,6 +120,8 @@ pub struct PiExecutor {
     /// Exposed to the Pi subprocess as `SCREENPIPE_API_AUTH_KEY` so bash tool
     /// calls against the local server can authenticate. None = auth disabled.
     pub api_auth_key: Option<String>,
+    /// AWS credentials for Bedrock provider (set per-invocation from preset).
+    aws_bedrock_creds: std::sync::Mutex<(Option<String>, Option<String>)>,
 }
 
 impl PiExecutor {
@@ -128,6 +130,7 @@ impl PiExecutor {
             user_token,
             api_url: SCREENPIPE_API_URL.to_string(),
             api_auth_key: None,
+            aws_bedrock_creds: std::sync::Mutex::new((None, None)),
         }
     }
 
@@ -642,6 +645,18 @@ impl PiExecutor {
                     }
                 }
             }
+
+            // Bedrock: inject AWS credentials via env vars
+            if resolved_provider == "amazon-bedrock" {
+                if let Ok(creds) = self.aws_bedrock_creds.lock() {
+                    if let Some(ref profile) = creds.0 {
+                        cmd.env("AWS_PROFILE", profile);
+                    }
+                    if let Some(ref region) = creds.1 {
+                        cmd.env("AWS_REGION", region);
+                    }
+                }
+            }
         }
 
         // Local server bearer token — kept separate from cloud keys so it
@@ -763,6 +778,18 @@ impl PiExecutor {
                             cmd.env("SCREENPIPE_API_KEY", key);
                         }
                         _ => {}
+                    }
+                }
+            }
+
+            // Bedrock: inject AWS credentials via env vars
+            if resolved_provider == "amazon-bedrock" {
+                if let Ok(creds) = self.aws_bedrock_creds.lock() {
+                    if let Some(ref profile) = creds.0 {
+                        cmd.env("AWS_PROFILE", profile);
+                    }
+                    if let Some(ref region) = creds.1 {
+                        cmd.env("AWS_REGION", region);
                     }
                 }
             }
@@ -1142,6 +1169,12 @@ impl AgentExecutor for PiExecutor {
 
     fn user_token(&self) -> Option<&str> {
         self.user_token.as_deref()
+    }
+
+    fn set_aws_credentials(&self, profile: Option<String>, region: Option<String>) {
+        if let Ok(mut creds) = self.aws_bedrock_creds.lock() {
+            *creds = (profile, region);
+        }
     }
 }
 

@@ -536,8 +536,59 @@ const AISection = ({
   const [models, setModels] = useState<AIModel[]>([]);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
 
+  const runBedrockDiagnostics = useCallback(async () => {
+    setTestStatus("testing");
+    setDiagnosticsOpen(true);
+    setTestResults({
+      endpoint: { status: "running", message: "Checking AWS profile..." },
+      auth: { status: "pending", message: "" },
+      models: { status: "pending", message: "" },
+      chat: { status: "pending", message: "" },
+    });
+
+    const profile = (settingsPreset as any)?.awsProfile || null;
+    const region = (settingsPreset as any)?.awsRegion || null;
+    const model = settingsPreset?.model || null;
+
+    const result = await commands.bedrockTestConnection(profile, region, model);
+    if (result.status === "error") {
+      setTestResults({
+        endpoint: { status: "fail", message: `Command failed: ${result.error}` },
+        auth: { status: "skip", message: "Skipped" },
+        models: { status: "skip", message: "Skipped" },
+        chat: { status: "skip", message: "Skipped" },
+      });
+      setTestStatus("done");
+      return;
+    }
+
+    const diag = result.data;
+    setTestResults({
+      endpoint: {
+        status: diag.profile_valid ? "pass" : "fail",
+        message: diag.profile_valid ? `Profile '${profile || "default"}' is valid` : (diag.error || "Profile check failed"),
+      },
+      auth: {
+        status: diag.credentials_valid ? "pass" : "fail",
+        message: diag.credentials_valid ? "AWS credentials valid" : (diag.error || "Credentials invalid"),
+      },
+      models: {
+        status: diag.credentials_valid ? "pass" : (diag.profile_valid ? "fail" : "skip"),
+        message: diag.credentials_valid ? "Bedrock API accessible" : (diag.error || "Skipped"),
+      },
+      chat: {
+        status: diag.model_accessible ? "pass" : (diag.credentials_valid && model ? "fail" : "skip"),
+        message: diag.model_accessible ? `Model '${model}' accessible` : (model ? (diag.error || "Model not accessible") : "No model selected"),
+      },
+    });
+    setTestStatus("done");
+  }, [settingsPreset]);
+
   const runDiagnostics = useCallback(async () => {
-    if (settingsPreset?.provider === "screenpipe-cloud" || settingsPreset?.provider === "bedrock") return;
+    if (settingsPreset?.provider === "screenpipe-cloud") return;
+    if (settingsPreset?.provider === "bedrock") {
+      return runBedrockDiagnostics();
+    }
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
@@ -839,7 +890,7 @@ const AISection = ({
     }
 
     setTestStatus("done");
-  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settingsPreset?.model]);
+  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settingsPreset?.model, runBedrockDiagnostics]);
 
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
@@ -1014,17 +1065,25 @@ const AISection = ({
         }
 
         case "bedrock": {
-          // TODO: dynamically fetch available models from Bedrock using the
-          // selected AWS profile. Would need a Tauri command that shells out to
-          // `aws bedrock list-inference-profiles --profile <awsProfile> --region <awsRegion>`
-          // and parses the result. For now, hardcoded list of common Anthropic models.
-          setModels([
-            { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", name: "Claude Opus 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4", provider: "bedrock" },
-          ]);
+          const profile = (settingsPreset as any)?.awsProfile || null;
+          const region = (settingsPreset as any)?.awsRegion || null;
+          const result = await commands.bedrockListModels(profile, region);
+          if (result.status === "ok" && result.data.length > 0) {
+            setModels(result.data.map((m) => ({
+              id: m.id,
+              name: `${m.name} (${m.id})`,
+              provider: "bedrock",
+            })));
+          } else {
+            // Fallback to hardcoded list if AWS CLI fails
+            setModels([
+              { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5 (us.anthropic.claude-sonnet-4-5-20250929-v1:0)", provider: "bedrock" },
+              { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", name: "Claude Opus 4.5 (us.anthropic.claude-opus-4-5-20251101-v1:0)", provider: "bedrock" },
+              { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5 (us.anthropic.claude-haiku-4-5-20251001-v1:0)", provider: "bedrock" },
+              { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4 (us.anthropic.claude-sonnet-4-20250514-v1:0)", provider: "bedrock" },
+              { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4 (us.anthropic.claude-opus-4-20250514-v1:0)", provider: "bedrock" },
+            ]);
+          }
           break;
         }
 
@@ -1085,7 +1144,7 @@ const AISection = ({
       setIsLoadingModels(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settings.user?.id, chatgptLoggedIn]);
+  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settings.user?.id, chatgptLoggedIn, (settingsPreset as any)?.awsProfile, (settingsPreset as any)?.awsRegion]);
 
   const apiKey = useMemo(() => {
     if (settingsPreset && "apiKey" in settingsPreset) {
