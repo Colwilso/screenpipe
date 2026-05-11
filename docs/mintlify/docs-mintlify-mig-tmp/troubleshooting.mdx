@@ -1,5 +1,5 @@
 ---
-title: "troubleshooting"
+title: "troubleshoot screenpipe: install, permissions, and pipes"
 sidebarTitle: "troubleshooting"
 description: "Fix common screenpipe issues including installation errors, screen and microphone permissions, missing audio, pipe failures, and MCP connection problems."
 icon: "wrench"
@@ -88,6 +88,42 @@ note: AirPods don't have this issue — Apple uses a proprietary codec.
 - reduce background noise
 - use a better microphone
 - try `deepgram` or `screenpipe-cloud` for cloud-based transcription (highest accuracy)
+
+### record only specific apps (e.g. Teams, Zoom)
+
+if you want to record only certain applications (like Teams meetings) and exclude everything else:
+
+1. **screen capture**: go to **settings → recording → included windows** and add the app name (e.g., `Teams`, `Zoom`). screenpipe will only capture these windows, even if you switch away briefly
+2. **audio devices**: go to **settings → recording** and select only the devices you need — for example, just your microphone and system audio, deselecting other inputs
+3. **test it**: open Teams and verify the timeline shows only Teams content. try opening other apps — they shouldn't appear in the recording
+
+this is useful for compliance, privacy (avoid recording unrelated work), or reducing storage usage. your recorded meetings and transcriptions are searchable via the API as normal.
+
+note: with included windows, screenpipe pauses capture when the app loses focus. this is intentional — if you want to capture even when focused on another window, use the broader "all windows" setting instead.
+
+---
+
+## chat & AI interactions
+
+### chat hangs or stops responding
+
+if your chat window freezes, try these fixes in order:
+
+1. **restart screenpipe** — closes stalled message queues
+2. **check health:** `curl http://localhost:3030/health` — if it fails, backend is stuck
+3. **verify you have data** — screenpipe needs screen/audio history; wait 1-2 minutes after startup
+4. **verify AI provider connection** — settings → model selector. for ChatGPT/Claude, sign out/back in
+5. **reduce load** — disable unused pipes (settings → pipes), switch to faster model (gpt-4o mini), check logs for "timeout" errors
+
+### chat messages disappear
+
+if assistant replies vanish when navigating away, **update to v0.4+** — this message persistence bug was fixed. on older versions, reinstall screenpipe.
+
+### AI model connection fails
+
+1. verify subscription active: [openai.com](https://openai.com) (ChatGPT Plus/Pro) or [claude.ai](https://claude.ai) (Claude Pro)
+2. sign out/in: settings → model selector → sign out, restart, sign back in
+3. if still failing, your tokens expired — try again
 
 ---
 

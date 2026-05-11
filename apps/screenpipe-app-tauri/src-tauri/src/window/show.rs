@@ -143,6 +143,15 @@ impl ShowRewindWindow {
                 .min_inner_size(min.0, min.1);
         }
 
+        // Hide title text on macOS for every window built through this helper.
+        // Title bar stays opaque (no Overlay style) so content doesn't bleed
+        // under the traffic lights — sibling helper window_builder() opts into
+        // Overlay where it's wanted.
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.hidden_title(true);
+        }
+
         builder
     }
 
@@ -372,16 +381,14 @@ impl ShowRewindWindow {
                         cursor.y as i32,
                     ) {
                         error!("Failed to reposition overlay to cursor monitor: {}", e);
-                        // Fallback: just bring to front at current position
-                        if let Err(e) = crate::windows_overlay::bring_to_front(window) {
-                            error!("Failed to bring window to front: {}", e);
-                        }
                     }
-                } else {
-                    // Can't get cursor position, just bring to front
-                    if let Err(e) = crate::windows_overlay::bring_to_front(window) {
-                        error!("Failed to bring window to front: {}", e);
-                    }
+                }
+                // Always activate after repositioning so the overlay receives keyboard focus.
+                // Without this, re-showing an already-created overlay when another screenpipe
+                // window (e.g. Home) holds focus leaves the overlay visible but not interactive —
+                // Escape and all shortcuts are swallowed by the unfocused background window.
+                if let Err(e) = crate::windows_overlay::bring_to_front_and_activate(window) {
+                    error!("Failed to activate overlay: {}", e);
                 }
                 let _ = app.emit("window-focused", true);
             }

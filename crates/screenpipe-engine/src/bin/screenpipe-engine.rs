@@ -41,8 +41,7 @@ use screenpipe_screen::monitor::list_monitors;
 use serde_json::json;
 use std::{
     env, fs,
-    net::SocketAddr,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, SocketAddr},
     ops::Deref,
     path::PathBuf,
     sync::Arc,
@@ -404,6 +403,46 @@ async fn main() -> anyhow::Result<()> {
                         let s = re_unix.replace_all(s, "~").to_string();
                         re_win.replace_all(&s, "~").to_string()
                     }
+
+                    // Noise filter: drop events whose root cause is a user
+                    // environment problem we can't fix from code. Mirrors the
+                    // Tauri-app filter in apps/screenpipe-app-tauri/src-tauri/
+                    // src/main.rs — the CLI binary was missing the same
+                    // suppression so the events kept flowing in (CLI-49
+                    // alone hit 744 users on stale builds).
+                    static USER_ENV_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> =
+                        std::sync::OnceLock::new();
+                    let env_patterns = USER_ENV_PATTERNS.get_or_init(|| {
+                        [
+                            // User hasn't granted screen recording permission (CLI-49)
+                            r"Screen recording permission denied",
+                            // Local DB corruption — user dropped/restored part of their db.sqlite
+                            r"no such table: main\.speaker_embeddings",
+                            // Concurrent DB access / user ran CLI while app was running
+                            r"database is locked",
+                            // Broken Homebrew install — external dylib missing
+                            r"Library not loaded.*libx265\.",
+                            // Linux system library missing — distro-local, not our bug
+                            r"Failed to load ayatana-appindicator3 or appindicator3 dynamic library",
+                            // Deepgram DNS / connectivity blips — already logged locally
+                            r"deepgram transcription failed: Cannot resolve audio transcription server",
+                        ]
+                        .into_iter()
+                        .filter_map(|p| regex::Regex::new(p).ok())
+                        .collect()
+                    });
+                    let matches_noise = |text: &str| env_patterns.iter().any(|re| re.is_match(text));
+                    if event.message.as_deref().map(matches_noise).unwrap_or(false) {
+                        return None;
+                    }
+                    for val in event.exception.values.iter() {
+                        if let Some(ref v) = val.value {
+                            if matches_noise(v) {
+                                return None;
+                            }
+                        }
+                    }
+
                     if let Some(ref mut msg) = event.message {
                         *msg = strip_user_paths(msg);
                     }
@@ -456,7 +495,6 @@ async fn main() -> anyhow::Result<()> {
                     map.insert("use_pii_removal".into(), json!(record_args.use_pii_removal));
                     map.insert("disable_vision".into(), json!(record_args.disable_vision));
                     map.insert("vad_engine".into(), json!("Silero"));
-                    // enable_input_capture / enable_accessibility always true (removed as settings)
                     map.insert("enable_sync".into(), json!(record_args.enable_sync));
                     map.insert(
                         "sync_interval_secs".into(),
@@ -466,6 +504,7 @@ async fn main() -> anyhow::Result<()> {
                     map.insert("api_auth".into(), json!(record_args.api_auth));
                     map.insert("encrypt_secrets".into(), json!(record_args.encrypt_secrets));
                     map.insert("retention_days".into(), json!(record_args.retention_days));
+                    map.insert("retention_mode".into(), json!(record_args.retention_mode));
                     // Only send counts for privacy-sensitive lists (not actual values)
                     map.insert(
                         "audio_device_count".into(),
@@ -1008,7 +1047,31 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&pipes_dir).ok();
 
     let user_token = std::env::var("SCREENPIPE_API_KEY").ok();
-    let pi_executor = std::sync::Arc::new(screenpipe_core::agents::pi::PiExecutor::new(user_token));
+    let pi_executor = std::sync::Arc::new(screenpipe_core::agents::pi::PiExecutor::new(
+        user_token.clone(),
+    ));
+
+    // Workflow event classifier — opt-in cloud feature. Polls recent activity
+    // and emits `WorkflowEvent`s on the bus so pipes with `trigger.events`
+    // frontmatter can run. Routed through the gateway by default; self-host
+    // can override with SCREENPIPE_EVENT_CLASSIFIER_URL.
+    if config.enable_workflow_events {
+        let classifier_url =
+            std::env::var("SCREENPIPE_EVENT_CLASSIFIER_URL").unwrap_or_else(|_| {
+                screenpipe_engine::workflow_classifier::DEFAULT_CLASSIFIER_URL.to_string()
+            });
+        let token = user_token.clone().unwrap_or_default();
+        let port = config.port;
+        tokio::spawn(async move {
+            screenpipe_engine::workflow_classifier::start_workflow_classifier(
+                classifier_url,
+                token,
+                port,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        });
+    }
 
     let mut agent_executors: std::collections::HashMap<
         String,
@@ -1210,6 +1273,19 @@ async fn main() -> anyhow::Result<()> {
             "forever".to_string()
         } else {
             format!("{}", record_args.retention_days)
+        }
+    );
+    println!(
+        "│ retention mode         │ {:<34} │",
+        if record_args.retention_days == 0 {
+            "n/a".to_string()
+        } else {
+            match record_args.retention_mode {
+                screenpipe_engine::retention::RetentionMode::Media => {
+                    "media-only (keep transcripts)".to_string()
+                }
+                screenpipe_engine::retention::RetentionMode::All => "all (full delete)".to_string(),
+            }
         }
     );
 
@@ -1417,6 +1493,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let port = config.port;
         let retention_days = record_args.retention_days;
+        let retention_mode = record_args.retention_mode;
         let retention_enabled = retention_days > 0;
         tokio::spawn(async move {
             if !retention_enabled {
@@ -1431,12 +1508,17 @@ async fn main() -> anyhow::Result<()> {
                 .json(&serde_json::json!({
                     "enabled": true,
                     "retention_days": retention_days,
+                    "mode": retention_mode,
                 }))
                 .send()
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    tracing::info!("local retention auto-enabled ({} days)", retention_days);
+                    tracing::info!(
+                        "local retention auto-enabled ({} days, mode={:?})",
+                        retention_days,
+                        retention_mode
+                    );
                 }
                 Ok(r) => {
                     tracing::debug!("retention configure returned {}", r.status());
@@ -1446,6 +1528,178 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // Spawn the async PII reconciliation worker (issue #3185).
+    // Off by default — only runs when `--async-pii-redaction` is set.
+    // The capture path is unaffected either way.
+    if !record_args.async_pii_redaction {
+        info!(
+            "text-PII worker skipped at startup — async_pii_redaction=false. \
+             OPF model (~2.8 GB) will NOT be downloaded or loaded. \
+             Toggle via Settings → Privacy → AI PII removal."
+        );
+    }
+    if record_args.async_pii_redaction {
+        use screenpipe_redact::{
+            adapters::{
+                opf::{OpfAdapter, OpfConfig},
+                tinfoil::TinfoilRedactor,
+            },
+            pipeline::{Pipeline, PipelineConfig},
+            worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
+            Redactor,
+        };
+        use std::sync::Arc;
+
+        info!("starting async PII reconciliation worker (destructive overwrite of source columns)");
+
+        // Pipeline: regex pre-pass + AI fallback. Regex catches
+        // structural PII deterministically and on-device. AI step
+        // resolves to:
+        //   1. local opf-rs (candle, ~74 ms p50 on Mac CPU, 41 ms on
+        //      Metal). First run downloads ~2.8 GB from
+        //      huggingface.co/screenpipe/pii-text-redactor and verifies
+        //      SHA-256 before landing at ~/.screenpipe/models/opf-v6/.
+        //      Spawned off the boot path so a slow first-run pull
+        //      doesn't block the engine.
+        //   2. Tinfoil confidential-compute enclave when TINFOIL_*
+        //      env vars are set and local opf-rs is unavailable.
+        //   3. regex-only otherwise (still destructive — overwrites
+        //      regex-redacted text into the source columns).
+        let pool = db.pool.clone();
+        tokio::spawn(async move {
+            info!(
+                "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
+                 ~/.screenpipe/models/opf-v6/)"
+            );
+            let pipeline = match OpfAdapter::load_or_download(OpfConfig::default()).await {
+                Ok(adapter) => {
+                    info!(
+                        "text-PII AI step: local opf-rs (candle) — lazy load on first \
+                         batch, idle-unload after 60s of no work"
+                    );
+                    // Wrap in Arc first so we can spawn the idle
+                    // unloader (which needs `Arc<Self>`) and still
+                    // hand the same Arc to the Pipeline.
+                    let adapter = Arc::new(adapter);
+                    let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
+                    let ai: Arc<dyn Redactor> = adapter;
+                    Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                }
+                Err(e) => {
+                    if std::env::var("TINFOIL_API_KEY").is_ok()
+                        || std::env::var("TINFOIL_BASE_URL").is_ok()
+                    {
+                        info!("text-PII AI step: tinfoil enclave (local opf-rs unavailable: {e})");
+                        let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::from_env());
+                        Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                    } else {
+                        tracing::warn!(
+                            "text-PII AI step disabled — local opf-rs unavailable ({e}) and no \
+                             TINFOIL_* env vars set. Worker will run regex-only."
+                        );
+                        Pipeline::regex_only()
+                    }
+                }
+            };
+            let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
+
+            let worker_cfg = WorkerConfig {
+                tables: ALL_TARGET_TABLES.to_vec(),
+                ..Default::default()
+            };
+            let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg).spawn();
+            // The worker runs for the lifetime of the engine. We don't
+            // join its handle — when the process exits the runtime
+            // tears down the task. If we ever want graceful shutdown
+            // (drain in-flight HTTP calls), wire `_worker_handle` into
+            // the shutdown_tx flow.
+        });
+    }
+
+    // Image-PII reconciliation worker (issue #3185 follow-up).
+    // Independent of the text worker — users can toggle either one
+    // without the other. Requires the rfdetr_v9 model present and at
+    // least one of the `onnx-*` or `mlx-mac` cargo features built.
+    if !record_args.async_image_pii_redaction {
+        info!(
+            "image-PII worker skipped at startup — async_image_pii_redaction=false. \
+             rfdetr_v9 model (~108 MB) will NOT be downloaded or loaded. \
+             Toggle via Settings → Privacy → AI PII removal."
+        );
+    }
+    if record_args.async_image_pii_redaction {
+        use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
+        use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
+        use screenpipe_redact::ImageRedactor;
+        use std::sync::Arc;
+
+        // Prefer the MLX runtime on Mac when the safetensors weights
+        // are present (~6× faster than the CoreML EP path). Falls
+        // through to the ONNX adapter otherwise — load_or_download
+        // fetches rfdetr_v9.onnx from
+        // huggingface.co/screenpipe/pii-image-redactor on first run
+        // (~108 MB), verifies SHA-256, caches at
+        // ~/.screenpipe/models/. Subsequent starts are instant.
+        #[allow(unused_mut)]
+        let mut detector_arc: Option<Arc<dyn ImageRedactor>> = None;
+        #[cfg(all(feature = "rfdetr-mlx", target_os = "macos", target_arch = "aarch64"))]
+        {
+            use screenpipe_redact::adapters::rfdetr_mlx::{RfdetrMlxConfig, RfdetrMlxRedactor};
+            let mlx_cfg = RfdetrMlxConfig::default();
+            // Mirrors the ONNX adapter: download once, verify SHA-256,
+            // cache at ~/.screenpipe/models/rfdetr_v9.safetensors.
+            if let Err(e) = mlx_cfg.ensure_model_present().await {
+                tracing::info!(
+                    "rfdetr-mlx safetensors download failed ({e}); falling back to ONNX adapter"
+                );
+            } else {
+                match RfdetrMlxRedactor::load(mlx_cfg) {
+                    Ok(d) => {
+                        info!("image-PII detector: rfdetr-mlx (Apple Silicon GPU)");
+                        // Lazy-load + 60 s idle-unload — frees the
+                        // ~150–200 MB MLX resident footprint when the
+                        // worker is paused or the reconciliation queue
+                        // has drained. Same pattern as OpfAdapter.
+                        let d = Arc::new(d);
+                        let _ = Arc::clone(&d).spawn_idle_unloader();
+                        detector_arc = Some(d as Arc<dyn ImageRedactor>);
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            "rfdetr-mlx load failed ({e}); falling back to ONNX adapter"
+                        );
+                    }
+                }
+            }
+        }
+        if detector_arc.is_none() {
+            match RfdetrRedactor::load_or_download(RfdetrConfig::default()).await {
+                Ok(d) => {
+                    info!("image-PII detector: rfdetr (ONNX Runtime)");
+                    detector_arc = Some(Arc::new(d) as Arc<dyn ImageRedactor>);
+                }
+                Err(e) => {
+                    // Loud-but-non-fatal: capture continues; user gets
+                    // an explicit "model missing or download failed"
+                    // message in the log, and the regular text
+                    // redactor (if enabled) keeps running.
+                    tracing::warn!(
+                        "image-PII redaction enabled but couldn't load model; skipping: {e}. \
+                         check network reachability to huggingface.co or pre-stage \
+                         rfdetr_v9.onnx at ~/.screenpipe/models/."
+                    );
+                }
+            }
+        }
+        if let Some(detector) = detector_arc {
+            info!(
+                "starting async image-PII reconciliation worker (destructive overwrite of source JPGs)"
+            );
+            let cfg = ImageWorkerConfig::default();
+            let _img_handle = ImageWorker::new(db.pool.clone(), detector, cfg).spawn();
+        }
     }
 
     // Add auto-destruct watcher

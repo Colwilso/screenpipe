@@ -86,8 +86,12 @@ async function tryDeductCredit(env: Env, userId: string, reason: string): Promis
 
 /**
  * Get user's current credit balance without deducting.
+ *
+ * Exported because the cost-cap check in `index.ts` also needs this — credits
+ * extend the daily cost ceiling 1:1 (1 credit = $1 of headroom). Without that,
+ * users who pay $50 still 429 on Opus and file Intercom tickets.
  */
-async function getCreditBalance(env: Env, userId: string): Promise<number> {
+export async function getCreditBalance(env: Env, userId: string): Promise<number> {
   const clerkId = await resolveClerkId(env, userId);
   if (!clerkId) return 0;
 
@@ -465,6 +469,13 @@ export async function getUsageStatus(
  * Check if a model is allowed for a given tier
  */
 export function isModelAllowed(model: string, tier: UserTier, env?: Env): boolean {
+  // Internal zero-cost models (e.g., the workflow event classifier on our
+  // own vLLM) are always allowed regardless of tier — we eat the cost and
+  // they're gated at the feature level (opt-in setting), not the tier.
+  if (model === 'screenpipe-event-classifier') {
+    return true;
+  }
+
   const allowedModels = getTierConfig(env)[tier].allowedModels;
 
   // Subscribed users can use any model

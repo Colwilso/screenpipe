@@ -10,7 +10,7 @@ use screenpipe_db::DatabaseManager;
 
 use screenpipe_audio::audio_manager::AudioManager;
 use screenpipe_core::sync::SyncServiceHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
     analytics,
@@ -27,7 +27,8 @@ use crate::{
         },
         data::{
             backup_handler, checkpoint_handler, delete_device_data_handler,
-            delete_time_range_handler, device_storage_handler,
+            delete_time_range_handler, device_storage_handler, evict_media_handler,
+            storage_preview_handler,
         },
         elements::{get_frame_elements, search_elements},
         frames::{
@@ -41,7 +42,8 @@ use crate::{
         meetings::{
             bulk_delete_meetings_handler, delete_meeting_handler, get_meeting_handler,
             list_meetings_handler, meeting_status_handler, merge_meetings_handler,
-            start_meeting_handler, stop_meeting_handler, update_meeting_handler,
+            split_meeting_handler, start_meeting_handler, stop_meeting_handler,
+            update_meeting_handler,
         },
         memories::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
@@ -54,7 +56,9 @@ use crate::{
             search_speakers_handler, undo_speaker_reassign_handler, update_speaker_handler,
         },
         streaming::{handle_video_export_post, handle_video_export_ws, stream_frames_handler},
-        websocket::{ws_events_handler, ws_health_handler, ws_metrics_handler},
+        websocket::{
+            ws_events_handler, ws_health_handler, ws_meeting_status_handler, ws_metrics_handler,
+        },
     },
     sync_api::{self, SyncState},
     video_cache::FrameCache,
@@ -172,6 +176,14 @@ pub struct AppState {
     pub manual_meeting: Arc<tokio::sync::RwLock<Option<i64>>>,
     /// Browser extension bridge — relays JS eval requests to the connected extension
     pub browser_bridge: Arc<crate::routes::browser::BrowserBridge>,
+    /// Registry of every browser the agent can drive — user's real browser via
+    /// the extension, the app-managed owned webview, future remote-CDP backends.
+    /// `GET /connections/browsers` lists what's here.
+    pub browser_registry: Arc<screenpipe_connect::connections::browser::BrowserRegistry>,
+    /// The owned-browser instance (Tauri-managed webview) registered into
+    /// `browser_registry`. Held separately so the desktop shell can attach a
+    /// transport handle after the engine has started.
+    pub owned_browser: Arc<screenpipe_connect::connections::browser::OwnedBrowser>,
     /// When true, non-localhost requests require Authorization: Bearer <api_key>
     pub api_auth: bool,
     /// The API key to validate against (from SCREENPIPE_API_KEY or auth.json)
@@ -202,6 +214,11 @@ pub struct SCServer {
         Arc<DashMap<String, Arc<screenpipe_core::pipes::permissions::PipePermissions>>>,
     /// Shared manual meeting lock — pass in from binary so persister and server share the same state.
     pub manual_meeting: Option<Arc<tokio::sync::RwLock<Option<i64>>>>,
+    /// Owned browser instance — set by the desktop shell so it can attach an
+    /// OwnedWebviewHandle once the Tauri WebviewWindow is created. If unset,
+    /// the engine creates a default unattached instance and owned-browser
+    /// requests return 503 until a handle is wired up.
+    pub owned_browser: Option<Arc<screenpipe_connect::connections::browser::OwnedBrowser>>,
     /// Require auth for remote API access
     pub api_auth: bool,
     /// API key for remote auth validation
@@ -240,6 +257,7 @@ impl SCServer {
             power_manager: None,
             pipe_permissions: Arc::new(DashMap::new()),
             manual_meeting: None,
+            owned_browser: None,
             api_auth: false,
             api_auth_key: None,
             secret_store: None,
@@ -484,10 +502,32 @@ impl SCServer {
                 .clone()
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(None))),
             browser_bridge: crate::routes::browser::BrowserBridge::new(),
+            browser_registry: screenpipe_connect::connections::browser::BrowserRegistry::new(),
+            // Reuse the desktop-shell-supplied owned browser if present so its
+            // already-attached OwnedWebviewHandle survives. Otherwise fall back
+            // to a default unattached instance — useful for CLI / tests /
+            // headless deployments.
+            owned_browser: self.owned_browser.clone().unwrap_or_else(
+                screenpipe_connect::connections::browser::OwnedBrowser::default_instance,
+            ),
             api_auth: self.api_auth,
             api_auth_key: self.api_auth_key.clone(),
             secret_store: self.secret_store.clone(),
         });
+
+        // Populate the registry so /connections/browsers shows both kinds
+        // immediately. The user-browser is wired to the existing bridge;
+        // the owned-browser is a stub until the desktop shell attaches its
+        // OwnedWebviewHandle.
+        {
+            use screenpipe_connect::connections::browser::UserBrowser;
+            let user = UserBrowser::default_instance(app_state.browser_bridge.clone());
+            app_state.browser_registry.register(user).await;
+            app_state
+                .browser_registry
+                .register(app_state.owned_browser.clone())
+                .await;
+        }
 
         // Restrict CORS to localhost origins (Tauri webview + local development).
         // Remote origins are blocked to prevent malicious websites from making
@@ -543,6 +583,7 @@ impl SCServer {
             .get("/meetings/:id", get_meeting_handler)
             .delete("/meetings/:id", delete_meeting_handler)
             .put("/meetings/:id", update_meeting_handler)
+            .post("/meetings/:id/split", split_meeting_handler)
             .post("/memories", create_memory_handler)
             .get("/memories", list_memories_handler)
             .get("/memories/tags", list_memory_tags_handler)
@@ -573,6 +614,8 @@ impl SCServer {
             .post("/sync/download", sync_api::sync_download)
             .post("/sync/pipes/push", sync_api::sync_pipes_push)
             .post("/sync/pipes/pull", sync_api::sync_pipes_pull)
+            .post("/sync/memories/push", sync_api::sync_memories_push)
+            .post("/sync/memories/pull", sync_api::sync_memories_pull)
             // Cloud Archive API routes
             .post("/archive/init", crate::archive::archive_init)
             .post("/archive/configure", crate::archive::archive_configure)
@@ -587,6 +630,8 @@ impl SCServer {
             .post("/retention/run", crate::retention::retention_run)
             // Data management
             .post("/data/delete-range", delete_time_range_handler)
+            .post("/data/evict-media", evict_media_handler)
+            .get("/data/storage-preview", storage_preview_handler)
             .post("/data/delete-device", delete_device_data_handler)
             .get("/data/device-storage", device_storage_handler)
             // Database backup & checkpoint
@@ -748,7 +793,13 @@ impl SCServer {
 
         let router = router.nest(
             "/connections",
-            crate::connections_api::router(cm, wa, self.secret_store.clone()),
+            crate::connections_api::router(
+                cm,
+                wa,
+                self.secret_store.clone(),
+                app_state.browser_bridge.clone(),
+                app_state.browser_registry.clone(),
+            ),
         );
 
         // Power management routes (if power manager is available)
@@ -770,8 +821,13 @@ impl SCServer {
             .route("/stream/frames", get(stream_frames_handler))
             .route("/ws/events", get(ws_events_handler))
             .route("/ws/health", get(ws_health_handler))
+            .route("/ws/meeting-status", get(ws_meeting_status_handler))
             .route("/ws/metrics", get(ws_metrics_handler))
-            // Browser extension bridge
+            // Browser extension bridge — DEPRECATED top-level paths.
+            // Canonical paths now live under /connections/browser/* (see connections_api.rs).
+            // These aliases stay in place because deployed Chrome extensions hardcode
+            // /browser/ws (packages/browser-extension/src/config.ts). Remove only after
+            // a coordinated extension update has shipped to all users.
             .route(
                 "/browser/ws",
                 get({
@@ -916,7 +972,12 @@ impl SCServer {
                                     .map(|s| s.eq_ignore_ascii_case("websocket"))
                                     .unwrap_or(false);
                                 if upgrade {
-                                    warn!(
+                                    // Browser extensions / MCP clients reconnect on a fixed
+                                    // interval without holding the auth token, so this fires
+                                    // ~2 880×/day in steady state. The 403 response already
+                                    // tells the caller what's wrong — keep the log line
+                                    // available for debugging but not at WARN.
+                                    debug!(
                                         path = %path,
                                         "api auth: rejected WebSocket upgrade (missing/invalid token; use Cookie screenpipe_auth, Authorization Bearer, or ?token=)"
                                     );
@@ -925,7 +986,13 @@ impl SCServer {
                                     .status(403)
                                     .header("Content-Type", "application/json")
                                     .body(axum::body::Body::from(
-                                        r#"{"error":"unauthorized: API access requires authentication. Pass Authorization: Bearer <your-api-key> (find your key in Settings > Privacy)"}"#,
+                                        // CLI-only users (no desktop app) can't open
+                                        // Settings > Privacy — surface the CLI path
+                                        // and env var here so the error itself
+                                        // tells them how to authenticate. Discord
+                                        // jeffutter, 2026-05-04: the previous hint
+                                        // pointed at a UI menu they didn't have.
+                                        r#"{"error":"unauthorized: API access requires authentication. Pass `Authorization: Bearer <your-api-key>`. Get the key with `screenpipe auth token`, or set the `SCREENPIPE_API_KEY` env var before starting screenpipe. (Desktop app users: Settings > Privacy.)"}"#,
                                     ))
                                     .unwrap()
                             }

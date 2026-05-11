@@ -144,7 +144,12 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const conversation: ChatConversation = {
       id: convId,
       title,
-      messages: msgs.slice(-100).map(m => {
+      // Persist the full transcript. The previous slice(-100) was silently
+      // dropping the oldest messages on every save, so any chat that grew
+      // past 100 messages walked forward and lost its early history. If
+      // file size becomes a problem for power users we cap at the render
+      // layer, never on disk.
+      messages: msgs.map(m => {
         // For tool-only responses, content may be empty but contentBlocks has the data.
         let content = m.content;
         if (!content && m.contentBlocks?.length) {
@@ -198,8 +203,54 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       })()),
     };
 
+    // Mirror the final messages into the in-memory chat-store BEFORE
+    // writing disk. The pi-event-router's persistBackgroundSession runs
+    // for any session that's no longer foregrounded when agent_end fires
+    // (user navigated away during/after the reply) and overwrites this
+    // same disk file using whatever the store currently has. Without
+    // this mirror the store still holds the "Processing..." placeholder
+    // (the router skipped events while we were foreground; the panel's
+    // streaming deltas only updated React state, not the store), so the
+    // router's save would clobber a freshly-written full conversation
+    // with the placeholder — which is the user-visible bug "navigate
+    // away, come back, the assistant message is gone."
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      if (useChatStore.getState().sessions[convId]) {
+        useChatStore.getState().actions.setMessages(convId, conversation.messages as any);
+      }
+    } catch (e) {
+      console.warn("[chat] failed to mirror messages to store before save:", e);
+    }
+
     await saveConversationFile(conversation);
     await refreshFileConversations();
+
+    // Sync the persisted title back into the in-memory chat-store so the
+    // sidebar (which reads `sessions[id].title` directly) updates immediately.
+    // Without this the row stays labelled "new chat" until the next app
+    // launch — that's the rename-doesn't-stick bug users reported.
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      const sessions = useChatStore.getState().sessions;
+      if (sessions[convId]) {
+        useChatStore.getState().actions.patch(convId, {
+          title: conversation.title,
+          messageCount: conversation.messages.length,
+          // Clear the draft flag on every save (including the 1.5s auto-save
+          // during streaming). Without this, the sidebar hides the chat for
+          // the entire streaming duration because the auto-save writes the
+          // file to disk but never clears draft:true in the store — so the
+          // chat appears on refresh (file exists) but not in the live sidebar.
+          draft: false,
+          ...(conversation.lastUserMessageAt
+            ? { lastUserMessageAt: conversation.lastUserMessageAt }
+            : {}),
+        });
+      }
+    } catch (e) {
+      console.warn("[chat] failed to sync title to store:", e);
+    }
 
     // Update activeConversationId in store (lightweight — no conversation data)
     try {
@@ -237,9 +288,69 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       const allPipe = messages.every((m) => m.id?.startsWith("pipe-"));
       if (!allPipe) {
         saveConversation(messages);
+        // Reveal this session in the sidebar — the assistant has replied,
+        // so it's no longer an empty draft.
+        void (async () => {
+          const { useChatStore } = await import("@/lib/stores/chat-store");
+          const sid = piSessionIdRef.current;
+          if (sid && useChatStore.getState().sessions[sid]?.draft) {
+            useChatStore.getState().actions.patch(sid, { draft: false });
+          }
+        })();
       }
     }
     prevIsLoadingRef.current = isLoading;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading, messages]);
+
+  // ---- Debounced auto-save during streaming ----
+  // Without this, the assistant message is only persisted on the
+  // isLoading: true → false edge above. Quitting the app mid-stream lost
+  // the partial assistant reply (the user still saw their question on
+  // reload, but the model's response was gone). Save every ~1.5 s while
+  // a response is streaming so a crash/quit drops at most a second of
+  // tokens. Pipe-watch conversations are still skipped — same rule as
+  // the edge save: only persist if at least one message is user-typed.
+  const streamingSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Snapshot of last-saved content length per message id so we don't
+  // rewrite the file when only React re-rendered (e.g. cursor blink).
+  const lastSavedSigRef = useRef<string>("");
+  useEffect(() => {
+    if (!isLoading || messages.length === 0) {
+      // Stream finished (or never started); the edge-trigger save above
+      // owns the final write. Make sure no stale timer fires after.
+      if (streamingSaveTimerRef.current) {
+        clearTimeout(streamingSaveTimerRef.current);
+        streamingSaveTimerRef.current = null;
+      }
+      return;
+    }
+    const allPipe = messages.every((m) => m.id?.startsWith("pipe-"));
+    if (allPipe) return;
+
+    // Cheap signature: total length of all message content + last id.
+    // If neither moved, no point re-serialising the whole transcript.
+    const sig = `${messages.length}|${messages[messages.length - 1]?.id ?? ""}|${
+      messages.reduce((n, m) => n + (m.content?.length ?? 0), 0)
+    }`;
+    if (sig === lastSavedSigRef.current) return;
+    lastSavedSigRef.current = sig;
+
+    if (streamingSaveTimerRef.current) {
+      clearTimeout(streamingSaveTimerRef.current);
+    }
+    streamingSaveTimerRef.current = setTimeout(() => {
+      streamingSaveTimerRef.current = null;
+      // Snapshot inside the timeout so we save the latest, not stale closure.
+      saveConversation(messages);
+    }, 1500);
+
+    return () => {
+      if (streamingSaveTimerRef.current) {
+        clearTimeout(streamingSaveTimerRef.current);
+        streamingSaveTimerRef.current = null;
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading, messages]);
 
@@ -252,6 +363,29 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     if (!conv) return;
     await saveConversationFile({ ...conv, title: trimmed, updatedAt: Date.now() });
     await refreshFileConversations();
+    // Mirror to the in-memory store so the chat sidebar reflects the new
+    // title without waiting for app restart. Some call sites already patch
+    // the store themselves; this is idempotent — patch is a no-op for
+    // non-existent ids.
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      if (useChatStore.getState().sessions[convId]) {
+        useChatStore.getState().actions.patch(convId, { title: trimmed });
+      }
+    } catch (e) {
+      console.warn("[chat] failed to sync rename to store:", e);
+    }
+    // Broadcast across windows. The chat-store is window-local (zustand
+    // lives in each WebView's JS context); without this, renaming in the
+    // /chat overlay window never reaches the chat-sidebar in /home (and
+    // vice versa) until the next on-disk hydration. Listeners in
+    // standalone-chat.tsx patch their local store on receipt.
+    try {
+      const { emit } = await import("@tauri-apps/api/event");
+      await emit("chat-renamed", { id: convId, title: trimmed });
+    } catch (e) {
+      console.warn("[chat] failed to broadcast rename:", e);
+    }
   };
 
   // ---- deleteConversation ----
@@ -368,8 +502,24 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       piStreamingTextRef.current = existing.streamingText ?? "";
       piMessageIdRef.current = existing.streamingMessageId ?? null;
       piContentBlocksRef.current = (existing.contentBlocks as any[]) ?? [];
-      if (existing.isLoading) setIsLoading(true);
-      if (existing.isStreaming) setIsStreaming(true);
+      // Self-heal a stuck `isStreaming` flag. The router bumps
+      // `updatedAt` on every token via patchMessage, so silence past
+      // STALE_MS means the stream is dead (Pi process died without
+      // firing agent_end, network cut mid-stream, etc.) — not just
+      // slow. Without this guard, returning to such a session shows
+      // the typing-cursor / loading dots forever.
+      const STALE_MS = 30_000;
+      const isStale =
+        !!existing.isStreaming && Date.now() - existing.updatedAt > STALE_MS;
+      if (isStale) {
+        store.actions.endTurn(conv.id);
+        piStreamingTextRef.current = "";
+        piMessageIdRef.current = null;
+        piContentBlocksRef.current = [];
+      } else {
+        if (existing.isLoading) setIsLoading(true);
+        if (existing.isStreaming) setIsStreaming(true);
+      }
       store.actions.markHydrated(conv.id);
     } else {
       // Cold session — load from disk and seed the store.

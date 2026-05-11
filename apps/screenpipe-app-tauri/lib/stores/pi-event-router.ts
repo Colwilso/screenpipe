@@ -79,8 +79,17 @@ type PiInnerEvent = AgentInnerEvent;
 /** Map a raw event type to a SessionStatus. Returns null when the event
  *  doesn't carry a status signal (e.g. `tool_execution_end` is ambiguous —
  *  could go back to streaming or end the turn entirely; we wait for the
- *  next definitive event). */
-function statusForEvent(evt: PiInnerEvent): SessionStatus | null {
+ *  next definitive event).
+ *
+ *  Exported so the foreground chat panel can mirror status updates into
+ *  the store on its own — the bus routes foreground events exclusively
+ *  to the panel listener (see `bus.ts:dispatchEvent`), so the router
+ *  never sees them and never gets a chance to patch the store. Without
+ *  this mirror the sidebar dot stays at whatever status was set last
+ *  time the session was on the background path (usually `idle`),
+ *  causing the user-visible bug "I'm in the chat and it's gray instead
+ *  of pulsing while streaming". */
+export function statusForEvent(evt: PiInnerEvent): SessionStatus | null {
   switch (evt.type) {
     case "agent_start":
     case "turn_start":
@@ -349,6 +358,38 @@ export async function mountPiEventRouter(): Promise<() => void> {
     const offTerminated = onTerminated((p) => handleTerminated(p));
     const offEvicted = onEvicted((p) => handleSessionEvicted(p));
     unregistrations.push(offDefault, offTerminated, offEvicted);
+
+    // Flush pending saves on app quit. Without this, a Cmd+Q during an
+    // active stream — or any time agent_end hasn't fired yet — leaves
+    // the partial transcript only in the in-memory store; the next
+    // launch reads stale disk and the latest exchanges silently
+    // disappear. We prevent the default close, await the flush, then
+    // destroy the window. Foreground sessions whose tokens live only
+    // in the panel's local React state aren't fully covered here —
+    // those rely on the panel's own snapshot-on-switch — but anything
+    // that's reached the store does get persisted.
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const win = getCurrentWindow();
+      const offClose = await win.onCloseRequested(async (event) => {
+        event.preventDefault();
+        try {
+          await flushPendingSaves();
+        } catch (e) {
+          console.warn("[router] flush on close failed:", e);
+        }
+        try {
+          await win.destroy();
+        } catch {
+          /* window already gone */
+        }
+      });
+      unregistrations.push(offClose);
+    } catch (e) {
+      // Non-Tauri context (tests, ssr) — skip silently.
+      console.debug("[router] close-flush hook not available:", e);
+    }
+
     mounted = true;
     return unmountPiEventRouter;
   })();
@@ -528,13 +569,31 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
     return;
   }
 
+  // turn_end fires between LLM turns within a single agent run (typically
+  // across a tool-call boundary). The agent is still streaming — only the
+  // current message's accumulator should be cleared so the next
+  // message_start gets a fresh slate. Calling endTurn here would briefly
+  // flip isStreaming/isLoading false and falsely settle the session
+  // mid-run.
+  if (t === "turn_end") {
+    const cur = store.sessions[sid];
+    if (cur?.streamingMessageId) {
+      store.actions.setStreaming(sid, {
+        streamingMessageId: null,
+        streamingText: "",
+        contentBlocks: [],
+      });
+    }
+    return;
+  }
+
   // End of turn — flush streaming state to "settled" message + clear
   // in-flight markers. We're in the BACKGROUND-only branch (the early
   // `currentId === sid` return above gates this), so the panel won't
   // run its own save useEffect for this session. Persist directly so
   // a chat that completes while the user is looking elsewhere still
   // ends up on disk and survives a restart.
-  if (t === "agent_end" || t === "turn_end") {
+  if (t === "agent_end") {
     store.actions.endTurn(sid);
     void persistBackgroundSession(sid);
     return;
@@ -546,6 +605,22 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
 // follow-up). A second save kicked off before the first finishes would
 // race on the same file; we chain them through a per-id promise queue.
 const saveQueue = new Map<string, Promise<void>>();
+
+/** Persist every in-store session that has unsaved messages. Awaits the
+ *  saveQueue tail for each id so already-running saves finish before
+ *  the window closes. Used by the close-on-quit hook in
+ *  `mountPiEventRouter`. */
+async function flushPendingSaves(): Promise<void> {
+  const sessions = useChatStore.getState().sessions;
+  const ids = Object.keys(sessions).filter((id) => {
+    const s = sessions[id];
+    return !!s.messages && s.messages.length > 0;
+  });
+  await Promise.all(ids.map((id) => persistBackgroundSession(id)));
+  // Await the entire saveQueue tail so any in-flight save (queued
+  // before flush) also completes. persistBackgroundSession returns the
+  // promise it just appended, so the previous await covers the tail.
+}
 
 /**
  * Persist a backgrounded session's accumulated state to disk. Called from
@@ -602,7 +677,10 @@ async function persistBackgroundSession(sid: string): Promise<void> {
         id: sid,
         title,
         ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
-        messages: messages.slice(-100).map((m: any) => {
+        // Full transcript — see comment in use-chat-conversations.ts
+        // saveConversation. The slice(-100) here was silently truncating
+        // long backgrounded chats on every agent_end save.
+        messages: messages.map((m: any) => {
           let content: string = m.content || "";
           if (!content && m.contentBlocks?.length) {
             content =
@@ -653,6 +731,17 @@ async function persistBackgroundSession(sid: string): Promise<void> {
 
       try {
         await saveConversationFile(conv);
+        // Mirror what use-chat-conversations.ts does on the foreground
+        // isLoading edge: clear the draft flag so the sidebar shows this
+        // chat immediately, without requiring a manual refresh. Without
+        // this, navigating away from a new chat before the assistant
+        // finishes leaves the session hidden (draft:true) in the sidebar
+        // even though the file is already on disk.
+        useChatStore.getState().actions.patch(sid, {
+          draft: false,
+          title: conv.title,
+          messageCount: conv.messages.length,
+        });
       } catch (e) {
         console.warn("[router] background save failed for", sid, e);
       }

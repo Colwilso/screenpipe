@@ -29,9 +29,23 @@ pub struct RecordingConfig {
     pub disable_audio: bool,
     pub disable_vision: bool,
     pub use_pii_removal: bool,
+    /// Async text PII redaction: runs the background reconciliation
+    /// worker over OCR / transcripts / accessibility / ui_events and
+    /// overwrites the source columns with the redacted text. Off by
+    /// default.
+    pub async_pii_redaction: bool,
+    /// Async image PII redaction: runs rfdetr_v8 on each captured
+    /// frame and blacks out detected PII regions, atomically
+    /// overwriting the source JPG. Off by default. First-run
+    /// downloads ~108 MB from huggingface.co/screenpipe/pii-image-redactor.
+    pub async_image_pii_redaction: bool,
+    /// "local" or "tinfoil" — flips both async-PII workers between
+    /// on-device ONNX and the screenpipe-hosted Tinfoil enclave.
+    /// One toggle covers both modalities; the user-facing UI is a
+    /// single radio under the AI PII removal switch.
+    pub pii_backend: String,
     /// Filter music-dominant audio before transcription using spectral analysis
     pub filter_music: bool,
-    // enable_input_capture and enable_accessibility removed — always true
 
     // Engines (typed, not strings)
     pub audio_transcription_engine: AudioTranscriptionEngine,
@@ -53,6 +67,11 @@ pub struct RecordingConfig {
     pub ignore_incognito_windows: bool,
     /// Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
     pub pause_on_drm_content: bool,
+    /// Skip clipboard capture in the UI recorder (events + content). Useful
+    /// when piping ~/.screenpipe data into a remote LLM or shipping it off
+    /// the box — passwords / api keys / private keys frequently flow
+    /// through the clipboard.
+    pub disable_clipboard_capture: bool,
     pub languages: Vec<Language>,
 
     // Cloud/auth
@@ -158,8 +177,10 @@ impl RecordingConfig {
             disable_audio: settings.disable_audio,
             disable_vision: settings.disable_vision,
             use_pii_removal: settings.use_pii_removal,
+            async_pii_redaction: settings.async_pii_redaction,
+            async_image_pii_redaction: settings.async_image_pii_redaction,
+            pii_backend: settings.pii_backend.clone(),
             filter_music: settings.filter_music,
-            // enable_input_capture / enable_accessibility removed — always true
             enable_workflow_events: settings.enable_workflow_events,
             audio_transcription_engine: engine_str
                 .parse()
@@ -178,6 +199,7 @@ impl RecordingConfig {
             ignored_urls: settings.ignored_urls.clone(),
             ignore_incognito_windows: settings.ignore_incognito_windows,
             pause_on_drm_content: settings.pause_on_drm_content,
+            disable_clipboard_capture: settings.disable_clipboard_capture,
             languages: settings
                 .languages
                 .iter()
@@ -247,6 +269,8 @@ impl RecordingConfig {
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            capture_clipboard: !self.disable_clipboard_capture,
+            capture_clipboard_content: !self.disable_clipboard_capture,
             ..Default::default()
         }
     }
@@ -295,7 +319,7 @@ impl RecordingConfig {
             ignore_incognito_windows: self.ignore_incognito_windows,
             pause_on_drm_content: self.pause_on_drm_content,
             languages: self.languages.clone(),
-            max_snapshot_width: self.max_snapshot_width,
+            video_quality: self.video_quality.clone(),
         }
     }
 }

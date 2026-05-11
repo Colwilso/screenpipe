@@ -85,7 +85,7 @@ import { Badge } from "../ui/badge";
 import { toast } from "../ui/use-toast";
 import { Card, CardContent } from "../ui/card";
 import { AIProviderType } from "@/lib/hooks/use-settings";
-import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { useTeam } from "@/lib/hooks/use-team";
 import {
   AlertDialog,
@@ -107,6 +107,11 @@ import {
   debounce,
   FieldValidationResult
 } from "@/lib/utils/validation";
+import {
+  DEFAULT_ENTERPRISE_AI_PRESET_POLICY,
+  filterPresetsForEnterprisePolicy,
+  isEnterpriseManagedPreset,
+} from "@/lib/enterprise-ai-preset-policy";
 
 // Helper to detect UUID-like strings and format preset names nicely
 const formatPresetName = (name: string): string => {
@@ -151,7 +156,7 @@ const INITIAL_DIAGNOSTICS: DiagnosticResults = {
 };
 
 export interface AIProviderCardProps {
-  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "bedrock" | "custom" | "embedded" | "screenpipe-cloud";
+  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "screenpipe-cloud";
   title: string;
   description: string;
   imageSrc: string;
@@ -244,7 +249,10 @@ const AISection = ({
   piAvailable?: boolean;
 }) => {
   const { settings, updateSettings } = useSettings();
-  const isEnterprise = useIsEnterpriseBuild();
+  const { isEnterprise, policy: enterprisePolicy } = useEnterprisePolicy();
+  const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
+  const employeePresetsAllowed =
+    !isEnterprise || aiPresetPolicy.allow_employee_custom_presets || (preset ? isEnterpriseManagedPreset(preset) : false);
   // Daily quota snapshot — drives the "N left today" chip on weighted
   // models. Null on BYOK providers; we render nothing in that case.
   const usage = useUsageStatus();
@@ -260,11 +268,17 @@ const AISection = ({
   const diagnosticsAbortRef = useRef<AbortController | null>(null);
   const [chatgptLoggedIn, setChatgptLoggedIn] = useState(false);
   const [chatgptLoading, setChatgptLoading] = useState(false);
+  const [chatgptChecking, setChatgptChecking] = useState(
+    () => settingsPreset?.provider === "openai-chatgpt"
+  );
 
   // Filter presets the same way the UI does so hidden presets don't block creation
   const visiblePresets = useMemo(
-    () => settings.aiPresets.filter((p) => !isEnterprise || p.provider !== "screenpipe-cloud"),
-    [settings.aiPresets, isEnterprise]
+    () =>
+      !isEnterprise
+        ? settings.aiPresets
+        : filterPresetsForEnterprisePolicy(settings.aiPresets, aiPresetPolicy),
+    [settings.aiPresets, isEnterprise, aiPresetPolicy]
   );
 
   // Optimized validation with debouncing
@@ -315,11 +329,21 @@ const AISection = ({
   // Check ChatGPT OAuth status when provider is selected
   useEffect(() => {
     if (settingsPreset?.provider === "openai-chatgpt") {
+      setChatgptChecking(true);
+      const timeout = setTimeout(() => setChatgptChecking(false), 5000);
       commands.chatgptOauthStatus().then((res) => {
+        clearTimeout(timeout);
         if (res.status === "ok") {
           setChatgptLoggedIn(res.data.logged_in);
         }
+        setChatgptChecking(false);
+      }).catch(() => {
+        clearTimeout(timeout);
+        setChatgptChecking(false);
       });
+      return () => clearTimeout(timeout);
+    } else {
+      setChatgptChecking(false);
     }
   }, [settingsPreset?.provider]);
 
@@ -332,6 +356,15 @@ const AISection = ({
   }, [validationErrors, settingsPreset]);
 
   const updateStoreSettings = async () => {
+    if (!employeePresetsAllowed) {
+      toast({
+        title: "Managed by your organization",
+        description: "Your admin controls which AI presets are available",
+        variant: "destructive",
+      });
+      return;
+    }
+
     if (!isFormValid) {
       toast({
         title: "Validation errors",
@@ -425,10 +458,9 @@ const AISection = ({
 
       setDialog(false);
     } catch (error) {
-      console.error("Failed to save preset:", error);
       toast({
         title: "Error saving preset",
-        description: error instanceof Error ? error.message : "Unknown error - check console for details",
+        description: "Something went wrong while saving the preset",
         variant: "destructive",
       });
     } finally {
@@ -495,6 +527,25 @@ const AISection = ({
   }, [updateSettingsPreset]);
 
   const handleAiProviderChange = useCallback((newValue: AIPreset["provider"]) => {
+    // No-op if same provider — avoids resetting UI state (e.g. chatgptChecking) unnecessarily
+    if (newValue === settingsPreset?.provider) return;
+
+    // Clear stale diagnostic results so previous provider's errors don't bleed through
+    setTestStatus("idle");
+    setTestResults(INITIAL_DIAGNOSTICS);
+    setDiagnosticsOpen(false);
+    // Reset ChatGPT auth UI — the status-check effect re-runs when provider dep changes
+    setChatgptLoggedIn(false);
+    // chatgptChecking is managed by the status-check effect, not here
+
+    const defaultNames: Record<string, string> = {
+      "openai-chatgpt": "chatgpt",
+      "openai": "openai",
+      "anthropic": "claude",
+      "native-ollama": "ollama",
+      "screenpipe-cloud": "screenpipe-cloud",
+    };
+
     let newUrl = "";
     let newModel = settingsPreset?.model;
 
@@ -510,11 +561,7 @@ const AISection = ({
         break;
       case "openai-chatgpt":
         newUrl = "https://api.openai.com/v1";
-        newModel = "gpt-5.4";
-        break;
-      case "anthropic":
-        newUrl = "";
-        newModel = "claude-sonnet-4-6";
+        newModel = "gpt-5.5";
         break;
       case "anthropic":
         newUrl = "https://api.anthropic.com";
@@ -526,69 +573,22 @@ const AISection = ({
         break;
     }
 
-    updateSettingsPreset({
-      provider: newValue,
-      url: newUrl,
-      model: newModel,
-    });
-  }, [settingsPreset?.url, settingsPreset?.model, updateSettingsPreset]);
+    const updates: Partial<AIPreset> = { provider: newValue, url: newUrl, model: newModel };
+    // Auto-fill name only when creating a new preset (no existing id)
+    if (!settingsPreset?.id && defaultNames[newValue]) {
+      updates.id = defaultNames[newValue];
+    }
+
+    updateSettingsPreset(updates);
+  }, [settingsPreset?.id, settingsPreset?.url, settingsPreset?.model, updateSettingsPreset]);
 
   const [models, setModels] = useState<AIModel[]>([]);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
-
-  const runBedrockDiagnostics = useCallback(async () => {
-    setTestStatus("testing");
-    setDiagnosticsOpen(true);
-    setTestResults({
-      endpoint: { status: "running", message: "Checking AWS profile..." },
-      auth: { status: "pending", message: "" },
-      models: { status: "pending", message: "" },
-      chat: { status: "pending", message: "" },
-    });
-
-    const profile = (settingsPreset as any)?.awsProfile || null;
-    const region = (settingsPreset as any)?.awsRegion || null;
-    const model = settingsPreset?.model || null;
-
-    const result = await commands.bedrockTestConnection(profile, region, model);
-    if (result.status === "error") {
-      setTestResults({
-        endpoint: { status: "fail", message: `Command failed: ${result.error}` },
-        auth: { status: "skip", message: "Skipped" },
-        models: { status: "skip", message: "Skipped" },
-        chat: { status: "skip", message: "Skipped" },
-      });
-      setTestStatus("done");
-      return;
-    }
-
-    const diag = result.data;
-    setTestResults({
-      endpoint: {
-        status: diag.profile_valid ? "pass" : "fail",
-        message: diag.profile_valid ? `Profile '${profile || "default"}' is valid` : (diag.error || "Profile check failed"),
-      },
-      auth: {
-        status: diag.credentials_valid ? "pass" : "fail",
-        message: diag.credentials_valid ? "AWS credentials valid" : (diag.error || "Credentials invalid"),
-      },
-      models: {
-        status: diag.credentials_valid ? "pass" : (diag.profile_valid ? "fail" : "skip"),
-        message: diag.credentials_valid ? "Bedrock API accessible" : (diag.error || "Skipped"),
-      },
-      chat: {
-        status: diag.model_accessible ? "pass" : (diag.credentials_valid && model ? "fail" : "skip"),
-        message: diag.model_accessible ? `Model '${model}' accessible` : (model ? (diag.error || "Model not accessible") : "No model selected"),
-      },
-    });
-    setTestStatus("done");
-  }, [settingsPreset]);
+  const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
+  const [modelSearch, setModelSearch] = useState("");
 
   const runDiagnostics = useCallback(async () => {
     if (settingsPreset?.provider === "screenpipe-cloud") return;
-    if (settingsPreset?.provider === "bedrock") {
-      return runBedrockDiagnostics();
-    }
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
@@ -890,7 +890,7 @@ const AISection = ({
     }
 
     setTestStatus("done");
-  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settingsPreset?.model, runBedrockDiagnostics]);
+  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settingsPreset?.model]);
 
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
@@ -1010,16 +1010,6 @@ const AISection = ({
           break;
         }
 
-        case "anthropic": {
-          // Hardcoded model list — Anthropic API models
-          setModels([
-            { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
-            { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
-            { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
-          ]);
-          break;
-        }
-
         case "openai-chatgpt": {
           // Try /v1/models with OAuth token; fall back to known models if it fails.
           let loaded = false;
@@ -1056,33 +1046,11 @@ const AISection = ({
           if (!loaded) {
             // Codex models available via ChatGPT Plus/Pro subscription
             setModels([
+              "gpt-5.5", "gpt-5.5-codex",
               "gpt-5.4", "gpt-5.3-codex",
               "gpt-5.2-codex", "gpt-5.2", "gpt-5.1-codex-max",
               "gpt-5.1", "gpt-5.1-codex-mini",
             ].map((id) => ({ id, name: id, provider: "openai-chatgpt" })));
-          }
-          break;
-        }
-
-        case "bedrock": {
-          const profile = (settingsPreset as any)?.awsProfile || null;
-          const region = (settingsPreset as any)?.awsRegion || null;
-          const result = await commands.bedrockListModels(profile, region);
-          if (result.status === "ok" && result.data.length > 0) {
-            setModels(result.data.map((m) => ({
-              id: m.id,
-              name: `${m.name} (${m.id})`,
-              provider: "bedrock",
-            })));
-          } else {
-            // Fallback to hardcoded list if AWS CLI fails
-            setModels([
-              { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5 (us.anthropic.claude-sonnet-4-5-20250929-v1:0)", provider: "bedrock" },
-              { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", name: "Claude Opus 4.5 (us.anthropic.claude-opus-4-5-20251101-v1:0)", provider: "bedrock" },
-              { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5 (us.anthropic.claude-haiku-4-5-20251001-v1:0)", provider: "bedrock" },
-              { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4 (us.anthropic.claude-sonnet-4-20250514-v1:0)", provider: "bedrock" },
-              { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4 (us.anthropic.claude-opus-4-20250514-v1:0)", provider: "bedrock" },
-            ]);
           }
           break;
         }
@@ -1144,7 +1112,7 @@ const AISection = ({
       setIsLoadingModels(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settings.user?.id, chatgptLoggedIn, (settingsPreset as any)?.awsProfile, (settingsPreset as any)?.awsRegion]);
+  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settings.user?.id, chatgptLoggedIn]);
 
   const apiKey = useMemo(() => {
     if (settingsPreset && "apiKey" in settingsPreset) {
@@ -1234,15 +1202,6 @@ const AISection = ({
           />
 
           <AIProviderCard
-            type="bedrock"
-            title="AWS Bedrock"
-            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
-            imageSrc="/images/bedrock-logo.png"
-            selected={settingsPreset?.provider === "bedrock"}
-            onClick={() => handleAiProviderChange("bedrock")}
-          />
-
-          <AIProviderCard
             type="custom"
             title="Custom"
             description="Connect to your own AI provider or self-hosted models"
@@ -1250,6 +1209,28 @@ const AISection = ({
             selected={settingsPreset?.provider === "custom"}
             onClick={() => handleAiProviderChange("custom")}
           />
+
+          <AIProviderCard
+            type="native-ollama"
+            title="Ollama"
+            description="Run AI models locally using your existing Ollama installation"
+            imageSrc="/images/ollama.png"
+            selected={settingsPreset?.provider === "native-ollama"}
+            onClick={() => handleAiProviderChange("native-ollama")}
+          />
+
+          {piAvailable && (!isEnterprise || aiPresetPolicy.allow_screenpipe_cloud) && (
+            <AIProviderCard
+              type="screenpipe-cloud"
+              title="Screenpipe Cloud"
+              description="AI coding agent powered by Screenpipe Cloud. Requires login."
+              imageSrc="/images/screenpipe.png"
+              selected={settingsPreset?.provider === "screenpipe-cloud"}
+              onClick={() => handleAiProviderChange("screenpipe-cloud")}
+              disabled={!settings.user?.token}
+              warningText={!settings.user?.token ? "Login required" : undefined}
+            />
+          )}
 
         </div>
       </div>
@@ -1264,7 +1245,6 @@ const AISection = ({
         required={true}
         spellCheck={false}
         autoCorrect="off"
-        autoCapitalize="off"
         disabled={!!preset && !isDuplicating && preset.id !== undefined}
         helperText="Only letters, numbers, spaces, hyphens, and underscores allowed"
       />
@@ -1279,51 +1259,9 @@ const AISection = ({
           placeholder="Enter custom AI URL"
           required={true}
           helperText="Enter the base URL for your custom AI provider"
-          spellCheck={false}
-          autoCorrect="off"
-          autoCapitalize="off"
         />
       )}
 
-      {settingsPreset?.provider === "bedrock" && (
-        <>
-          <div className="w-full">
-            <Label htmlFor="awsProfile">AWS Profile</Label>
-            <p className="text-xs text-muted-foreground mb-2">
-              AWS CLI profile name (from ~/.aws/config). Leave empty to use default profile.
-            </p>
-            <Input
-              id="awsProfile"
-              type="text"
-              value={(settingsPreset as any)?.awsProfile || ""}
-              onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
-              placeholder="default"
-              className="w-full"
-              spellCheck={false}
-              autoCorrect="off"
-              autoCapitalize="off"
-            />
-          </div>
-
-          <div className="w-full">
-            <Label htmlFor="awsRegion">AWS Region</Label>
-            <p className="text-xs text-muted-foreground mb-2">
-              AWS region for Bedrock (e.g., us-east-1, us-west-2).
-            </p>
-            <Input
-              id="awsRegion"
-              type="text"
-              value={(settingsPreset as any)?.awsRegion || ""}
-              onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
-              placeholder="us-east-1"
-              className="w-full"
-              spellCheck={false}
-              autoCorrect="off"
-              autoCapitalize="off"
-            />
-          </div>
-        </>
-      )}
 
       {(settingsPreset?.provider === "anthropic" || settingsPreset?.provider === "custom" || (isApiKeyRequired &&
         settingsPreset?.provider === "openai")) && (
@@ -1381,39 +1319,67 @@ const AISection = ({
               ChatGPT Account
             </Label>
             <div className="flex items-center gap-3">
-              <Button
-                type="button"
-                variant={chatgptLoggedIn ? "outline" : "default"}
-                disabled={chatgptLoading}
-                onClick={async () => {
-                  if (chatgptLoggedIn) {
-                    setChatgptLoading(true);
-                    await commands.chatgptOauthLogout();
-                    setChatgptLoggedIn(false);
-                    setChatgptLoading(false);
-                  } else {
-                    setChatgptLoading(true);
-                    try {
-                      const res = await commands.chatgptOauthLogin();
-                      if (res.status === "ok" && res.data) {
-                        setChatgptLoggedIn(true);
-                      }
-                    } catch (e) {
-                      console.error("chatgpt oauth failed:", e);
-                    }
-                    setChatgptLoading(false);
-                  }
-                }}
-              >
-                {chatgptLoading ? (
+              {chatgptChecking ? (
+                <Button type="button" variant="outline" disabled>
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                ) : chatgptLoggedIn ? (
-                  <CheckCircle2 className="h-4 w-4 mr-2" />
-                ) : null}
-                {chatgptLoggedIn ? "Sign out" : "Sign in with ChatGPT"}
-              </Button>
-              {chatgptLoggedIn && (
-                <span className="text-sm text-muted-foreground">Signed in</span>
+                  Checking connection...
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant={chatgptLoggedIn ? "outline" : "default"}
+                  disabled={chatgptLoading}
+                  onClick={async () => {
+                    if (chatgptLoggedIn) {
+                      setChatgptLoading(true);
+                      await commands.chatgptOauthLogout();
+                      setChatgptLoggedIn(false);
+                      setChatgptLoading(false);
+                    } else {
+                      setChatgptLoading(true);
+                      try {
+                        const res = await commands.chatgptOauthLogin();
+                        if (res.status === "ok" && res.data) {
+                          setChatgptLoggedIn(true);
+                          toast({
+                            title: "ChatGPT connected",
+                            description: "Click \"Create preset\" below to save and start using it.",
+                          });
+                        } else if (res.status === "error") {
+                          const msg = String(res.error || "unknown error");
+                          console.error("chatgpt oauth failed:", msg);
+                          toast({
+                            title: "ChatGPT sign-in failed",
+                            description: msg.includes("invalid_state")
+                              ? "Auth session expired — please try signing in again."
+                              : msg.includes("not logged in") || msg.includes("timed out")
+                              ? "Sign-in timed out or was cancelled. Please try again."
+                              : msg.slice(0, 120),
+                            variant: "destructive",
+                          });
+                        }
+                      } catch (e) {
+                        console.error("chatgpt oauth failed:", e);
+                        toast({
+                          title: "ChatGPT sign-in failed",
+                          description: "An unexpected error occurred. Please try again.",
+                          variant: "destructive",
+                        });
+                      }
+                      setChatgptLoading(false);
+                    }
+                  }}
+                >
+                  {chatgptLoading ? (
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  ) : chatgptLoggedIn ? (
+                    <CheckCircle2 className="h-4 w-4 mr-2" />
+                  ) : null}
+                  {chatgptLoggedIn ? "Sign out" : "Sign in with ChatGPT"}
+                </Button>
+              )}
+              {chatgptLoggedIn && !chatgptChecking && (
+                <span className="text-sm text-muted-foreground">Connected</span>
               )}
             </div>
           </div>
@@ -1426,7 +1392,18 @@ const AISection = ({
             AI Model
             <span className="text-destructive">*</span>
           </Label>
-          <Popover modal={true}>
+          <Popover
+            modal={true}
+            open={isModelPickerOpen}
+            onOpenChange={(open) => {
+              setIsModelPickerOpen(open);
+              if (open) {
+                setModelSearch(settingsPreset?.model || "");
+              } else {
+                setModelSearch("");
+              }
+            }}
+          >
             <PopoverTrigger asChild>
               <Button
                 variant="outline"
@@ -1449,26 +1426,32 @@ const AISection = ({
             </PopoverTrigger>
             <PopoverContent className="w-full p-0">
               <Command>
-                <CommandInput 
+                <CommandInput
+                  value={modelSearch}
                   placeholder="Select or type model name" 
                   onKeyDown={(e) => {
                     if (e.key === "Enter") {
-                      const input = (e.target as HTMLInputElement).value;
-                      if (input && models.every(m => m.id !== input)) {
+                      const input = modelSearch.trim();
+                      if (!input) return;
+                      const exactModel = models.find((m) => m.id === input);
+                      if (exactModel) {
+                        updateSettingsPreset({ model: exactModel.id });
+                        setIsModelPickerOpen(false);
+                        return;
+                      }
+                      if (models.every(m => m.id !== input)) {
                         updateSettingsPreset({ model: input });
+                        setIsModelPickerOpen(false);
                       }
                     }
                   }}
                   onValueChange={(value) => {
-                    // Allow typing a custom model name
-                    if (value && models.every(m => m.id !== value)) {
-                      updateSettingsPreset({ model: value });
-                    }
+                    setModelSearch(value);
                   }}
                 />
                 <CommandList>
                   <CommandEmpty>
-                    Press enter to use &quot;{settingsPreset?.model}&quot;
+                    Press enter to use &quot;{modelSearch || settingsPreset?.model}&quot;
                   </CommandEmpty>
                   {isLoadingModels ? (
                     <CommandGroup>
@@ -1485,7 +1468,10 @@ const AISection = ({
                             <CommandItem
                               key={model.id}
                               value={model.id}
-                              onSelect={() => updateSettingsPreset({ model: model.id })}
+                              onSelect={() => {
+                                updateSettingsPreset({ model: model.id });
+                                setIsModelPickerOpen(false);
+                              }}
                             >
                               <div className="flex flex-col gap-0.5 w-full">
                                 <div className="flex items-center justify-between">
@@ -1527,6 +1513,7 @@ const AISection = ({
                                 return;
                               }
                               updateSettingsPreset({ model: model.id });
+                              setIsModelPickerOpen(false);
                             }}
                           >
                             <div className="flex flex-col gap-0.5 w-full">
@@ -1799,20 +1786,37 @@ const AISection = ({
         >
           Cancel
         </Button>
-        <Button 
-          onClick={updateStoreSettings} 
-          disabled={isLoading || !isFormValid}
-          className="flex items-center gap-2"
-        >
-          {isLoading ? (
-            <Loader2 className="w-4 h-4 animate-spin" />
-          ) : isFormValid ? (
-            <CheckCircle2 className="w-4 h-4" />
-          ) : (
-            <AlertCircle className="w-4 h-4" />
-          )}
-          {preset ? "Update preset" : "Create preset"}
-        </Button>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span>
+                <Button
+                  onClick={updateStoreSettings}
+                  disabled={isLoading || !isFormValid}
+                  className="flex items-center gap-2"
+                >
+                  {isLoading ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : isFormValid ? (
+                    <CheckCircle2 className="w-4 h-4" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4" />
+                  )}
+                  {preset ? "Update preset" : "Create preset"}
+                </Button>
+              </span>
+            </TooltipTrigger>
+            {!isFormValid && !isLoading && (
+              <TooltipContent>
+                {!settingsPreset?.id
+                  ? "Enter a preset name to continue"
+                  : !settingsPreset?.model
+                  ? "Select a model to continue"
+                  : "Fix validation errors to continue"}
+              </TooltipContent>
+            )}
+          </Tooltip>
+        </TooltipProvider>
       </div>
     </div>
   );
@@ -1823,7 +1827,6 @@ const providerImageSrc: Record<string, string> = {
   "openai-chatgpt": "/images/openai.png",
   anthropic: "/images/claude-ai.svg",
   "native-ollama": "/images/ollama.png",
-  bedrock: "/images/bedrock-logo.png",
   custom: "/images/custom.png",
   pi: "/images/screenpipe.png",
   screenpipe: "/images/screenpipe.png",
@@ -1842,6 +1845,8 @@ function SortablePresetCard({
   onShareToTeam,
   isLoading,
   isTeamAdmin,
+  readOnly = false,
+  defaultLocked = false,
 }: {
   preset: AIPreset;
   isDefault: boolean;
@@ -1853,6 +1858,8 @@ function SortablePresetCard({
   onShareToTeam?: () => void;
   isLoading: boolean;
   isTeamAdmin?: boolean;
+  readOnly?: boolean;
+  defaultLocked?: boolean;
 }) {
   const {
     attributes,
@@ -1861,7 +1868,7 @@ function SortablePresetCard({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: preset.id });
+  } = useSortable({ id: preset.id, disabled: readOnly });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -1875,11 +1882,12 @@ function SortablePresetCard({
       ref={setNodeRef}
       style={style}
       className={cn(
-        "p-3 relative group transition-all hover:shadow-md border-border bg-card cursor-pointer",
+        "p-3 relative group transition-all hover:shadow-md border-border bg-card",
+        readOnly ? "cursor-default" : "cursor-pointer",
         isDefault && "ring-2 ring-primary/20",
         isDragging && "shadow-lg"
       )}
-      onClick={onEdit}
+      onClick={readOnly ? undefined : onEdit}
     >
       <div className="space-y-2">
         <div className="flex justify-between items-center">
@@ -1906,6 +1914,11 @@ function SortablePresetCard({
                 default
               </Badge>
             )}
+            {readOnly && (
+              <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                managed
+              </Badge>
+            )}
             {!hasValidation && (
               <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
             )}
@@ -1922,13 +1935,13 @@ function SortablePresetCard({
           </span>
         </div>
         <div className="flex items-center gap-0.5 pt-1.5 border-t border-border">
-          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onDuplicate(); }} disabled={isLoading}>
+          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onDuplicate(); }} disabled={isLoading || readOnly}>
             <Copy className="w-3 h-3 mr-1" />duplicate
           </Button>
-          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onSetDefault(); }} disabled={isLoading || isDefault}>
+          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onSetDefault(); }} disabled={isLoading || isDefault || defaultLocked}>
             <Star className="w-3 h-3 mr-1" />{isDefault ? "default" : "set default"}
           </Button>
-          {isTeamAdmin && onShareToTeam && (
+          {isTeamAdmin && onShareToTeam && !readOnly && (
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -1940,7 +1953,7 @@ function SortablePresetCard({
               </Tooltip>
             </TooltipProvider>
           )}
-          {!isDefault && (
+          {!isDefault && !readOnly && (
             <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2 text-destructive hover:text-destructive ml-auto" onClick={(e) => { e.stopPropagation(); onDelete(); }} disabled={isLoading}>
               <Trash2 className="w-3 h-3" />
             </Button>
@@ -1961,7 +1974,16 @@ export const AIPresets = () => {
     null
   );
   const [isDuplicating, setIsDuplicating] = useState(false);
-  const isEnterprise = useIsEnterpriseBuild();
+  const { isEnterprise, policy: enterprisePolicy } = useEnterprisePolicy();
+  const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
+  const visiblePresets = useMemo(
+    () =>
+      !isEnterprise
+        ? settings.aiPresets
+        : filterPresetsForEnterprisePolicy(settings.aiPresets, aiPresetPolicy),
+    [settings.aiPresets, isEnterprise, aiPresetPolicy]
+  );
+  const canManageEmployeePresets = !isEnterprise || aiPresetPolicy.allow_employee_custom_presets;
   const [piAvailable, setPiAvailable] = useState(false);
   const team = useTeam();
   const isTeamAdmin = !!team.team && team.role === "admin";
@@ -2005,13 +2027,17 @@ export const AIPresets = () => {
         setPiAvailable(true);
       }
     };
+    if (isEnterprise) {
+      setPiAvailable(aiPresetPolicy.allow_screenpipe_cloud);
+      return;
+    }
     if (!isEnterprise) {
       checkPi();
     }
     // Re-check periodically in case background install finishes
     const interval = isEnterprise ? null : setInterval(checkPi, 5000);
     return () => { if (interval) clearInterval(interval); };
-  }, [isEnterprise]);
+  }, [isEnterprise, aiPresetPolicy.allow_screenpipe_cloud]);
 
   useEffect(() => {
     if (!createPresetsDialog) {
@@ -2035,6 +2061,17 @@ export const AIPresets = () => {
     try {
       // Prevent deletion of screenpipe-cloud preset for Pro subscribers
       const presetToRemove = settings.aiPresets.find((preset) => preset.id === id);
+      if (
+        isEnterprise &&
+        ((presetToRemove && isEnterpriseManagedPreset(presetToRemove)) || !aiPresetPolicy.allow_employee_custom_presets)
+      ) {
+        toast({
+          title: "Managed by your organization",
+          description: "Your admin controls which AI presets are available",
+          variant: "destructive",
+        });
+        return;
+      }
       if (presetToRemove?.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
         toast({
           title: "Cannot delete cloud preset",
@@ -2097,6 +2134,15 @@ export const AIPresets = () => {
   const setDefaultPreset = async (id: string) => {
     setIsLoading(true);
     try {
+      if (isEnterprise && aiPresetPolicy.lock_default_preset) {
+        toast({
+          title: "Default preset is locked",
+          description: "Your admin controls the default AI preset",
+          variant: "destructive",
+        });
+        return;
+      }
+
       const selectedPreset = settings.aiPresets.find((p) => p.id === id);
       if (!selectedPreset) return;
 
@@ -2138,6 +2184,17 @@ export const AIPresets = () => {
   const duplicatePreset = async (id: string) => {
     const presetToDuplicate = settings.aiPresets.find((p) => p.id === id);
     if (!presetToDuplicate) return;
+    if (
+      isEnterprise &&
+      (isEnterpriseManagedPreset(presetToDuplicate) || !aiPresetPolicy.allow_employee_custom_presets)
+    ) {
+      toast({
+        title: "Managed by your organization",
+        description: "Your admin controls which AI presets are available",
+        variant: "destructive",
+      });
+      return;
+    }
 
     // Find a unique name by appending a number
     const baseName = presetToDuplicate.id.replace(/ \d+$/, "");
@@ -2159,7 +2216,7 @@ export const AIPresets = () => {
     setCreatePresentDialog(true);
   };
 
-  if (!settings.aiPresets?.length) {
+  if (!visiblePresets.length) {
     return (
       <div className="space-y-5">
         <p className="text-muted-foreground text-sm mb-4">
@@ -2172,13 +2229,16 @@ export const AIPresets = () => {
             No AI presets yet
           </h2>
           <p className="text-sm text-muted-foreground text-center max-w-md">
-            Create your first AI preset to get started with intelligent features.
-            Presets allow you to quickly switch between different AI configurations.
+            {canManageEmployeePresets
+              ? "Create your first AI preset to get started with intelligent features. Presets allow you to quickly switch between different AI configurations."
+              : "Your organization has not made any AI presets available on this device."}
           </p>
-          <Button onClick={() => setCreatePresentDialog(true)} size="lg">
-            <Plus className="w-4 h-4 mr-2" />
-            Create Your First Preset
-          </Button>
+          {canManageEmployeePresets && (
+            <Button onClick={() => setCreatePresentDialog(true)} size="lg">
+              <Plus className="w-4 h-4 mr-2" />
+              Create Your First Preset
+            </Button>
+          )}
         </div>
       </div>
     );
@@ -2193,7 +2253,7 @@ export const AIPresets = () => {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Badge variant="outline" className="px-3 py-1">
-            {settings.aiPresets.length} preset{settings.aiPresets.length !== 1 ? 's' : ''}
+            {visiblePresets.length} preset{visiblePresets.length !== 1 ? 's' : ''}
           </Badge>
           {settings.aiPresets.some(p => p.defaultPreset) && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -2202,37 +2262,46 @@ export const AIPresets = () => {
             </div>
           )}
         </div>
-        <Button onClick={() => setCreatePresentDialog(true)}>
-          <Plus className="w-4 h-4 mr-2" />
-          Create Preset
-        </Button>
+        {canManageEmployeePresets && (
+          <Button onClick={() => setCreatePresentDialog(true)}>
+            <Plus className="w-4 h-4 mr-2" />
+            Create Preset
+          </Button>
+        )}
       </div>
 
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
         <SortableContext
-          items={settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "screenpipe-cloud").map((p) => p.id)}
+          items={visiblePresets.map((p) => p.id)}
           strategy={rectSortingStrategy}
         >
           <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-3">
-            {settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "screenpipe-cloud").map((preset) => (
-              <SortablePresetCard
-                key={preset.id}
-                preset={preset}
-                isDefault={preset.defaultPreset}
-                hasValidation={!!(preset.provider && preset.model && (preset.url || preset.provider === "bedrock" || preset.provider === "screenpipe-cloud"))}
-                onEdit={() => {
-                  setSelectedPreset(preset);
-                  setIsDuplicating(false);
-                  setCreatePresentDialog(true);
-                }}
-                onDuplicate={() => duplicatePreset(preset.id)}
-                onSetDefault={() => setPresetToSetDefault(preset.id)}
-                onDelete={() => setPresetToDelete(preset.id)}
-                onShareToTeam={isTeamAdmin ? () => sharePresetToTeam(preset) : undefined}
-                isLoading={isLoading}
-                isTeamAdmin={isTeamAdmin}
-              />
-            ))}
+            {visiblePresets.map((preset) => {
+              const readOnly =
+                isEnterprise &&
+                (!aiPresetPolicy.allow_employee_custom_presets || isEnterpriseManagedPreset(preset));
+              return (
+                <SortablePresetCard
+                  key={preset.id}
+                  preset={preset}
+                  isDefault={preset.defaultPreset}
+                  hasValidation={!!(preset.provider && preset.model && (preset.url || preset.provider === "screenpipe-cloud" || preset.provider === "openai-chatgpt"))}
+                  onEdit={() => {
+                    setSelectedPreset(preset);
+                    setIsDuplicating(false);
+                    setCreatePresentDialog(true);
+                  }}
+                  onDuplicate={() => duplicatePreset(preset.id)}
+                  onSetDefault={() => setPresetToSetDefault(preset.id)}
+                  onDelete={() => setPresetToDelete(preset.id)}
+                  onShareToTeam={isTeamAdmin ? () => sharePresetToTeam(preset) : undefined}
+                  isLoading={isLoading}
+                  isTeamAdmin={isTeamAdmin}
+                  readOnly={readOnly}
+                  defaultLocked={isEnterprise && aiPresetPolicy.lock_default_preset}
+                />
+              );
+            })}
           </div>
         </SortableContext>
       </DndContext>

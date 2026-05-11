@@ -153,9 +153,9 @@
     --info-foreground: 0 0% 0%;
     --info-muted: 0 0% 15%;
 
-    /* Muted colors */
+    /* Muted colors — brightened for vibrancy/translucent sidebar */
     --muted: 0 0% 14%;
-    --muted-foreground: 0 0% 60%; /* #999999 */
+    --muted-foreground: 0 0% 75%; /* Brightened from 60% for vibrancy contrast */
 
     /* Accent colors */
     --accent: 0 0% 14%;
@@ -215,7 +215,7 @@
   }
 
   /* When translucent sidebar is enabled on macOS, the OS handles the background */
-  html.macos-vibrancy, 
+  html.macos-vibrancy,
   body.macos-vibrancy {
     background-color: transparent !important;
   }
@@ -366,12 +366,60 @@
 
   /* Vibrant sidebar theme — Minimal macOS backdrop */
   .vibrant-sidebar {
-    /* CRITICAL FIX for macOS WKWebView backdrop-filter flicker */
-    background-color: rgba(0, 0, 0, 0.08) !important;
+    /* Light mode: subtle light overlay on translucent background */
+    background-color: rgba(255, 255, 255, 0.08) !important;
     border-color: transparent;
   }
+  .light .vibrant-sidebar {
+    background-color: rgba(255, 255, 255, 0.08) !important;
+  }
   .dark .vibrant-sidebar {
+    /* Dark mode: subtle bright overlay on translucent background */
     background-color: rgba(255, 255, 255, 0.06) !important;
+  }
+
+  /* System light mode fallback — covers the gap before JS applies .light class */
+  @media (prefers-color-scheme: light) {
+    html:not(.dark) .vibrant-sidebar {
+      background-color: rgba(255, 255, 255, 0.08) !important;
+    }
+    html:not(.dark) .vibrant-sidebar-fg {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-sidebar-fg-muted {
+      color: hsl(0 0% 40%) !important;
+    }
+    html:not(.dark) .vibrant-nav-active {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-nav-hover:hover {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-nav-item {
+      color: hsl(0 0% 40%) !important;
+    }
+    html:not(.dark) .vibrant-nav-item:hover {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-nav-item:hover .vibrant-sidebar-fg-muted {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-heading {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-card-border {
+      border-color: hsl(0 0% 0% / 0.1) !important;
+    }
+    html:not(.dark) .vibrant-btn-border {
+      border-color: hsl(0 0% 0% / 0.2) !important;
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-btn-border:hover {
+      color: hsl(0 0% 0% / 0.8) !important;
+    }
+    html:not(.dark) .vibrant-sidebar-border {
+      border-color: hsl(0 0% 0% / 0.08) !important;
+    }
   }
 
   /* System dark mode fallback — covers the gap before JS applies .dark class.
@@ -386,7 +434,7 @@
       color: hsl(0 0% 100%) !important;
     }
     html:not(.light) .vibrant-sidebar-fg-muted {
-      color: hsl(0 0% 60%) !important;
+      color: hsl(0 0% 75%) !important;
     }
     html:not(.light) .vibrant-nav-active {
       color: hsl(0 0% 100%) !important;
@@ -395,7 +443,7 @@
       color: hsl(0 0% 100%) !important;
     }
     html:not(.light) .vibrant-nav-item {
-      color: hsl(0 0% 60%) !important;
+      color: hsl(0 0% 80%) !important;
     }
     html:not(.light) .vibrant-nav-item:hover {
       color: hsl(0 0% 100%) !important;
@@ -563,3 +611,13 @@
   color: hsl(var(--muted-foreground)) !important;
 }
 
+
+/* TipTap — show placeholder only on the first empty paragraph of an empty doc.
+   Mirrors the muted-foreground/40 styling we use on native textareas. */
+.ProseMirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: hsl(var(--muted-foreground) / 0.4);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}

@@ -20,19 +20,26 @@ import {
   Search,
   Sparkles,
   Phone,
-  X,
+  Plug,
+  NotebookPen,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
-import { useChatStore, getOrCreateEmptyChatId } from "@/lib/stores/chat-store";
+import { useChatStore } from "@/lib/stores/chat-store";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
 import { AppSidebar, SidebarProvider, useSidebarContext } from "@/components/app-sidebar";
 import { usePlatform } from "@/lib/hooks/use-platform";
+import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 import { FeedbackSection } from "@/components/settings/feedback-section";
 import { PipeStoreView } from "@/components/pipe-store";
 import { MemoriesSection } from "@/components/settings/memories-section";
+import { ConnectionsSection } from "@/components/settings/connections-section";
+import { MeetingNotesSection } from "@/components/meeting-notes";
 import { StandaloneChat } from "@/components/standalone-chat";
-import { ChatSidebar } from "@/components/chat-sidebar";
+import {
+  ChatSidebar,
+  CollapsedChatSidebarButton,
+} from "@/components/chat-sidebar";
 import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
 import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
 import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
@@ -48,9 +55,9 @@ import { useTeam } from "@/lib/hooks/use-team";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
-import { computeMeetingActive, type MeetingRow } from "@/lib/utils/meeting-state";
+import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/meeting-state";
 import { useRouter } from "next/navigation";
-import { localFetch } from "@/lib/api";
+import { appendAuthToken, ensureApiReady, getApiBaseUrl, localFetch } from "@/lib/api";
 import {
   Tooltip,
   TooltipContent,
@@ -58,24 +65,28 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
-type MainSection = "home" | "timeline" | "memories" | "pipes" | "activity" | "help";
+type MainSection = "home" | "timeline" | "memories" | "pipes" | "activity" | "connections" | "meetings" | "help";
 
 // All valid URL sections for the home page
 const ALL_SECTIONS = [
-  "home", "timeline", "pipes", "help", "memories", "activity",
+  "home", "timeline", "pipes", "help", "memories", "activity", "connections", "meetings",
   "feedback", // backwards compat → maps to "help"
 ];
 
 // Settings sections that should redirect to /settings
 const SETTINGS_SECTIONS = new Set<string>([
   "account", "recording", "ai", "general", "display", "shortcuts", "notifications",
-  "connections", "privacy", "storage", "meetings", "team", "referral", "usage", "speakers",
+  "privacy", "storage", "team", "referral", "usage", "speakers",
   "disk-usage", "cloud-archive", "cloud-sync", // backwards compat → maps to "storage"
 ]);
 
 function HomeContent() {
   const router = useRouter();
   const { isMac } = usePlatform();
+  // In fullscreen, macOS hides the traffic lights — collapse the
+  // reservation that keeps the top-left action icons clear of them.
+  const isFullscreen = useIsFullscreen();
+  const reserveTrafficLights = isMac && !isFullscreen;
   const [activeSection, setActiveSection] = useQueryState("section", {
     defaultValue: "home",
     parse: (value) => {
@@ -91,6 +102,11 @@ function HomeContent() {
   const { isTranslucent } = useSidebarContext();
   const teamState = useTeam();
   const { isSectionHidden, isSettingLocked, needsLicenseKey, submitLicenseKey } = useEnterprisePolicy();
+  const selectChatConversation = useCallback((id: string) => {
+    setActiveSection("home");
+    useChatStore.getState().actions.setCurrent(id);
+    void emit("chat-load-conversation", { conversationId: id });
+  }, [setActiveSection]);
 
   // Redirect settings sections to the standalone settings page
   useEffect(() => {
@@ -155,16 +171,19 @@ function HomeContent() {
   }, [setActiveSection]);
 
   // Clear the sidebar's "current" highlight when leaving the chat
-  // view; restore it from panelSessionId when coming back. The chat
-  // panel stays mounted (display:none) and keeps streaming, but
-  // visually the row shouldn't look "selected" while the user is
-  // looking at Pipes/Memories/etc.
+  // view. The chat panel stays mounted (display:none) and keeps streaming.
+  //
+  // Do NOT setCurrent(panelSessionId) when entering home — that ran
+  // after the same click as "New chat" / chat-load-conversation and
+  // overwrote the freshly chosen id with the stale foreground id,
+  // so the sidebar jumped to an old row (felt like cycling recents)
+  // instead of the blank session the user just asked for. Highlight
+  // sync on home is handled by: row clicks + emit, chat-current-session
+  // from StandaloneChat when conversationId updates, and the New chat
+  // handler below (setCurrent before emit).
   useEffect(() => {
     const { actions } = useChatStore.getState();
-    if (activeSection === "home") {
-      const panelId = useChatStore.getState().panelSessionId;
-      if (panelId) actions.setCurrent(panelId);
-    } else {
+    if (activeSection !== "home") {
       actions.setCurrent(null);
     }
   }, [activeSection]);
@@ -186,6 +205,37 @@ function HomeContent() {
       return next;
     });
   }, []);
+
+  // Ephemeral collapse for focused workflows (e.g. taking notes during
+  // a meeting). Captures the user's prior sidebar state on enter and
+  // restores it on exit — never persisted to localStorage.
+  //
+  // Stable identity (no deps) so this callback doesn't re-fire the
+  // child's notify-effect every time `sidebarCollapsed` flips. The prior
+  // version had `[sidebarCollapsed]` in its deps, which meant: user
+  // hits Cmd+B in focused-meeting mode → setSidebarCollapsed(false) →
+  // callback recreated → child's "notify on selectedId/onFocusModeChange"
+  // effect re-ran with selectedId still set → setSidebarCollapsed(true).
+  // Net effect: the sidebar slammed shut every time the user tried to
+  // open it during a meeting.
+  const sidebarPrevCollapsedRef = useRef<boolean | null>(null);
+  const sidebarCollapsedRef = useRef(sidebarCollapsed);
+  useEffect(() => { sidebarCollapsedRef.current = sidebarCollapsed; }, [sidebarCollapsed]);
+  const handleMeetingFocusModeChange = useCallback(
+    (focused: boolean) => {
+      if (focused) {
+        if (sidebarPrevCollapsedRef.current === null) {
+          sidebarPrevCollapsedRef.current = sidebarCollapsedRef.current;
+        }
+        setSidebarCollapsed(true);
+      } else if (sidebarPrevCollapsedRef.current !== null) {
+        const prev = sidebarPrevCollapsedRef.current;
+        sidebarPrevCollapsedRef.current = null;
+        setSidebarCollapsed(prev);
+      }
+    },
+    [],
+  );
 
   // Cmd+B / Ctrl+B to toggle sidebar
   useEffect(() => {
@@ -256,11 +306,17 @@ function HomeContent() {
   }, [settings.monitorIds, settings.useAllMonitors]);
 
   // Active meeting state — lights up the phone icon for ANY active meeting
-  // (manual OR auto-detected: Teams, Zoom, etc.). manualActive is true only
-  // when the user can stop it via the icon click.
-  const [meetingState, setMeetingState] = useState<{ active: boolean; manualActive: boolean }>(
-    { active: false, manualActive: false },
-  );
+  // (manual OR auto-detected: Teams, Zoom, etc.).
+  const [meetingState, setMeetingState] = useState<MeetingStatusResponse & {
+    manualActive: boolean;
+  }>({
+    active: false,
+    manualActive: false,
+    activeMeetingId: null,
+    stoppableMeetingId: null,
+    meetingApp: null,
+    detectionSource: null,
+  });
   const [meetingLoading, setMeetingLoading] = useState(false);
 
   // Timestamp when user clicked start, used for a 10s grace period so a
@@ -268,44 +324,100 @@ function HomeContent() {
   const manualMeetingStartedAt = useRef<number>(0);
   useEffect(() => {
     let cancelled = false;
-    const check = () => {
-      localFetch("/meetings?limit=5")
-        .then((r) => r.ok ? r.json() : [])
-        .then((meetings: MeetingRow[]) => {
+    let ws: WebSocket | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let backoffMs = 1000;
+
+    const connect = () => {
+      void (async () => {
+        try {
+          await ensureApiReady();
           if (cancelled) return;
-          setMeetingState(
-            computeMeetingActive(meetings, manualMeetingStartedAt.current),
-          );
-        })
-        .catch(() => {});
+          const wsBase = getApiBaseUrl().replace("http://", "ws://");
+          ws = new WebSocket(appendAuthToken(`${wsBase}/ws/meeting-status`));
+          ws.onopen = () => {
+            backoffMs = 1000;
+          };
+          ws.onmessage = (event) => {
+            try {
+              const parsed = JSON.parse(event.data) as MeetingStatusResponse;
+              if (cancelled) return;
+              setMeetingState(
+                computeMeetingActive(parsed, manualMeetingStartedAt.current),
+              );
+            } catch {
+              // ignore malformed event payloads
+            }
+          };
+          ws.onclose = (event) => {
+            if (cancelled || event.code === 1000) return;
+            retry = setTimeout(connect, backoffMs);
+            backoffMs = Math.min(backoffMs * 2, 10000);
+          };
+          ws.onerror = () => {
+            ws?.close();
+          };
+        } catch {
+          if (cancelled) return;
+          retry = setTimeout(connect, backoffMs);
+          backoffMs = Math.min(backoffMs * 2, 10000);
+        }
+      })();
     };
-    check();
-    const interval = setInterval(check, 5000);
-    return () => { cancelled = true; clearInterval(interval); };
+
+    connect();
+    return () => {
+      cancelled = true;
+      if (retry) clearTimeout(retry);
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close(1000, "unmount");
+      }
+    };
   }, []);
 
-  const toggleMeeting = useCallback(async () => {
+  const toggleMeeting = useCallback(async (seed?: { title?: string; attendees?: string }) => {
     setMeetingLoading(true);
     try {
-      if (meetingState.manualActive) {
-        // Stop the manual meeting we previously started
-        await localFetch("/meetings/stop", { method: "POST" });
-        manualMeetingStartedAt.current = 0;
-        setMeetingState({ active: false, manualActive: false });
-      } else if (meetingState.active) {
-        // Auto-detected meeting in progress — icon is a passive indicator,
-        // user can't stop someone else's Teams/Zoom call from here
-        return;
+      if (meetingState.active) {
+        // Stop the currently active meeting, whether manual or auto-detected.
+        const targetId = meetingState.stoppableMeetingId;
+        const res = await localFetch("/meetings/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: targetId }),
+        });
+        if (res.ok) {
+          manualMeetingStartedAt.current = 0;
+          setMeetingState({
+            active: false,
+            manualActive: false,
+            activeMeetingId: null,
+            stoppableMeetingId: null,
+            meetingApp: null,
+            detectionSource: null,
+          });
+        }
       } else {
-        // No meeting active — start a manual one
+        // No meeting active — start a manual one (optionally seeded from a
+        // calendar event when the caller has it).
+        const body: Record<string, string> = { app: "manual" };
+        if (seed?.title) body.title = seed.title;
+        if (seed?.attendees) body.attendees = seed.attendees;
         const res = await localFetch("/meetings/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ app: "manual" }),
+          body: JSON.stringify(body),
         });
         if (res.ok) {
           manualMeetingStartedAt.current = Date.now();
-          setMeetingState({ active: true, manualActive: true });
+          setMeetingState({
+            active: true,
+            manualActive: true,
+            activeMeetingId: null,
+            stoppableMeetingId: null,
+            meetingApp: "manual",
+            detectionSource: "manual",
+          });
         }
       }
     } catch (e) {
@@ -315,14 +427,41 @@ function HomeContent() {
     }
   }, [meetingState]);
 
-  // Native overlay: toggle meeting when user clicks phone icon in Swift overlay
+  // Native overlay already toggles the meeting in Rust. Refresh local state
+  // here instead of toggling again, otherwise one click can create or stop
+  // two meetings depending on which UI surfaces are mounted.
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    listen("native-shortcut-toggle-meeting", () => {
-      toggleMeeting();
+    listen<MeetingStatusResponse>("native-shortcut-toggle-meeting", (event) => {
+      const payload = event.payload;
+      if (typeof payload?.active === "boolean") {
+        if (payload.active) {
+          manualMeetingStartedAt.current = Date.now();
+        } else {
+          manualMeetingStartedAt.current = 0;
+        }
+        setMeetingState({
+          active: payload.active,
+          manualActive: payload.manualActive ?? false,
+          activeMeetingId: payload.activeMeetingId ?? null,
+          stoppableMeetingId: payload.stoppableMeetingId ?? payload.activeMeetingId ?? null,
+          meetingApp: payload.meetingApp ?? null,
+          detectionSource: payload.detectionSource ?? null,
+        });
+        return;
+      }
+      void (async () => {
+        try {
+          const res = await localFetch("/meetings/status");
+          const status = res.ok ? await res.json() as MeetingStatusResponse : null;
+          setMeetingState(computeMeetingActive(status, manualMeetingStartedAt.current));
+        } catch {
+          // ignore sync failures; websocket remains source of truth
+        }
+      })();
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };
-  }, [toggleMeeting]);
+  }, []);
 
   // Watch pipe: navigate to chat when user clicks "watch" on a running pipe
   useEffect(() => {
@@ -341,11 +480,17 @@ function HomeContent() {
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
-      openSettings(detail?.section ?? "general");
+      const section = detail?.section ?? "general";
+      // connections is a top-level main-sidebar section now, not in settings
+      if (section === "connections") {
+        setActiveSection("connections");
+        return;
+      }
+      openSettings(section);
     };
     window.addEventListener("open-settings", handler);
     return () => window.removeEventListener("open-settings", handler);
-  }, [openSettings]);
+  }, [openSettings, setActiveSection]);
 
   const renderMainSection = () => {
     if (isSectionHidden(activeSection) && activeSection !== "help") {
@@ -370,6 +515,17 @@ function HomeContent() {
         return <PipeStoreView />;
       case "activity":
         return <ActivityDashboard />;
+      case "connections":
+        return <ConnectionsSection />;
+      case "meetings":
+        return (
+          <MeetingNotesSection
+            meetingState={meetingState}
+            meetingLoading={meetingLoading}
+            onToggleMeeting={toggleMeeting}
+            onFocusModeChange={handleMeetingFocusModeChange}
+          />
+        );
       case "help":
         return <FeedbackSection />;
       default:
@@ -385,13 +541,14 @@ function HomeContent() {
   // Top-level nav items (filtered by enterprise policy)
   const mainSections = [
     // The first nav item doubles as "go to chat view + start a fresh
-    // conversation". Replaces the old "Home" + the "+" inside the chat
-    // sidebar (single, obvious entry point). The click handler below
-    // both switches the active section AND spins up a new chat session.
+    // conversation". Each click allocates a new session id (empty
+    // rows are not reused — that felt like opening an old recent).
     { id: "home", label: "New chat", icon: <Plus className="h-3.5 w-3.5" /> },
     { id: "pipes", label: "Pipes", icon: <Workflow className="h-3.5 w-3.5" /> },
     { id: "timeline", label: "Timeline", icon: <Clock className="h-3.5 w-3.5" /> },
+    { id: "meetings", label: "Meeting notes", icon: <NotebookPen className="h-3.5 w-3.5" /> },
     { id: "memories", label: "Memories", icon: <Sparkles className="h-3.5 w-3.5" /> },
+    { id: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
   ].filter((s) => !isSectionHidden(s.id));
 
   // Listen for navigation events from other windows (e.g. tray, Rust-side links)
@@ -412,7 +569,10 @@ function HomeContent() {
     return () => { unlisten.then((fn) => fn()); };
   }, [setActiveSection, router]);
 
-  const isFullHeight = activeSection === "home" || activeSection === "timeline";
+  const isFullHeight =
+    activeSection === "home" ||
+    activeSection === "timeline" ||
+    activeSection === "meetings";
 
   return (
     <div className={cn("bg-transparent", isFullHeight ? "h-screen overflow-hidden" : "min-h-screen")} data-testid="home-page">
@@ -441,7 +601,7 @@ function HomeContent() {
                       // top-1 + p-1 puts the 14px icon's center at y≈15px, matching the
                       // vertical center of the macOS traffic lights (which sit at y≈14).
                       "fixed top-1 z-20 p-1 rounded-md transition-colors",
-                      isMac ? "left-[78px]" : "left-2",
+                      reserveTrafficLights ? "left-[78px]" : "left-2",
                       isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
                     )}
                   >
@@ -463,7 +623,7 @@ function HomeContent() {
                     className={cn(
                       "fixed top-1 z-20 p-1 rounded-md transition-colors",
                       // 28px right of the collapse icon (icon 16 + gap 8 + small breathing).
-                      isMac ? "left-[110px]" : "left-9",
+                      reserveTrafficLights ? "left-[110px]" : "left-9",
                       isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
                     )}
                   >
@@ -555,8 +715,8 @@ function HomeContent() {
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <button
-                          onClick={toggleMeeting}
-                          disabled={meetingLoading || (meetingState.active && !meetingState.manualActive)}
+                          onClick={() => toggleMeeting()}
+                          disabled={meetingLoading}
                           className={cn(
                             "relative flex items-center justify-center h-5 w-5 rounded transition-colors",
                             isTranslucent ? "vibrant-nav-item hover:bg-white/10" : "text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -565,11 +725,11 @@ function HomeContent() {
                           {meetingState.active && (
                             <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
                           )}
-                          <Phone className="h-3 w-3" />
+                          <Phone className={cn("h-3 w-3", isTranslucent ? "vibrant-sidebar-fg" : "text-muted-foreground")} />
                         </button>
                       </TooltipTrigger>
-                      <TooltipContent side="bottom" className="text-xs">
-                        {meetingState.manualActive ? "stop meeting" : meetingState.active ? "meeting detected" : "start meeting"}
+                      <TooltipContent side="top" className="text-xs">
+                        {meetingState.active ? "stop meeting" : "start meeting"}
                       </TooltipContent>
                     </Tooltip>
                   </div>
@@ -656,30 +816,32 @@ function HomeContent() {
                       onClick={() => {
                         setActiveSection(section.id);
                         // The "home" slot is the New Chat affordance —
-                        // clicking it (from any view) spawns a fresh
-                        // chat session and switches to it. Mirrors the
-                        // sidebar's "+ new chat" behaviour exactly so
-                        // the two entry points stay in sync.
+                        // clicking it (from any view) always spawns a
+                        // new chat session and switches to it.
                         if (section.id === "home") {
-                          // Reuse an existing empty chat if there is one;
-                          // otherwise create. Mirrors the sidebar's
-                          // "+ new chat" handler so spamming the nav
-                          // doesn't pile up empty rows.
-                          const { id, isNew } = getOrCreateEmptyChatId();
+                          // Always start a brand-new session. Reusing an
+                          // empty row (getOrCreateEmptyChatId) felt like
+                          // "nothing happened" / jumping to an old blank
+                          // row in recents instead of a fresh compose view.
+                          const id = crypto.randomUUID();
                           const store = useChatStore.getState();
-                          if (isNew) {
-                            store.actions.upsert({
-                              id,
-                              title: "new chat",
-                              preview: "",
-                              status: "idle",
-                              messageCount: 0,
-                              createdAt: Date.now(),
-                              updatedAt: Date.now(),
-                              pinned: false,
-                              unread: false,
-                            });
-                          }
+                          // Drop stale drafts before creating a new one so
+                          // repeated "New chat" clicks don't accumulate empty rows.
+                          Object.values(store.sessions).forEach((s) => {
+                            if (s.draft) store.actions.drop(s.id);
+                          });
+                          store.actions.upsert({
+                            id,
+                            title: "new chat",
+                            preview: "",
+                            status: "idle",
+                            messageCount: 0,
+                            createdAt: Date.now(),
+                            updatedAt: Date.now(),
+                            pinned: false,
+                            unread: false,
+                            draft: true,
+                          });
                           store.actions.setCurrent(id);
                           void emit("chat-load-conversation", {
                             conversationId: id,
@@ -719,6 +881,12 @@ function HomeContent() {
                   }
                   return btn;
                 })}
+                {sidebarCollapsed && (
+                  <CollapsedChatSidebarButton
+                    onSelect={selectChatConversation}
+                    isTranslucent={isTranslucent}
+                  />
+                )}
               </div>
 
 
@@ -923,6 +1091,7 @@ function HomeContent() {
 
           </div>
       </div>
+
     </div>
   );
 }

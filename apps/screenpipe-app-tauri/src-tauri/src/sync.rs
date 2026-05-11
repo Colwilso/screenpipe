@@ -731,6 +731,12 @@ pub async fn auto_start_retention(app: &AppHandle) {
         _ => return,
     };
 
+    // Off until explicitly enabled. Legacy stores that pre-date this field
+    // must NOT silently start deleting media — the retention-settings UI
+    // reads `localRetentionEnabled ?? false`, so the toggle visibly shows
+    // "off" for those users; defaulting to `true` here would run retention
+    // behind their back. Users who want auto-delete enable it via Settings →
+    // Storage, which writes the field to the store.
     let enabled = settings
         .extra
         .get("localRetentionEnabled")
@@ -747,11 +753,19 @@ pub async fn auto_start_retention(app: &AppHandle) {
         .and_then(|v| v.as_u64())
         .unwrap_or(14) as u32;
 
+    let mode = settings
+        .extra
+        .get("localRetentionMode")
+        .and_then(|v| v.as_str())
+        .filter(|s| *s == "media" || *s == "all")
+        .unwrap_or("media");
+
     let client = reqwest::Client::new();
     let api = local_api_context_from_app(app);
     let configure_req = serde_json::json!({
         "enabled": true,
         "retention_days": days,
+        "mode": mode,
     });
 
     match apply_local_api_auth(&api, client.post(api.url("/retention/configure")))
@@ -760,7 +774,10 @@ pub async fn auto_start_retention(app: &AppHandle) {
         .await
     {
         Ok(response) if response.status().is_success() => {
-            info!("local retention auto-started (retention={}d)", days);
+            info!(
+                "local retention auto-started (retention={}d, mode={})",
+                days, mode
+            );
         }
         Ok(response) => {
             let status = response.status();

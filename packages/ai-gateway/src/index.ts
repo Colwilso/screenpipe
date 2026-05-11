@@ -3,13 +3,14 @@ import { Env, RequestBody, AuthResult } from './types';
 import { handleOptions, createSuccessResponse, createErrorResponse, addCorsHeaders } from './utils/cors';
 import { validateAuth } from './utils/auth';
 import { RateLimiter, checkRateLimit } from './utils/rate-limiter';
-import { trackUsage, getUsageStatus, isModelAllowed, getTierConfig } from './services/usage-tracker';
+import { trackUsage, getUsageStatus, isModelAllowed, getTierConfig, getCreditBalance } from './services/usage-tracker';
 import { handleChatCompletions } from './handlers/chat';
 import { handleModelListing } from './handlers/models';
 import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
 import { handleVoiceTranscription, handleVoiceQuery, handleTextToSpeech, handleVoiceChat } from './handlers/voice';
 import { handleVertexProxy, handleVertexModels } from './handlers/vertex-proxy';
 import { handleWebSearch } from './handlers/web-search';
+import { handleTinfoilAttestation, handleTinfoilProxy } from './handlers/tinfoil-proxy';
 import { logCost, getModelCost, inferProvider, getSpendSummary, getDailyUserCost, getMaxDailyCostPerUser, getTierDailyCostCap, isZeroCostModel } from './services/cost-tracker';
 import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { getModelWeight } from './services/usage-tracker';
@@ -50,11 +51,14 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			const status = await getUsageStatus(env, authResult.deviceId, authResult.tier, authResult.userId);
 			// Enrich with cost-based limit flag (NOT the raw $ numbers — those
 			// are our internal margin and shouldn't leak to any client/user).
+			// Credits extend the cap 1:1 (1 credit = $1 of headroom) so that the
+			// /billing top-up button actually lifts the limit it advertises.
 			const dailyCost = await getDailyUserCost(env, authResult.deviceId);
 			const maxCost = getTierDailyCostCap(authResult.tier, env);
+			const credits = authResult.userId ? await getCreditBalance(env, authResult.userId) : 0;
 			const enriched = {
 				...status,
-				cost_limit_reached: dailyCost >= maxCost,
+				cost_limit_reached: dailyCost >= maxCost + credits,
 			};
 			return addCorsHeaders(createSuccessResponse(enriched));
 		}
@@ -100,11 +104,18 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			// Cheap models (weight 0-1) like qwen3.5-flash, haiku, deepseek-chat
 			// should not trigger cost caps — they're affordable and pipes need them.
 			// Subscribed users get 5x higher cap.
+			//
+			// Credits extend the cap 1:1: a user with a $50 credit balance gets
+			// $50 more headroom for today before this 429 fires. Required to make
+			// the /billing one-click top-up actually unblock the user it sold to.
+			// (The credits are separately consumed per-query in the trackUsage
+			// path below, so this is just the ceiling check.)
 			const modelWeight = getModelWeight(body.model);
 			if (!isZeroCostModel(body.model) && modelWeight >= 3) {
 				const dailyCost = await getDailyUserCost(env, authResult.deviceId);
 				const maxCost = getTierDailyCostCap(authResult.tier, env);
-				if (dailyCost >= maxCost) {
+				const credits = authResult.userId ? await getCreditBalance(env, authResult.userId) : 0;
+				if (dailyCost >= maxCost + credits) {
 					const resetsAt = new Date();
 					resetsAt.setUTCHours(24, 0, 0, 0);
 					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
@@ -281,6 +292,23 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			ctx.waitUntil(pruneModelHealth(env));
 			// Return tier-filtered models with live health status
 			return await handleModelListing(env, authResult.tier);
+		}
+
+		// ─── Tinfoil E2EE proxy ────────────────────────────────────────
+		// Distinct from the server-side `gemma4-31b` integration in
+		// providers/tinfoil.ts — these routes preserve end-to-end body
+		// encryption (HPKE/EHBP). The gateway never sees plaintext.
+		// Spec: https://docs.tinfoil.sh/guides/proxy-server
+		if (path === '/v1/tinfoil/attestation' && request.method === 'GET') {
+			// Public-ish (still tier-gated above so we know who's calling) —
+			// just forwards the attestation bundle which is itself public.
+			return await handleTinfoilAttestation(env);
+		}
+		if (path === '/v1/tinfoil/chat/completions' && request.method === 'POST') {
+			return await handleTinfoilProxy(request, env, authResult, '/v1/chat/completions');
+		}
+		if (path === '/v1/tinfoil/responses' && request.method === 'POST') {
+			return await handleTinfoilProxy(request, env, authResult, '/v1/responses');
 		}
 
 		if (path === '/v1/voice/transcribe' && request.method === 'POST') {
@@ -601,6 +629,11 @@ export default {
 					dsn: env.SENTRY_DSN,
 					tracesSampleRate: 0.1,
 					beforeSend: scrubSentryEvent,
+					// release must match the value passed to `sentry-cli sourcemaps
+					// upload --release=<R>` at deploy time, otherwise Sentry can't
+					// symbolicate stack frames and every event shows `index.js:NNN`
+					// instead of the real provider .ts file + line number.
+					release: env.SENTRY_RELEASE,
 				},
 				request: request as any,
 				context: ctx,

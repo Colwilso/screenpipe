@@ -110,6 +110,9 @@ export function CliCommandDialog({ settings }: CliCommandDialogProps) {
     if (settings.disableAudio) {
       args.push("--disable-audio");
     }
+    if (settings.disableClipboardCapture) {
+      args.push("--disable-clipboard-capture");
+    }
     settings.ignoredWindows.forEach((window) =>
       args.push(`--ignored-windows "${window}"`)
     );
@@ -126,8 +129,6 @@ export function CliCommandDialog({ settings }: CliCommandDialogProps) {
     if (settings.languages.length > 0) {
       settings.languages.forEach((id) => args.push(`--language ${id}`));
     }
-
-    // enableInputCapture and enableAccessibility are always on (no CLI flag needed)
 
     const envVarsStr =
       envVars.length > 0

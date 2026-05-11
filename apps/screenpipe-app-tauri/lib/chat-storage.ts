@@ -9,6 +9,7 @@ import {
   readDir,
   mkdir,
   remove,
+  rename,
   exists,
 } from "@tauri-apps/plugin-fs";
 import type {
@@ -34,8 +35,11 @@ export async function ensureChatsDir(): Promise<string> {
   return dir;
 }
 
+// Pipe-run session ids are `pipe:<name>:<execId>`. The colons are illegal on
+// NTFS (reserved for alternate data streams), so saves silently fail on
+// Windows. Same set as Win32's invalid-filename chars; safe no-op for UUIDs.
 function conversationFilename(id: string): string {
-  return `${id}.json`;
+  return `${id.replace(/[<>:"/\\|?*]/g, "_")}.json`;
 }
 
 export async function saveConversationFile(
@@ -43,7 +47,35 @@ export async function saveConversationFile(
 ): Promise<void> {
   const dir = await ensureChatsDir();
   const filePath = `${dir}/${conversationFilename(conv.id)}`;
-  await writeTextFile(filePath, JSON.stringify(conv, null, 2));
+  // Atomic write: stage to a unique sibling .tmp, then rename onto the
+  // final path. A crash or quit mid-write leaves either the previous
+  // file intact OR an orphan .tmp (cleaned up by the next save), never
+  // a half-written .json that loadConversationFile would silently
+  // treat as "missing" via its try/catch → return null path. rename()
+  // is atomic on POSIX and same-volume NTFS.
+  //
+  // Tmp name MUST be unique per call. Two concurrent saves for the
+  // same conversation (panel autosave + browser-sidebar's
+  // updateConversationFlags, or two router-driven background saves
+  // racing the panel) would otherwise both write to `<file>.json.tmp`,
+  // the first rename would consume it, the second would fail with
+  // ENOENT and fall back to the catch path. We've seen this in the
+  // wild — see the "[webview] persist browserState failed: rename ...
+  // .tmp ... No such file or directory" error log.
+  const tmpPath = `${filePath}.${Date.now()}.${Math.random()
+    .toString(36)
+    .slice(2, 10)}.tmp`;
+  const body = JSON.stringify(conv, null, 2);
+  await writeTextFile(tmpPath, body);
+  try {
+    await rename(tmpPath, filePath);
+  } catch (e) {
+    // Best-effort cleanup so a stale .tmp doesn't accumulate on the rare
+    // path where rename fails (cross-device, permission). Re-throw so
+    // callers don't think the save succeeded.
+    try { await remove(tmpPath); } catch { /* ignore */ }
+    throw e;
+  }
 }
 
 export async function loadConversationFile(
@@ -153,7 +185,7 @@ export async function listConversations(): Promise<ConversationMeta[]> {
  */
 export async function updateConversationFlags(
   id: string,
-  patch: Partial<Pick<ChatConversation, "pinned" | "hidden" | "title">>
+  patch: Partial<Pick<ChatConversation, "pinned" | "hidden" | "title" | "browserState">>
 ): Promise<void> {
   const conv = await loadConversationFile(id);
   if (!conv) return;

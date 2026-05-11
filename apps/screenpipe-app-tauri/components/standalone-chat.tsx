@@ -18,9 +18,10 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil, Pin, Shield, ShieldCheck } from "lucide-react";
+import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil, Pin, Shield, ShieldCheck, Sparkles } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { PipeContextBanner } from "@/components/chat/pipe-context-banner";
+import { BrowserSidebar } from "@/components/browser-sidebar";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
 import { PipeAIIcon, PipeAIIconLarge } from "@/components/pipe-ai-icon";
@@ -30,7 +31,7 @@ import { VideoComponent } from "@/components/rewind/video";
 import { MermaidDiagram } from "@/components/rewind/mermaid-diagram";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
-import { AIPreset } from "@/lib/utils/tauri";
+import { AIPreset, PiQueuedPrompt } from "@/lib/utils/tauri";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 // OpenAI SDK no longer used directly — all providers route through Pi agent
@@ -42,9 +43,11 @@ import { commands } from "@/lib/utils/tauri";
 import { emit } from "@tauri-apps/api/event";
 import { useChatConversations } from "@/components/hooks/use-chat-conversations";
 import { useChatStore } from "@/lib/stores/chat-store";
+import { statusForEvent } from "@/lib/stores/pi-event-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { usePlatform } from "@/lib/hooks/use-platform";
+import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
@@ -167,73 +170,112 @@ function buildSystemPrompt(): string {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const offsetStr = getTimezoneOffsetString();
 
-  return `You are a helpful AI assistant that can search through the user's Screenpipe data - their screen recordings, audio transcriptions, and UI interactions.
+  return `You are the user's Screenpipe assistant. You have read access to their screen recordings, audio transcriptions, and UI activity, and tools to search, summarize, and act on them. When external integrations are connected (see "Connected integrations" section), use their endpoints for live data instead of only relying on recorded activity.
 
-BEHAVIOR RULES:
-- Act immediately on clear requests. NEVER ask for confirmation when the user's intent is obvious.
-- If a search returns empty, silently fix your query and retry (widen time range, remove filters). Do NOT list "possibilities" or ask the user what to do.
-- Be concise. Cite timestamps when relevant. Convert all UTC timestamps to the user's local timezone before displaying.
-- Never show raw process names (.exe) to the user. Translate to human-readable app names — strip the .exe suffix and title-case if unknown.
-- When summarizing activity, write like a knowledgeable assistant recapping the user's day — connect the dots between windows, content, and audio into a narrative. Name specific projects, files, people, and URLs. Say "you were debugging a Windows crash for 20 min, then reviewed a PR about team member display names" not "you used WezTerm for 39 min and Arc for 8 min." The window titles and key_texts from activity-summary contain the specifics — use them.
+# Voice and length — the most important rule
 
-TOOL SELECTION (use the right tool for the job):
-- "meeting", "call", "conversation", "what did I/they say" → search with content_type: "audio", NO q param
-- "how long", "time spent", "which apps", "most used" → use activity-summary (NOT raw frame counts or SQL)
-- "what was on screen", "what was I reading/looking at" → search with content_type: "all" or "accessibility"
-- Broad overview ("what was I doing?") → activity-summary FIRST. The windows field shows exactly what the user was working on (window titles, URLs, time per tab). Usually sufficient without further searches.
+Default to plain prose, like a friend texting back. Most answers are short: a few sentences for lookups, a short paragraph for recaps. Long answers only when the work itself is long or technical. No headings, no tables, no bullet lists, no code blocks, no numbered "Phase 1 / Phase 2" decomposition — unless the question itself is long or technical.
 
-LOCAL SERVER AUTH:
-The local screenpipe server (localhost:3030) requires a bearer token. It is exposed to you as the env var SCREENPIPE_API_AUTH_KEY. EVERY curl against localhost:3030 MUST include the header: -H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY". Do NOT ask the user for an API key — you already have it. If a call returns 401, the env var may be empty (auth disabled on this install) — retry without the header.
+Don't lecture. Skip "Why this matters", "the reusable pattern is", "in summary", "key takeaways". Answer the question and stop. No closing recap of what you just said.
 
-CRITICAL SEARCH RULES (database has 600k+ entries):
-1. ALWAYS include start_time in EVERY search - NEVER search without a time range
-2. Default time range: last 1-2 hours. Expand ONLY if no results found
-3. First search: ONLY use time params (start_time, end_time). No q, no app_name, no content_type. This gives ground truth of what's recorded. Scan results to find correct app_name values, then narrow with filters using exact observed values. App names are case-sensitive (e.g. "Discord" vs "Discord.exe"). The q param searches captured text, NOT app names.
-4. NEVER report "no data found" after one filtered search. Verify with unfiltered time-only search first.
-5. Keep limit=5-10 per search. NEVER use limit > 50
-6. Maximum 10 search/API calls per user request. Stop and summarize what you have
-7. For weekly/multi-day queries: search ONE DAY AT A TIME with small limits
-8. Prefer /raw_sql with COUNT(*), GROUP BY for aggregation over fetching raw rows
-9. All /raw_sql SELECT queries MUST include a LIMIT clause (max 10000)
+Hide the plumbing. By default never show: frame IDs, file paths, raw ISO timestamps, schema field names (\`speaker_ids\`, \`accessibility_text\`, etc.), API parameters (\`content_type\`, \`limit=\`), or process names ending in \`.exe\`. Translate to human terms — strip \`.exe\` and title-case unknown app names, convert UTC timestamps to the user's local timezone, say "yesterday around 3pm" not \`2026-04-27T15:00:00Z\`.
 
-EXAMPLES OF GOOD SEARCHES:
-- User: "summarize my meeting" → search content_type:"audio", start_time:"2h ago", NO q param → summarize transcriptions
-- User: "what apps did I use today" → call activity-summary with start_time: today_start, end_time: now → report active_minutes per app
-- User: "what was I reading about X" → search q:"X", start_time:"3h ago" → show text with deep links
+# Flip to technical mode when the user signals it
 
-Rules for showing media:
-- Show videos/images using standard markdown: ![description](/path/to/file.mp4) or ![description](/path/to/image.jpg)
-- ONLY use the exact, unmodified file_path or audio_file_path from search results. NEVER construct or guess paths.
-- Before showing a video, verify the file exists by checking it with the shell (e.g. ls or Test-Path). If missing, tell the user and retry search with a different time range instead of showing a broken player.
+Match the user's energy. Go detailed/structured when any of these is true:
+- They pasted code, JSON, SQL, error traces, configs, or credentials
+- They wrote a numbered task list, a role prompt ("you are an X advisor"), or a multi-step instruction
+- Their words include "debug", "trace", "explain how", "show me the code", "step by step", "I'm building", "I'm optimizing", "outline", "table"
+- The earlier turns of this conversation were already technical
 
-SPEAKER MANAGEMENT (localhost:3030):
-- GET /speakers/unnamed?limit=10 — list unnamed speakers
-- GET /speakers/search?name=John — search by name
-- POST /speakers/update — rename: {"id": 5, "name": "John"}
-- POST /speakers/merge — merge duplicates: {"speaker_to_keep_id": 1, "speaker_to_merge_id": 2}
-- GET /speakers/similar?speaker_id=5 — find similar speakers
-- POST /speakers/reassign — reassign audio chunk to different speaker
+In technical mode you can use headings, tables, code blocks, exact timestamps, file paths, and longer answers. Match the depth they brought — don't exceed it.
 
-FULL API REFERENCE:
-For the complete list of 60+ screenpipe API endpoints (frames, audio, pipes, tags, etc.), fetch: https://docs.screenpi.pe/llms-full.txt
-Fetch this when you need endpoints beyond /search, /activity-summary, or /speakers.
+# Ambiguous / one-word / typo input
 
-DEEP LINKS & MEDIA:
-- Frame (PREFERRED): [10:30 AM — Chrome](screenpipe://frame/12345) — use frame_id from screen text search results. NEVER invent frame IDs.
-- Timeline (audio only): [meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z) — use exact timestamp from audio search results.
-- Video/Image: use markdown ![description](/path/to/file.mp4)
-NEVER fabricate frame IDs or timestamps — only use values from actual search results.
+If the user sends "hi", "gih", "d", a single word, or an obvious typo, ask one short clarifying question. Don't launch a capability tour or read your own skills aloud.
 
-RENDERING COMPONENTS:
-You can embed these in your response when they genuinely add value. Don't force them into simple answers.
+# Activity recaps (the most common request)
 
-- Mermaid diagrams: \`\`\`mermaid fenced blocks for flowcharts, sequence diagrams, timelines.
-- App usage breakdown: \`\`\`app-stats fenced blocks, one row per app, format "App Name|minutes_as_decimal". Deduplicate — merge variants like "discord.exe" and "Discord" into one row with summed minutes.
-- Collapsible sections: <details><summary>label</summary> content </details> for optional / secondary info the user can expand.
+When summarizing what the user did, write like a friend recapping their day. Connect windows, content, and audio into a short narrative. Name specific projects, people, files, URLs from the data. "You spent the morning debugging a Windows crash, then took a call with Pat about pricing" — not "WezTerm 39m, Arc 8m, Zoom 12m". Pull the specifics from window titles and key_texts in activity-summary. Cap at ~150 words unless the user asked for depth.
+
+# Acting on requests
+
+- Act immediately on clear intent. Don't ask to confirm what's obvious.
+- If a search returns empty, silently widen and retry. Don't enumerate possibilities or ask the user to choose.
+- Never say "no data found" after one filtered search — verify first with an unfiltered time-only search.
+
+# Connection write policy
+
+Never POST, PUT, or PATCH to a connection proxy unless the user explicitly asks you to create, write, or modify something in that service. For ambiguous requests, read first. Ask before writing.
+
+# Tool selection
+
+- "upcoming meetings / calendar events / what's on my calendar / schedule" → if a calendar integration is connected (google-calendar, apple-calendar), call its events endpoint first; only fall back to audio search if no calendar is connected
+- "meeting / call / conversation / what did I/they say" → search with content_type: "audio", no q param (for past meetings/calls captured by screenpipe)
+- "how long / time spent / which apps / most used" → activity-summary (not raw frame counts or SQL)
+- "what was on screen / what was I reading" → search with content_type: "all" or "accessibility"
+- "what was I doing" → activity-summary first; the windows field usually has enough without further searches
+
+# Local server auth
+
+The local screenpipe server (localhost:3030) requires a bearer token, exposed as env var SCREENPIPE_API_AUTH_KEY. Every curl to localhost:3030 must include \`-H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY"\`. Don't ask the user for a key — you already have it. On 401, retry without the header (auth is disabled on that install).
+
+# Search rules (DB has 600k+ rows)
+
+1. Always include start_time. Default: last 1–2 hours. Widen only when empty.
+2. First search: time only — no q, no app_name, no content_type. Scan results for real app_name values, then narrow. App names are case-sensitive ("Discord" vs "Discord.exe"). The q param searches captured text, not app names.
+3. limit=5–10 per call. Never >50.
+4. Cap at 10 search/API calls per user request, then summarize what you have.
+5. Multi-day queries: one day at a time.
+6. Prefer /raw_sql with COUNT/GROUP BY for aggregation over fetching raw rows. SELECT queries must include LIMIT (max 10000).
+
+# Showing media
+
+- Markdown only: \`![description](/path/to/file.mp4)\` or \`![description](/path/to/image.jpg)\`
+- Use the exact file_path / audio_file_path from results. Never construct or guess paths.
+- Verify the file exists (\`ls\` / \`Test-Path\`) before showing it. If missing, retry the search instead of rendering a broken player.
+
+# Deep links — sparingly
+
+Only when jumping to that exact moment is the answer the user wants. Not as decoration on every timestamp in a recap.
+- Frame: \`[10:30 AM — Chrome](screenpipe://frame/12345)\` — only with a real frame_id from results
+- Timeline (audio): \`[meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z)\` — exact timestamp from audio results
+Never fabricate frame IDs or timestamps.
+
+# Speakers (localhost:3030)
+
+- GET /speakers/unnamed?limit=10
+- GET /speakers/search?name=John
+- POST /speakers/update — \`{"id": 5, "name": "John"}\`
+- POST /speakers/merge — \`{"speaker_to_keep_id": 1, "speaker_to_merge_id": 2}\`
+- GET /speakers/similar?speaker_id=5
+- POST /speakers/reassign
+
+# Full API reference
+
+60+ endpoints (frames, audio, pipes, tags, etc.) at https://docs.screenpi.pe/llms-full.txt. Fetch when you need anything beyond /search, /activity-summary, or /speakers.
+
+# Rich rendering — only when it earns its space
+
+- Mermaid: \`\`\`mermaid blocks for flowcharts / sequences / timelines
+- App breakdown: \`\`\`app-stats blocks, one row per app as "App Name|minutes_decimal". Dedupe variants ("discord.exe" + "Discord" → one row with summed minutes)
+- Collapsible: \`<details><summary>label</summary>content</details>\` for optional / secondary info
+Don't reach for these on short answers.
 
 Current time: ${now.toISOString()}
 User's timezone: ${timezone} (UTC${offsetStr})
 User's local time: ${now.toLocaleString()}`;
+}
+
+function buildConnectionsContext(
+  connections: Array<{ id: string; name: string; category?: string; description?: string }>
+): string {
+  const withDesc = connections.filter((c) => c.description);
+  if (withDesc.length === 0) return "";
+  const entries = withDesc
+    .map((c) => `## ${c.name} (${c.id})\n${c.description}`)
+    .join("\n\n");
+  return `\n\n# Connected integrations\n\nThe user has connected the following external services. Use the endpoints listed under each to fetch live data when relevant. All endpoints are on http://localhost:3030 and require \`-H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY"\`.\n\n${entries}`;
 }
 
 interface SearchResult {
@@ -275,6 +317,11 @@ interface Message {
   model?: string;
   provider?: string;
   retryPrompt?: string; // when set, renders a retry CTA on error messages
+  /** True between optimistic enqueue and the moment Pi's drain loop picks
+   *  the prompt up (`agent_start` for this turn). Drives a lighter visual
+   *  treatment so the user can tell at-a-glance which messages are still
+   *  waiting in line vs. already in-flight. Cleared by handleAgentStart. */
+  queued?: boolean;
 }
 
 // Tool icons by name
@@ -523,8 +570,8 @@ function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: bo
   );
 }
 
-function ThinkingBlock({ text, isThinking, durationMs }: { text: string; isThinking: boolean; durationMs?: number }) {
-  const [expanded, setExpanded] = useState(false);
+function ThinkingBlock({ text, isThinking, durationMs, defaultExpanded = false }: { text: string; isThinking: boolean; durationMs?: number; defaultExpanded?: boolean }) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const [elapsed, setElapsed] = useState(0);
   const startRef = useRef(Date.now());
 
@@ -876,7 +923,7 @@ function buildToolSummary(toolCalls: ToolCall[]): string {
   return parts.join(", ");
 }
 
-function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
+function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: ToolCall[]; defaultExpanded?: boolean }) {
   const [manualExpand, setManualExpand] = useState<boolean | null>(null);
 
   const hasRunning = toolCalls.some((tc) => tc.isRunning);
@@ -886,8 +933,11 @@ function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
   const total = toolCalls.length;
   const summary = allDone ? buildToolSummary(toolCalls) : "";
 
-  // Auto-expand while running, auto-collapse when done (user can override)
-  const isExpanded = manualExpand !== null ? manualExpand : hasRunning;
+  // Auto-expand while running, auto-collapse when done (user can override).
+  // `defaultExpanded` keeps the group open even when done — used for
+  // messages whose entire output is tool calls (typical pipe-runs)
+  // where the tool result is the whole story.
+  const isExpanded = manualExpand !== null ? manualExpand : (hasRunning || defaultExpanded);
 
   return (
     <div className="w-full min-w-0">
@@ -963,6 +1013,8 @@ function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
 // Renders message content with interleaved text and tool call blocks
 function MessageContent({ message, onImageClick, onRetry }: { message: Message; onImageClick?: (images: string[], index: number) => void; onRetry?: (prompt: string) => void }) {
   const isUser = message.role === "user";
+  const { settings } = useSettings();
+  const hideThinkingBlocks = settings?.hideThinkingBlocks ?? true;
 
   // Retry CTA — shown at the bottom of error messages that have a retryPrompt
   const retryCta = !isUser && message.retryPrompt ? (
@@ -983,6 +1035,13 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
   // Group consecutive tool blocks into collapsible containers
   if (message.contentBlocks && message.contentBlocks.length > 0) {
     const grouped = groupContentBlocks(message.contentBlocks);
+    // When the message has no rendered prose (no text block — common for
+    // pipe-run executions whose entire output is thinking + tool calls),
+    // expand thinking blocks by default. Otherwise the collapsed
+    // "thought for 0s" pill is the only visible thing on the message
+    // and the chat panel reads as empty even though there's real
+    // content to see.
+    const hasText = grouped.some((g) => g.type === "text");
     return (
       <div className="space-y-2 min-w-0 w-full overflow-hidden">
         {grouped.map((group) => {
@@ -990,10 +1049,16 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
             return <MarkdownBlock key={`text-${group.key}`} text={group.text} isUser={isUser} />;
           }
           if (group.type === "thinking") {
+            // Settings → Display → Hide Thinking Blocks (default true). Even
+            // when shown the block starts collapsed: the "thought for Xs"
+            // pill is enough signal that the assistant did chain-of-thought
+            // work — auto-expanding (the c092166e0 behavior) drew the eye
+            // to raw reasoning instead of the response.
+            if (hideThinkingBlocks) return null;
             return <ThinkingBlock key={`thinking-${group.key}`} text={group.text} isThinking={group.isThinking} durationMs={group.durationMs} />;
           }
           if (group.type === "tool-group") {
-            return <ToolCallGroup key={`tools-${group.key}`} toolCalls={group.toolCalls} />;
+            return <ToolCallGroup key={`tools-${group.key}`} toolCalls={group.toolCalls} defaultExpanded={!hasText} />;
           }
           return null;
         })}
@@ -1045,7 +1110,11 @@ function CollapsibleUserMessage({ label, fullContent }: { label: string; fullCon
       <div className="flex items-center gap-1.5">
         <span className="flex-1 text-sm font-medium">{label}</span>
         <button
-          onClick={() => setExpanded(!expanded)}
+          onClick={(e) => {
+            e.stopPropagation();
+            setExpanded(!expanded);
+          }}
+          onMouseUp={(e) => e.stopPropagation()}
           className="shrink-0 p-0.5 rounded hover:bg-background/20 text-background/60 hover:text-background/90 transition-colors"
           title={expanded ? "Collapse prompt" : "Show full prompt"}
         >
@@ -1243,6 +1312,10 @@ export function StandaloneChat({
 } = {}) {
   const { settings, updateSettings, isSettingsLoaded, reloadStore } = useSettings();
   const { isMac } = usePlatform();
+  // Drop the macOS traffic-light reservation when the window is fullscreen
+  // (the buttons hide). Only relevant in standalone mode (no parent
+  // className) — the embedded variant is below the host's chrome anyway.
+  const isFullscreen = useIsFullscreen();
   const { items: appItems } = useSqlAutocomplete("app");
   const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
   const { templatePipes, loading: pipesLoading } = usePipes();
@@ -1250,8 +1323,20 @@ export function StandaloneChat({
   // filter popover so users can mention them directly with @id — helps the
   // agent pick the right connection for a query instead of having to guess.
   const [connections, setConnections] = useState<
-    Array<{ id: string; name: string; category?: string }>
+    Array<{ id: string; name: string; category?: string; description?: string }>
   >([]);
+  // Watch the input section's width so suggestion chips can collapse into
+  // a popover on narrow chat columns.
+  useEffect(() => {
+    const el = inputSectionRef.current;
+    if (!el) return;
+    const measure = () => setInputSectionWidth(el.getBoundingClientRect().width);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1259,11 +1344,11 @@ export function StandaloneChat({
         const res = await localFetch("/connections");
         if (!res.ok) return;
         const json = (await res.json()) as {
-          data?: Array<{ id: string; name: string; connected: boolean; category?: string }>;
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
         };
         const list = (json.data ?? [])
           .filter((c) => c.connected)
-          .map((c) => ({ id: c.id, name: c.name, category: c.category }));
+          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
         if (!cancelled) setConnections(list);
       } catch {
         // silent — filter just won't surface connections, no UI regression
@@ -1272,6 +1357,29 @@ export function StandaloneChat({
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // Re-fetch connections whenever the window becomes visible — picks up any
+  // integrations connected in Settings while the chat was open.
+  useEffect(() => {
+    const fetchConnections = async () => {
+      try {
+        const res = await localFetch("/connections");
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
+        };
+        const list = (json.data ?? [])
+          .filter((c) => c.connected)
+          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
+        setConnections(list);
+      } catch { /* silent */ }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") fetchConnections();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   // Custom summary templates (persisted in settings)
@@ -1306,6 +1414,11 @@ export function StandaloneChat({
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamedCharCount, setStreamedCharCount] = useState(0);
+  // Prompts the user has queued while a previous one is still streaming.
+  // Sourced from rust via the `pi-queue-changed` event — single source of
+  // truth lives in `pi_command_queue.rs`. Cleared as soon as the drain loop
+  // pulls a queued item and writes it to stdin (it's then in-flight).
+  const [queuedPrompts, setQueuedPrompts] = useState<PiQueuedPrompt[]>([]);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [openMessageMenuId, setOpenMessageMenuId] = useState<string | null>(null);
   // Cursor-style inline edit: click a sent user message to tweak and resend
@@ -1379,6 +1492,12 @@ export function StandaloneChat({
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Tracks the input section's width so we can collapse the auto-suggestion
+  // chips into a popover when the chat column is narrow (e.g. when the
+  // BrowserSidebar opens and squeezes the chat). Updated by a ResizeObserver
+  // attached to the input wrapper.
+  const inputSectionRef = useRef<HTMLDivElement>(null);
+  const [inputSectionWidth, setInputSectionWidth] = useState(800);
   const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -1446,7 +1565,7 @@ export function StandaloneChat({
   const lastUserMessageRef = useRef<string>("");
 
   // Ref to sendMessage so useEffect callbacks can call it without stale closures
-  const sendMessageRef = useRef<(msg: string) => Promise<void>>();
+  const sendMessageRef = useRef<(msg: string, displayLabel?: string) => Promise<void>>();
   // Bypass guard for auto-send from chat-prefill (Pi confirmed running but React state stale)
   const autoSendBypassRef = useRef(false);
 
@@ -1923,6 +2042,101 @@ export function StandaloneChat({
     useChatStore.getState().actions.setPanelSession(conversationId);
   }, [conversationId]);
 
+  // E2E hook: expose a function to seed a user message into a session.
+  // Required by parallel-chat.spec.ts because `ensureAssistantPlaceholder`
+  // (added 2026-04-29 in e1f55023d) only creates an assistant bubble when
+  // the last message in LOCAL React state is `role: "user"`. Without a
+  // way to inject a user message, the test's pure pi_event-faking path
+  // can't materialize any assistant DOM and CI has been red on every PR
+  // since.
+  //
+  // Three places get updated:
+  //   1. Local React state (`setMessages`) — what `ensureAssistantPlaceholder`
+  //      reads via `setMessages(prev => …)`. This is the critical one.
+  //   2. The chat-store via `upsert` — needed because `appendMessage` no-ops
+  //      when the session record doesn't exist yet (a brand-new session
+  //      created by `chat-load-conversation` → `startNewConversation` does
+  //      NOT seed a sessions[id] entry; that only happens on first save
+  //      after agent_end). Without upsert, the seed silently disappears.
+  //   3. `piSessionIdRef.current` — set if the panel hasn't yet caught up
+  //      to the requested session, so `text_delta` handlers (keyed by
+  //      sessionId) route correctly.
+  //
+  // Production impact: zero — only a non-functional reference on `window`,
+  // never read from production code paths.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    (window as any).__e2eSeedUserMessage = (sid: string, text: string) => {
+      const id = `e2e-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const userMsg = {
+        id,
+        role: "user" as const,
+        content: text,
+        timestamp: Date.now(),
+      };
+
+      // (2) Ensure the session record exists in the store so subsequent
+      // appendMessage / setStreaming / snapshotSession calls actually
+      // mutate something. upsert overwrites if existing, so we read first
+      // and merge messages by hand.
+      const store = useChatStore.getState();
+      const existing = store.sessions[sid];
+      if (!existing) {
+        store.actions.upsert({
+          id: sid,
+          title: "e2e",
+          preview: text.slice(0, 60),
+          status: "idle",
+          messageCount: 1,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          pinned: false,
+          unread: false,
+          messages: [userMsg as any],
+        });
+      } else {
+        store.actions.appendMessage(sid, userMsg as any);
+      }
+
+      // (1) Mirror to local React state so `ensureAssistantPlaceholder`
+      // sees the user-tail on the next text_delta. Always do this — the
+      // test only ever seeds for the about-to-stream session, which is
+      // by definition what the panel is rendering.
+      setMessages((prev) => [...prev, userMsg as any]);
+
+      // (3) Force the session ref in case the panel hasn't finished
+      // switching yet. Otherwise text_deltas with this sid would route
+      // to the wrong handler.
+      piSessionIdRef.current = sid;
+    };
+    return () => {
+      delete (window as any).__e2eSeedUserMessage;
+    };
+  }, []);
+
+  // Cross-window rename sync. The chat-store is window-local (zustand
+  // lives in each WebView's JS context), so a rename done in the /chat
+  // overlay would otherwise never reach the chat-sidebar in /home. The
+  // canonical rename path (`renameConversation` in use-chat-conversations)
+  // emits this event to all windows; we patch the local store on receipt.
+  // Self-receipt is a harmless idempotent no-op (patch sets the same
+  // title we just wrote).
+  useEffect(() => {
+    const unlisten = listen<{ id: string; title: string }>(
+      "chat-renamed",
+      (event) => {
+        const { id, title } = event.payload;
+        if (!id || !title) return;
+        if (useChatStore.getState().sessions[id]) {
+          useChatStore.getState().actions.patch(id, { title });
+        }
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
+
   // Component-lifetime guard for bus handlers that fire across the
   // longer-lived useEffects (terminated, foreground registrations).
   // Useful because the panel's per-effect `mounted` flags are scoped
@@ -2012,6 +2226,35 @@ export function StandaloneChat({
     if (pipeWatchIsLoading !== undefined) setIsLoading(pipeWatchIsLoading);
     if (pipeWatchIsStreaming !== undefined) setIsStreaming(pipeWatchIsStreaming);
   }, [pipeWatchIsLoading, pipeWatchIsStreaming]);
+
+  // Self-heal a stuck "writing…" indicator on regular chat sessions.
+  // The router (background) and the panel's foreground listener both set
+  // store.isStreaming/isLoading to false on agent_end. Local React
+  // state is also cleared by the foreground listener — but if that
+  // listener missed the event for any reason (race during section
+  // change, mountedRef brief flicker, bus dispatch landing on default
+  // instead of foreground), local can drift `true` while the store
+  // says `false`. Returning to the panel from Settings then shows
+  // "writing…" forever even though the turn is over.
+  // One-way: only sync false→false. The forward direction (true) is
+  // owned by the panel itself when the user sends, so we never want to
+  // reach in and turn the indicator off mid-typing.
+  const storeChatIsStreaming = useChatStore((s) => {
+    if (!conversationId) return undefined;
+    const sess = s.sessions[conversationId];
+    if (!sess || sess.kind === "pipe-watch") return undefined;
+    return !!sess.isStreaming;
+  });
+  const storeChatIsLoading = useChatStore((s) => {
+    if (!conversationId) return undefined;
+    const sess = s.sessions[conversationId];
+    if (!sess || sess.kind === "pipe-watch") return undefined;
+    return !!sess.isLoading;
+  });
+  useEffect(() => {
+    if (storeChatIsStreaming === false) setIsStreaming(false);
+    if (storeChatIsLoading === false) setIsLoading(false);
+  }, [storeChatIsStreaming, storeChatIsLoading]);
 
   // Keep the pipe-context banner in sync with the current session.
   // When the panel switches AWAY from a pipe-watch session (user
@@ -2118,19 +2361,23 @@ export function StandaloneChat({
   // Remove a specific @mention from input
   const removeFilter = (filterType: "time" | "content" | "app" | "speaker", label?: string) => {
     let newInput = input;
-    if (filterType === "time" && label) {
+    if (filterType === "time") {
       // Remove time mentions like @today, @yesterday, @last-hour, etc.
-      const timePatterns: Record<string, RegExp> = {
-        "today": /@today\b/gi,
-        "yesterday": /@yesterday\b/gi,
-        "last week": /@last[- ]?week\b/gi,
-        "last hour": /@last[- ]?hour\b/gi,
-        "this morning": /@this[- ]?morning\b/gi,
-      };
-      const pattern = timePatterns[label];
-      if (pattern) newInput = newInput.replace(pattern, "").trim();
+      if(label){
+        const timePatterns: Record<string, RegExp> = {
+          "today": /@today\b/gi,
+          "yesterday": /@yesterday\b/gi,
+          "last week": /@last[- ]?week\b/gi,
+          "last hour": /@last[- ]?hour\b/gi,
+          "this morning": /@this[- ]?morning\b/gi,
+        };
+        const pattern = timePatterns[label];
+        if (pattern) newInput = newInput.replace(pattern, "").trim();
+      }else{
+        newInput = newInput.replace(/@(today|yesterday|last[- ]?week|last[- ]?hour|this[- ]?morning)\b/gi, "").trim();
+      }
     } else if (filterType === "content") {
-      newInput = newInput.replace(/@(audio|screen)\b/gi, "").trim();
+      newInput = newInput.replace(/@(audio|screen|input)\b/gi, "").trim();
     } else if (filterType === "app" && activeFilters.appName) {
       // Remove app mention - need to find the pattern
       const appPattern = new RegExp(`@${activeFilters.appName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi");
@@ -2257,10 +2504,13 @@ export function StandaloneChat({
       return;
     }
 
-    // Enter without shift submits the form
+    // Enter without shift submits the form. We intentionally don't gate on
+    // isLoading anymore — if a previous prompt is still streaming, the new
+    // one is enqueued at the rust level (see `pi_command_queue.rs`) and
+    // shown in the queued-cards rail under the transcript.
     if (e.key === "Enter" && !e.shiftKey && !showMentionDropdown) {
       e.preventDefault();
-      if ((input.trim() || pastedImages.length > 0) && !isLoading) {
+      if (input.trim() || pastedImages.length > 0) {
         sendMessage(input.trim());
       }
       return;
@@ -2308,14 +2558,16 @@ export function StandaloneChat({
   const isPi = true;
   const hasValidModel = activePreset?.model && activePreset.model.trim() !== "";
   const needsLogin = activePreset?.provider === "screenpipe-cloud" && !settings.user?.token;
+  // needsLogin is advisory only — chat is allowed without auth (the cloud
+  // backend accepts unauthenticated requests for now). The login warning is
+  // surfaced in the UI banner but does not gate sends.
   // Pi auto-starts on first message, so don't block chat when Pi is not running
-  const canChat = hasPresets && hasValidModel && !needsLogin && !piStarting;
+  const canChat = hasPresets && hasValidModel && !piStarting;
 
   const getDisabledReason = (): string | null => {
     if (!hasPresets) return "No AI presets configured";
     if (!activePreset) return "No preset selected";
     if (!hasValidModel) return `No model selected in "${activePreset.id}" preset`;
-    if (needsLogin) return "Login required";
     if (piStarting) return "Starting Pi agent...";
     return null;
   };
@@ -2404,19 +2656,37 @@ export function StandaloneChat({
     // This is passed via --append-system-prompt to Pi, enabling Anthropic prompt
     // caching (90% input cost reduction on subsequent messages).
     const presetPrompt = p.prompt || "";
-    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}`.trim() || null;
+    const connectionsCtx = buildConnectionsContext(connections);
+    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}${connectionsCtx}`.trim() || null;
     return {
       provider: p.provider,
       url: p.url || "",
       model: p.model || "",
       apiKey: ("apiKey" in p ? (p.apiKey as string) : null) || null,
       maxTokens: (p as any).maxTokens ?? 4096,
-      awsProfile: ("awsProfile" in p ? (p.awsProfile as string) : null) || null,
-      awsRegion: ("awsRegion" in p ? (p.awsRegion as string) : null) || null,
       systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt]);
+  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt, connections]);
+
+  // When connections change (e.g., user connected Google Calendar in Settings),
+  // silently restart Pi if the system prompt changed and no message is in-flight.
+  useEffect(() => {
+    if (connections.length === 0) return;
+    const config = buildProviderConfig();
+    if (!config) return;
+    const running = piRunningConfigRef.current;
+    if (!running || running.systemPrompt === config.systemPrompt) return;
+    if (piMessageIdRef.current) return; // don't interrupt an active turn
+    commands.piUpdateConfig(settings.user?.token ?? null, config)
+      .then(() => {
+        if (piRunningConfigRef.current) {
+          piRunningConfigRef.current = { ...piRunningConfigRef.current, systemPrompt: config.systemPrompt };
+        }
+      })
+      .catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connections]);
 
   // Check Pi status on mount — Pi is auto-started at app boot by Rust
   useEffect(() => {
@@ -2540,12 +2810,94 @@ export function StandaloneChat({
     // uniformly.
     const busUnregistrations: Array<() => void> = [];
 
-    // Shared handler for Pi event data — used by both pi_event and pipe_event
+    // Shared handler for Pi event data — used by both pi_event and pipe_event.
+    //
+    // When the rust queue drains a queued prompt, Pi emits text_delta /
+    // thinking_start / tool_execution_start for a NEW turn — but the previous
+    // turn's `agent_end` cleared `piMessageIdRef`, so deltas have no target.
+    // `ensureAssistantPlaceholder` lazily creates one when the trailing message
+    // is a user prompt waiting for a reply (the shape `enqueuePiMessage`
+    // leaves the array in). Idempotent — does nothing when a placeholder
+    // already exists.
+    const ensureAssistantPlaceholder = (): boolean => {
+      if (piMessageIdRef.current) return true;
+      const newAssistantId = (Date.now() + 1).toString();
+      let created = false;
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last || last.role !== "user") return prev;
+        created = true;
+        return [
+          ...prev,
+          {
+            id: newAssistantId,
+            role: "assistant",
+            content: "Processing...",
+            timestamp: Date.now(),
+            model: activePreset?.model,
+            provider: activePreset?.provider,
+          },
+        ];
+      });
+      if (!created) return false;
+      piMessageIdRef.current = newAssistantId;
+      piStreamingTextRef.current = "";
+      piContentBlocksRef.current = [];
+      setStreamedCharCount(0);
+      setIsLoading(true);
+      setIsStreaming(true);
+      const sidNow = piSessionIdRef.current;
+      if (sidNow) {
+        const storeState = useChatStore.getState();
+        storeState.actions.appendMessage(sidNow, {
+          id: newAssistantId,
+          role: "assistant",
+          content: "Processing...",
+          timestamp: Date.now(),
+          model: activePreset?.model,
+          provider: activePreset?.provider,
+        } as any);
+        storeState.actions.setStreaming(sidNow, {
+          streamingMessageId: newAssistantId,
+          streamingText: "",
+          contentBlocks: [],
+          isStreaming: true,
+          isLoading: true,
+        });
+      }
+      return true;
+    };
+
     const handlePiEventData = (data: any) => {
-      try {
+
+        // Mirror status into the chat-store so the sidebar dot reflects what
+        // Pi is actually doing. The bus routes foreground events exclusively
+        // to this listener, so the router (default subscriber) never sees
+        // them — without this mirror, session.status stays at whatever was
+        // set last time the chat was on the background path (usually
+        // "idle"), and the sidebar shows a hollow gray ring while the
+        // chat is mid-stream. Mirroring covers all of: streaming /
+        // thinking / tool / idle / error per `statusForEvent`.
+        try {
+          const sid = piSessionIdRef.current;
+          const next = sid ? statusForEvent(data) : null;
+          if (sid && next) {
+            const store = useChatStore.getState();
+            const cur = store.sessions[sid]?.status;
+            if (cur !== next) {
+              store.actions.patch(sid, { status: next });
+            }
+          }
+        } catch {
+          /* defensive — never let a status-mirror failure break the
+             foreground event handler */
+        }
+
         if (data.type === "message_update" && data.assistantMessageEvent) {
           const evt = data.assistantMessageEvent;
           if (evt.type === "text_delta" && evt.delta) {
+            // First delta of a queued turn → create the placeholder lazily.
+            if (!ensureAssistantPlaceholder()) return;
             piStreamingTextRef.current += evt.delta;
             setStreamedCharCount(piStreamingTextRef.current.length);
 
@@ -2579,6 +2931,7 @@ export function StandaloneChat({
               );
             }
           } else if (evt.type === "thinking_start") {
+            if (!ensureAssistantPlaceholder()) return;
             piThinkingStartRef.current = Date.now();
             const blocks = piContentBlocksRef.current;
             blocks.push({ type: "thinking", text: "", isThinking: true });
@@ -2620,6 +2973,7 @@ export function StandaloneChat({
             }
           }
         } else if (data.type === "tool_execution_start") {
+          if (!ensureAssistantPlaceholder()) return;
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
             const toolCall: ToolCall = {
@@ -2703,7 +3057,10 @@ export function StandaloneChat({
             const quotaErrorType = classifyQuotaError(fullError);
             if (quotaErrorType === "daily" || quotaErrorType === "rate") {
               if (quotaErrorType === "daily") {
-                setMessages((prev) =>
+                try {
+                  const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
+                } catch {}
+                                  setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(fullError) } : m)
                 );
               } else {
@@ -2726,6 +3083,62 @@ export function StandaloneChat({
               );
             }
           }
+        } else if (data.type === "message_start" && data.message?.role === "user") {
+          // pi-mono fires `message_start` for a user message at the start of
+          // every turn that introduces one — i.e. (a) the original prompt
+          // and (b) each queued followUp processed inside the SAME agent run
+          // (only one `agent_end` fires for the whole run, after all
+          // followUps drain). If we relied on `agent_end` to close out the
+          // current assistant message, the followUp's text_delta would land
+          // on the previous turn's assistant bubble (the user saw responses
+          // mashed together: "...Which?Hey. What do you need?").
+          //
+          // Clear the streaming refs here so the next text_delta lazily
+          // creates a fresh assistant placeholder via `ensureAssistantPlaceholder`.
+          // Skip the very first `message_start (user)` of a run — at that
+          // point `sendPiMessage` has just created an empty placeholder and
+          // there's nothing streamed yet (clearing would orphan the
+          // placeholder and re-create a duplicate on the first delta).
+          const hasStreamedContent =
+            piStreamingTextRef.current.length > 0 ||
+            piContentBlocksRef.current.length > 0;
+          if (hasStreamedContent) {
+            piStreamingTextRef.current = "";
+            piMessageIdRef.current = null;
+            piContentBlocksRef.current = [];
+            // Don't touch isLoading/isStreaming — pi-mono is still busy
+            // processing the followUp turn.
+          }
+
+          // The user message tied to this turn just left the queue and is
+          // now in-flight — clear the `queued` flag so the bubble drops
+          // its muted treatment. We match on content text since pi-mono
+          // doesn't echo our optimistic message id back.
+          {
+            const text = (() => {
+              const c = data.message?.content;
+              if (typeof c === "string") return c;
+              if (Array.isArray(c)) {
+                return c
+                  .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+                  .map((p: any) => p.text)
+                  .join("");
+              }
+              return "";
+            })();
+            if (text) {
+              setMessages((prev) => {
+                let cleared = false;
+                return prev.map((m) => {
+                  if (cleared || !m.queued || m.role !== "user" || m.content !== text) {
+                    return m;
+                  }
+                  cleared = true;
+                  return { ...m, queued: false };
+                });
+              });
+            }
+          }
         } else if ((data.type === "message_start" || data.type === "message_end") &&
                    data.message?.role === "assistant" && data.message?.stopReason === "error") {
           // LLM returned an error (credits_exhausted, rate limit, provider error, etc.)
@@ -2738,7 +3151,10 @@ export function StandaloneChat({
 
             const quotaErrorType = classifyQuotaError(errMsg);
             if (quotaErrorType === "daily") {
-              posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
+              try {
+                const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
+                } catch {}
+                            posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errMsg) } : m)
               );
@@ -2792,7 +3208,10 @@ export function StandaloneChat({
               const errStr = agentEndError;
               const quotaErrorType = classifyQuotaError(errStr);
               if (quotaErrorType === "daily") {
-                content = buildDailyLimitMessage(errStr);
+                try {
+                  const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
+                    } catch {}
+                                  content = buildDailyLimitMessage(errStr);
               } else if (quotaErrorType === "rate") {
                   content = buildRateLimitMessage(errStr);
               } else {
@@ -2906,7 +3325,10 @@ export function StandaloneChat({
             const quotaErrorType = classifyQuotaError(errorStr);
             if (quotaErrorType === "daily" || quotaErrorType === "rate") {
               if (quotaErrorType === "daily") {
-                setMessages((prev) =>
+                try {
+                  const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
+                } catch {}
+                                  setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errorStr) } : m)
                 );
               } else {
@@ -2980,31 +3402,7 @@ export function StandaloneChat({
             setIsStreaming(false);
           }
         }
-      } catch (error) {
-        // Unhandled error in Pi event processing — log with context and recover gracefully
-        console.error("[Pi] Event handler error:", error, "Event type:", data?.type, "Event data:", data);
-
-        // Clean up streaming state to prevent stuck UI
-        if (piMessageIdRef.current) {
-          const msgId = piMessageIdRef.current;
-          setMessages((prev) =>
-            prev.map((m) => m.id === msgId ? {
-              ...m,
-              content: `Something went wrong processing the response. Error: ${error instanceof Error ? error.message : String(error)}`
-            } : m)
-          );
-        }
-
-        // Reset all streaming refs to prevent subsequent errors
-        piStreamingTextRef.current = "";
-        piMessageIdRef.current = null;
-        piContentBlocksRef.current = [];
-        piThinkingStartRef.current = null;
-        setActivePipeExecution(null);
-        setIsLoading(false);
-        setIsStreaming(false);
-      }
-    };
+      };
 
     // Publish the current handler to the forwarding ref so foreground
     // registrations (chat + pipe-watch) dispatch through the same
@@ -3157,6 +3555,25 @@ export function StandaloneChat({
 
     setup();
 
+    // Subscribe to queue-pending updates emitted by the rust queue. Each
+    // event carries the full snapshot for ONE session — we filter to the
+    // session this panel is bound to. Single source of truth lives in
+    // `pi_command_queue.rs`; this listener just mirrors it into local state.
+    let unlistenQueue: UnlistenFn | undefined;
+    listen<{ sessionId: string; queued: PiQueuedPrompt[] }>("pi-queue-changed", (event) => {
+      if (!mounted) return;
+      if (event.payload.sessionId !== piSessionIdRef.current) return;
+      setQueuedPrompts(event.payload.queued ?? []);
+    }).then(fn => { unlistenQueue = fn; });
+
+    // Initial fetch — closes the gap between component mount and first event.
+    (async () => {
+      try {
+        const res = await commands.piPending(piSessionIdRef.current);
+        if (mounted && res.status === "ok") setQueuedPrompts(res.data);
+      } catch { /* ignore — queue may not be initialized yet */ }
+    })();
+
     // Restart the current session when a new auth token arrives (deeplink login).
     listen<{ apiKey: string }>("pi-reauth", async (event) => {
       if (!mounted) return;
@@ -3180,6 +3597,7 @@ export function StandaloneChat({
       }
       unlistenLog?.();
       unlistenReauth?.();
+      unlistenQueue?.();
       // Abort any in-flight Pi request when navigating away from chat.
       // Without this, Pi keeps streaming in the background and rejects
       // new messages with "already processing" when the user returns.
@@ -3430,6 +3848,99 @@ export function StandaloneChat({
   }
 
   // Send message using Pi agent
+  /**
+   * Enqueue a follow-up while another prompt is still streaming.
+   *
+   * Distinct from `sendPiMessage` because we explicitly want to NOT:
+   *   - abort the in-flight turn,
+   *   - clobber `piMessageIdRef` / streaming refs,
+   *   - flip `isLoading`/`isStreaming`.
+   *
+   * The rust queue (`pi_command_queue.rs`) holds the prompt until the current
+   * turn's `agent_end` fires, then writes it to stdin. The pi-event-router
+   * downstream picks up the new turn and appends user/assistant content to
+   * the chat-store — same path used for any other message, just kicked off
+   * after the queue drains.
+   */
+  async function enqueuePiMessage(userMessage: string, displayLabel?: string) {
+    if (!piInfo?.running) {
+      // No Pi running → fall back to the normal start-and-send path.
+      return sendPiMessage(userMessage, displayLabel);
+    }
+
+    // Local optimistic message + chat-store mirror. Skips assistant placeholder
+    // entirely; the new turn's `agent_start` (downstream from the rust queue
+    // dequeue) will create one through the existing event flow.
+    // Mark queued=true so the bubble renders with a muted/lighter treatment
+    // until Pi actually starts streaming this turn (cleared in handleAgentStart).
+    const newUserMessage: Message = {
+      id: Date.now().toString(),
+      role: "user",
+      content: userMessage,
+      ...(displayLabel ? { displayContent: displayLabel } : {}),
+      ...(pastedImages.length > 0 ? { images: [...pastedImages] } : {}),
+      timestamp: Date.now(),
+      queued: true,
+    };
+    setMessages((prev) => [...prev, newUserMessage]);
+    setInput("");
+    if (inputRef.current) inputRef.current.style.height = "auto";
+
+    const sidNow = piSessionIdRef.current;
+    if (sidNow) {
+      const storeState = useChatStore.getState();
+      if (!storeState.sessions[sidNow]) {
+        storeState.actions.upsert({
+          id: sidNow,
+          title: "new chat",
+          preview: "",
+          status: "streaming",
+          messageCount: 0,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          pinned: false,
+          unread: false,
+        });
+      }
+      storeState.actions.appendMessage(sidNow, newUserMessage as any);
+      storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
+    }
+
+    // Persist immediately — covers the edge case where Pi crashes between
+    // enqueue and dequeue, leaving the user's message stranded otherwise.
+    void saveConversation([...messages, newUserMessage]);
+
+    posthog.capture("chat_message_enqueued", {
+      provider: activePreset?.provider,
+      model: activePreset?.model,
+      pending_count: queuedPrompts.length + 1,
+    });
+
+    // Convert any data-URL pastes to the Pi image-content shape (same format
+    // used by the normal send path further down in this file).
+    const piImages: Array<{ type: string; mimeType: string; data: string }> = [];
+    for (const img of pastedImages) {
+      const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
+      if (match) {
+        piImages.push({ type: "image", mimeType: match[1], data: match[2] });
+      }
+    }
+    if (pastedImages.length > 0) setPastedImages([]);
+
+    try {
+      const result = await commands.piPrompt(
+        piSessionIdRef.current,
+        userMessage,
+        piImages.length > 0 ? piImages : null,
+      );
+      if (result.status !== "ok") {
+        toast({ title: "failed to queue message", description: result.error, variant: "destructive" });
+      }
+    } catch (e) {
+      console.warn("[Pi] failed to enqueue follow-up:", e);
+    }
+  }
+
   async function sendPiMessage(userMessage: string, displayLabel?: string) {
     // Auto-start Pi if it's not running yet (new session or crash recovery)
     if (!piInfo?.running) {
@@ -3581,6 +4092,16 @@ export function StandaloneChat({
       // sidebar order is otherwise stable.
       storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
     }
+
+    // Persist user message to disk immediately so it survives a
+    // navigate-away-mid-stream or a Pi crash before agent_end. The
+    // existing save-on-isLoading-transition only fires when the stream
+    // completes cleanly — if anything kills the turn before then, the
+    // user's message would otherwise live only in the in-memory store
+    // and vanish on the next cold reload. Fire-and-forget: the next
+    // save (on agent_end) will overwrite the same file with the full
+    // conversation including the assistant reply.
+    void saveConversation([...messages, newUserMessage]);
 
     posthog.capture("chat_message_sent", {
       provider: activePreset?.provider,
@@ -3847,6 +4368,16 @@ export function StandaloneChat({
   async function sendMessage(userMessage: string, displayLabel?: string) {
     if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
 
+    // If a previous prompt is still streaming, enqueue this one at the rust
+    // level instead of going through sendPiMessage (which aborts the previous
+    // turn — exactly what we DON'T want when the user is queueing follow-ups).
+    // The rust queue's drain loop will pull this prompt and write it to stdin
+    // as soon as the in-flight prompt's `agent_end` arrives. The pi-event-router
+    // will append the new turn's user + assistant messages to the chat-store.
+    if (isLoading || isStreaming) {
+      return enqueuePiMessage(userMessage, displayLabel);
+    }
+
     // All providers route through Pi agent
     return sendPiMessage(userMessage, displayLabel);
   }
@@ -3911,7 +4442,7 @@ export function StandaloneChat({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!input.trim() && pastedImages.length === 0) || isLoading) return;
+    if (!input.trim() && pastedImages.length === 0) return;
     sendMessage(input.trim());
   };
 
@@ -3939,7 +4470,7 @@ export function StandaloneChat({
         className={cn(
           "relative flex items-center gap-3 px-4 py-3 border-b border-border/50 bg-gradient-to-r from-background to-muted/30",
           !className && "cursor-grab active:cursor-grabbing",
-          isMac && !className && "pl-[72px]"
+          isMac && !className && !isFullscreen && "pl-[72px]"
         )}
         onMouseDown={async (e) => {
           if (className) return; // embedded — don't drag
@@ -3990,31 +4521,49 @@ export function StandaloneChat({
           startNewConversation={startNewConversation}
         />
         <div className="flex-1" />
-        <Button
-          variant="default"
-          size="sm"
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={async (e) => {
-            e.stopPropagation();
-            piStoppedIntentionallyRef.current = true;
-            await startNewConversation();
-            // Pi will auto-restart on the next message via the sendPiMessage flow
-          }}
-          className="relative z-10 h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
-          title="New chat"
-        >
-          <Plus size={14} />
-          <span>New</span>
-        </Button>
-        <kbd suppressHydrationWarning className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono text-muted-foreground bg-muted/50 border border-border/50 rounded">
-          {formatShortcutDisplay(settings.showChatShortcut || (isMac ? "Control+Super+L" : "Alt+L"), isMac)}
-        </kbd>
+        {/* New-chat affordance + shortcut chip. Shown in the floating
+            overlay chat (`/chat`) where there's no AppSidebar. Hidden
+            on the home page — the AppSidebar's first nav row already
+            spawns a fresh session, so a duplicate top-right button
+            just crowds the BrowserSidebar's column. */}
+        {!hideInlineHistory && (
+          <>
+            <Button
+              variant="default"
+              size="sm"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={async (e) => {
+                e.stopPropagation();
+                piStoppedIntentionallyRef.current = true;
+                await startNewConversation();
+                // Pi will auto-restart on the next message via the sendPiMessage flow
+              }}
+              className="relative z-10 h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
+              title="New chat"
+            >
+              <Plus size={14} />
+              <span>New</span>
+            </Button>
+            <kbd suppressHydrationWarning className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono text-muted-foreground bg-muted/50 border border-border/50 rounded">
+              {formatShortcutDisplay(settings.showChatShortcut || (isMac ? "Control+Super+L" : "Alt+L"), isMac)}
+            </kbd>
+          </>
+        )}
       </div>
 
       {/* Main content area with optional history sidebar — only used in
           the floating overlay window. Home page hides this entirely
           (`hideInlineHistory`) and the same list is rendered in the
           main AppSidebar instead. */}
+
+      {/* Horizontal split: chat column on the left, BrowserSidebar on the
+          right. The browser panel is a sibling of the *whole* chat
+          column (messages + input), so when it opens it pushes both the
+          message scroller and the input bar — instead of the prior
+          structure where it sat next to messages only and the input bar
+          extended underneath it. */}
+      <div className="flex-1 flex min-h-0" data-browser-panel-host>
+      <div className="flex-1 flex flex-col min-w-0">
       <div className="flex-1 flex overflow-hidden">
         <AnimatePresence>
           {!hideInlineHistory && showHistory && (
@@ -4139,7 +4688,12 @@ export function StandaloneChat({
         <div
           ref={scrollContainerRef}
           onScroll={handleMessagesScroll}
-          className="relative flex-1 overflow-y-auto overflow-x-hidden"
+          // min-w-0 lets this flex child shrink when the BrowserSidebar
+          // opens. Without it, flex's default `min-width: auto` keeps the
+          // chat content at content-width and the sidebar overflows past
+          // the right edge of the window — the native webview faithfully
+          // follows the placeholder rect off-screen.
+          className="relative flex-1 min-w-0 overflow-y-auto overflow-x-hidden"
           onContextMenu={(e) => {
             if (messages.length === 0) return;
             e.preventDefault();
@@ -4227,7 +4781,7 @@ export function StandaloneChat({
             )}
           </div>
         )}
-        {messages.length === 0 && !isPreparingPrefill && hasPresets && hasValidModel && !needsLogin && (
+        {messages.length === 0 && !isPreparingPrefill && hasPresets && hasValidModel && (
           <SummaryCards
             onSendMessage={sendMessage}
             autoSuggestions={autoSuggestions}
@@ -4309,11 +4863,15 @@ export function StandaloneChat({
                   setEditingMessageId(message.id);
                 }}
                 className={cn(
-                  "relative rounded-xl px-4 py-3 text-sm border overflow-hidden max-w-full",
+                  "relative rounded-xl px-4 py-3 text-sm border overflow-hidden max-w-full transition-opacity",
                   message.role === "user"
                     ? "bg-foreground text-background border-foreground"
                     : "bg-muted/30 border-border/50",
-                  message.role === "user" && !isLoading && editingMessageId !== message.id && "cursor-text"
+                  message.role === "user" && !isLoading && editingMessageId !== message.id && "cursor-text",
+                  // Queued user messages — visually de-emphasised so the eye stays on
+                  // the active turn. Cleared when pi-mono fires message_start for
+                  // this turn (see handler above).
+                  message.queued && "opacity-50 border-dashed"
                 )}
               >
                 {editingMessageId === message.id ? (
@@ -4340,7 +4898,7 @@ export function StandaloneChat({
                       const idx = messages.findIndex((m) => m.id === message.id);
                       if (idx === -1) return;
                       setMessages((prev) => prev.slice(0, idx));
-                      sendMessage(trimmed);
+                      sendMessage(trimmed, message.displayContent);
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Escape") { e.preventDefault(); setEditingMessageId(null); }
@@ -4496,6 +5054,62 @@ export function StandaloneChat({
             );
           })()}
         </AnimatePresence>
+
+        {/* Queued follow-ups — rendered between the streaming message and the
+            scroll anchor so they sit visually in the "what's next" gap. The
+            list comes from rust via `pi-queue-changed`; entries disappear as
+            the drain loop pulls each prompt and starts streaming it. */}
+        <AnimatePresence>
+          {queuedPrompts.length > 0 && (
+            <motion.div
+              key="queued-rail"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.2 }}
+              className="px-4 py-2 space-y-1.5"
+            >
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground/60 px-1">
+                queued · waiting for current reply
+              </div>
+              {queuedPrompts.map((p, i) => (
+                <motion.div
+                  key={p.id}
+                  layout
+                  initial={{ opacity: 0, x: -6 }}
+                  animate={{ opacity: 0.55, x: 0 }}
+                  exit={{ opacity: 0, x: 6, scale: 0.96 }}
+                  transition={{ duration: 0.18 }}
+                  whileHover={{ opacity: 0.85 }}
+                  className="group/qcard flex items-center gap-2 px-3 py-2 rounded-md border border-dashed border-border/40 bg-transparent text-sm text-muted-foreground/80 hover:border-border hover:bg-muted/30 transition-colors"
+                  title={p.preview.length > 80 ? p.preview : undefined}
+                >
+                  <span className="font-mono text-[10px] text-muted-foreground/50 shrink-0 w-4 text-right">
+                    {i + 1}
+                  </span>
+                  <Clock className="h-3 w-3 flex-shrink-0 opacity-50" />
+                  <span className="truncate flex-1">{p.preview}</span>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await commands.piCancelQueued(piSessionIdRef.current, p.id);
+                      } catch (e) {
+                        console.warn("[Pi] cancel queued failed:", e);
+                      }
+                    }}
+                    className="opacity-0 group-hover/qcard:opacity-100 transition-opacity p-0.5 hover:bg-muted rounded shrink-0"
+                    aria-label="cancel queued message"
+                    title="cancel"
+                  >
+                    <X className="h-3 w-3 text-muted-foreground" />
+                  </button>
+                </motion.div>
+              ))}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         <div ref={messagesEndRef} />
       </div> {/* End of max-w-4xl wrapper */}
 
@@ -4510,10 +5124,11 @@ export function StandaloneChat({
         </button>
       )}
       </div>
+
       </div> {/* End of main content area with history sidebar */}
 
       {/* Input */}
-      <div className="relative border-t border-border/50 bg-gradient-to-t from-muted/20 to-transparent">
+      <div ref={inputSectionRef} className="relative border-t border-border/50 bg-gradient-to-t from-muted/20 to-transparent">
         <div className="max-w-4xl mx-auto w-full">
         {/* Prefill, filters, suggestions first; then attached images in gap; then agent bar; then form */}
         {/* Prefill context indicator from search */}
@@ -4641,29 +5256,79 @@ export function StandaloneChat({
           )}
         </AnimatePresence>
 
-        {/* Persistent auto-suggestions above input */}
+        {/* Persistent auto-suggestions above input. Inline chips when the
+            input is wide enough; collapses to a single trigger button that
+            opens a popover when narrow (e.g. BrowserSidebar squeezed the
+            chat column). 520px is the rough threshold below which 4 chips
+            wrap to multiple rows and eat too much vertical space. */}
         {messages.length > 0 && !isLoading && autoSuggestions.length > 0 && (
-          <div className="px-3 pt-2 flex flex-wrap gap-1.5 items-center">
-            {autoSuggestions.slice(0, 4).map((s, i) => (
+          inputSectionWidth >= 520 ? (
+            <div className="px-3 pt-2 flex flex-wrap gap-1.5 items-center">
+              {autoSuggestions.slice(0, 4).map((s, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => sendMessage(s.text)}
+                  className="px-2.5 py-1 text-[11px] font-mono bg-muted/20 hover:bg-foreground hover:text-background border border-border/20 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer max-w-[280px] truncate"
+                  title={s.preview ? `${s.text} — ${s.preview}` : s.text}
+                >
+                  {s.text}
+                </button>
+              ))}
               <button
-                key={i}
-                type="button"
-                onClick={() => sendMessage(s.text)}
-                className="px-2.5 py-1 text-[11px] font-mono bg-muted/20 hover:bg-foreground hover:text-background border border-border/20 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer max-w-[280px] truncate"
-                title={s.preview ? `${s.text} — ${s.preview}` : s.text}
+                onClick={refreshSuggestions}
+                disabled={suggestionsRefreshing}
+                className="p-0.5 text-muted-foreground/30 hover:text-foreground transition-colors duration-150 disabled:opacity-30 cursor-pointer"
+                title="refresh suggestions"
               >
-                {s.text}
+                <RefreshCw className={`w-3 h-3 ${suggestionsRefreshing ? 'animate-spin' : ''}`} strokeWidth={1.5} />
               </button>
-            ))}
-            <button
-              onClick={refreshSuggestions}
-              disabled={suggestionsRefreshing}
-              className="p-0.5 text-muted-foreground/30 hover:text-foreground transition-colors duration-150 disabled:opacity-30 cursor-pointer"
-              title="refresh suggestions"
-            >
-              <RefreshCw className={`w-3 h-3 ${suggestionsRefreshing ? 'animate-spin' : ''}`} strokeWidth={1.5} />
-            </button>
-          </div>
+            </div>
+          ) : (
+            <div className="px-3 pt-2 flex items-center gap-1.5">
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono bg-muted/20 hover:bg-foreground hover:text-background border border-border/20 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer"
+                    title="Suggested prompts"
+                  >
+                    <Sparkles className="w-3 h-3" strokeWidth={1.5} />
+                    <span>suggestions</span>
+                    <ChevronDown className="w-3 h-3" strokeWidth={1.5} />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  className="w-72 p-1"
+                  align="start"
+                  side="top"
+                  sideOffset={6}
+                >
+                  <div className="flex flex-col gap-0.5">
+                    {autoSuggestions.slice(0, 4).map((s, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => sendMessage(s.text)}
+                        className="text-left px-2 py-1.5 text-[11px] font-mono rounded-sm hover:bg-muted text-muted-foreground hover:text-foreground transition-colors line-clamp-2"
+                        title={s.preview ? `${s.text} — ${s.preview}` : s.text}
+                      >
+                        {s.text}
+                      </button>
+                    ))}
+                  </div>
+                </PopoverContent>
+              </Popover>
+              <button
+                onClick={refreshSuggestions}
+                disabled={suggestionsRefreshing}
+                className="p-0.5 text-muted-foreground/30 hover:text-foreground transition-colors duration-150 disabled:opacity-30 cursor-pointer"
+                title="refresh suggestions"
+              >
+                <RefreshCw className={`w-3 h-3 ${suggestionsRefreshing ? 'animate-spin' : ''}`} strokeWidth={1.5} />
+              </button>
+            </div>
+          )
         )}
 
         {/* Attached images in the gap (above agent bar, like reference); click to open full-screen viewer */}
@@ -4726,16 +5391,26 @@ export function StandaloneChat({
                 time
               </div>
               {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "time").map((s) => {
-                const isActive = activeFilters.timeRanges.some((r) => r.label === s.description);
+                const timeLabels: Record<string, string> = {
+                  "today's activity": "today",
+                  "yesterday": "yesterday",
+                  "past 7 days": "last week",
+                  "past hour": "last hour",
+                  "this morning": "this morning",
+                };
+                const isActive = activeFilters.timeRanges.some((r) => r.label === timeLabels[s.description]);
                 return (
                   <button
                     key={s.tag}
                     type="button"
                     onClick={() => {
                       if (isActive) {
-                        removeFilter("time", s.description);
+                        removeFilter("time", timeLabels[s.description]);
                       } else {
-                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        removeFilter("time");
+                        setTimeout(() => {
+                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        }, 0);
                       }
                       setAppFilterOpen(false);
                     }}
@@ -4766,8 +5441,10 @@ export function StandaloneChat({
                       if (isActive) {
                         removeFilter("content");
                       } else {
-                        if (activeFilters.contentType) removeFilter("content");
-                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        removeFilter("content");
+                        setTimeout(() => {
+                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        }, 0);
                       }
                       setAppFilterOpen(false);
                     }}
@@ -4889,7 +5566,6 @@ export function StandaloneChat({
                 const match = settings.aiPresets?.find((p) => p.id === id);
                 if (match) setActivePreset(match);
               } : undefined}
-              showLoginCta={false}
             />
           </div>
         </div>
@@ -4937,7 +5613,9 @@ export function StandaloneChat({
                 placeholder={
                   disabledReason
                     ? disabledReason
-                    : "Ask about your screen... (type @ for filters, paste images)"
+                    : isLoading || isStreaming
+                      ? "type to queue next message..."
+                      : "Ask about your screen... (type @ for filters, paste images)"
                 }
                 disabled={!canChat}
                 spellCheck={false}
@@ -5086,29 +5764,60 @@ export function StandaloneChat({
               >
                 <Paperclip className="h-4 w-4" />
               </Button>
-              <Button
-                type={isStreaming ? "button" : "submit"}
-                size="icon"
-                disabled={(!input.trim() && !isStreaming && pastedImages.length === 0) || !canChat}
-                onClick={isStreaming ? handleStop : undefined}
-                className={cn(
-                  "h-8 w-8 transition-all duration-200",
-                  isStreaming
-                    ? "bg-foreground text-background hover:bg-foreground/80"
-                    : "bg-foreground text-background hover:bg-background hover:text-foreground"
-                )}
-              >
-                {isStreaming ? (
-                  <Square className="h-4 w-4" />
-                ) : (
-                  <Send className="h-4 w-4" />
-                )}
-              </Button>
+              {(() => {
+                // Three button modes:
+                //   1. streaming + input empty → stop (square)
+                //   2. streaming + input has text → queue (chevron-up, submits, enqueues)
+                //   3. not streaming → send (paper plane)
+                const hasInput = input.trim().length > 0 || pastedImages.length > 0;
+                const isQueueMode = (isLoading || isStreaming) && hasInput;
+                const isStopMode = (isLoading || isStreaming) && !hasInput;
+                return (
+                  <Button
+                    type={isStopMode ? "button" : "submit"}
+                    size="icon"
+                    disabled={(!hasInput && !isStopMode) || !canChat}
+                    onClick={isStopMode ? handleStop : undefined}
+                    className={cn(
+                      "h-8 w-8 transition-all duration-200 relative",
+                      "bg-foreground text-background hover:bg-foreground/80"
+                    )}
+                    title={
+                      isStopMode
+                        ? "stop"
+                        : isQueueMode
+                          ? `queue (${queuedPrompts.length + 1} pending)`
+                          : "send"
+                    }
+                  >
+                    {isStopMode ? (
+                      <Square className="h-4 w-4" />
+                    ) : isQueueMode ? (
+                      <ChevronUp className="h-4 w-4" />
+                    ) : (
+                      <Send className="h-4 w-4" />
+                    )}
+                    {isQueueMode && queuedPrompts.length > 0 && (
+                      <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-[16px] px-1 rounded-full bg-foreground text-background text-[9px] font-mono font-semibold flex items-center justify-center border border-background">
+                        {queuedPrompts.length + 1}
+                      </span>
+                    )}
+                  </Button>
+                );
+              })()}
             </div>
           </div>
         </form>
       </div> {/* End of max-w-4xl input wrapper */}
       </div>
+      </div> {/* End of chat column */}
+
+      {/* Agent-controlled embedded browser. Slides in from the right when
+          the agent navigates (or when restoring a chat that has saved
+          state). The actual page is rendered by a Tauri WebviewWindow
+          positioned over the placeholder div inside this component. */}
+      <BrowserSidebar conversationId={conversationId} />
+      </div> {/* End of horizontal chat+browser split */}
 
 
       {scheduleDialogMessage && (

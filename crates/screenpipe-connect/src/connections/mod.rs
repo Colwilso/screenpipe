@@ -9,8 +9,10 @@
 
 pub mod airtable;
 pub mod asana;
+pub mod bee;
 pub mod bitrix24;
 pub mod brex;
+pub mod browser;
 pub mod calcom;
 pub mod calendly;
 pub mod clickup;
@@ -45,6 +47,7 @@ pub mod otter;
 pub mod perplexity;
 pub mod pipedrive;
 pub mod pocket;
+pub mod posthog;
 pub mod pushover;
 pub mod quickbooks;
 pub mod resend;
@@ -62,6 +65,7 @@ pub mod vercel;
 pub mod whatsapp;
 pub mod zapier;
 pub mod zendesk;
+pub mod zoom;
 
 use crate::oauth;
 use anyhow::Result;
@@ -163,6 +167,40 @@ pub trait Integration: Send + Sync {
     fn proxy_config(&self) -> Option<&'static ProxyConfig> {
         None
     }
+
+    /// Extra PEM-encoded root certificate to trust when calling this
+    /// integration's API. Required for providers that run on a private
+    /// CA (e.g. Bee uses `CN=BeeCertificateAuthority`, not WebPKI).
+    /// Default `None` — system roots only.
+    ///
+    /// The proxy handler in screenpipe-engine and the integration's own
+    /// `test()` both consult this and rebuild their reqwest client with
+    /// the cert appended via `add_root_certificate` when present.
+    fn extra_root_pem(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Build a reqwest client that trusts the given integration's extra root
+/// CA (if any) on top of the system roots. Falls through to a default
+/// client when the integration uses public CAs. Centralised here so the
+/// proxy handler and `test()` callers stay in sync.
+pub fn build_client_for(integ: &dyn Integration) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(pem) = integ.extra_root_pem() {
+        match reqwest::Certificate::from_pem(pem.as_bytes()) {
+            Ok(cert) => builder = builder.add_root_certificate(cert),
+            Err(e) => tracing::warn!(
+                "extra_root_pem for {} failed to parse — falling back to system roots: {}",
+                integ.def().id,
+                e
+            ),
+        }
+    }
+    builder.build().unwrap_or_else(|e| {
+        tracing::warn!("custom client build failed, using default: {}", e);
+        reqwest::Client::new()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +228,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(hubspot::HubSpot),
         Box::new(bitrix24::Bitrix24),
         Box::new(limitless::Limitless),
+        Box::new(bee::Bee),
         Box::new(pocket::Pocket),
         Box::new(airtable::Airtable),
         Box::new(logseq::Logseq),
@@ -197,6 +236,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(ntfy::Ntfy),
         Box::new(toggl::Toggl),
         Box::new(brex::Brex),
+        Box::new(posthog::PostHog),
         Box::new(clickup::ClickUp),
         Box::new(confluence::Confluence),
         Box::new(salesforce::Salesforce),
@@ -225,6 +265,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(loops::Loops),
         Box::new(resend::Resend),
         Box::new(supabase::Supabase),
+        Box::new(zoom::Zoom),
     ]
 }
 
@@ -301,8 +342,9 @@ async fn save_connection(
     save_store(screenpipe_dir, &file_store)
 }
 
-/// Remove a connection from SecretStore. Falls back to the legacy file
-/// only when no SecretStore is available.
+/// Remove a connection from SecretStore and the legacy file.
+/// Always clears both stores so that credentials migrated from the legacy
+/// connections.json (saved before SecretStore was available) are fully removed.
 async fn remove_connection(
     secret_store: Option<&SecretStore>,
     screenpipe_dir: &Path,
@@ -311,13 +353,15 @@ async fn remove_connection(
     if let Some(ss) = secret_store {
         let store_key = format!("cred:{}", key);
         ss.delete(&store_key).await?;
-        return Ok(());
     }
 
-    // No SecretStore — fall back to file
+    // Always also clear from the legacy file — handles the migration case where
+    // credentials were written to connections.json before SecretStore existed.
     let mut file_store = load_store(screenpipe_dir);
-    file_store.remove(key);
-    save_store(screenpipe_dir, &file_store)
+    if file_store.remove(key).is_some() {
+        save_store(screenpipe_dir, &file_store)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +454,16 @@ impl ConnectionManager {
             .iter()
             .find(|i| i.def().id == id)
             .map(|i| i.def())
+    }
+
+    /// Look up the extra root CA PEM (if any) this integration needs.
+    /// Used by the proxy handler to build a reqwest client that trusts
+    /// providers behind a private CA (e.g. Bee).
+    pub fn find_extra_root_pem(&self, id: &str) -> Option<&'static str> {
+        self.integrations
+            .iter()
+            .find(|i| i.def().id == id)
+            .and_then(|i| i.extra_root_pem())
     }
 
     pub async fn disconnect(&self, id: &str) -> Result<()> {

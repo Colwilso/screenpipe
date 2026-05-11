@@ -25,6 +25,7 @@ use screenpipe_engine::{
     analytics, hot_frame_cache::HotFrameCache, power::PowerManagerHandle, server::bind_listener,
     start_power_manager_with_pref, start_sleep_monitor, RecordingConfig, ResourceMonitor, SCServer,
 };
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 /// Shared references that survive capture start/stop cycles.
@@ -44,6 +45,12 @@ pub struct ServerCore {
     /// Local API auth key — exposed to the frontend via Tauri command so
     /// localFetch can inject it synchronously (no async store race).
     pub local_api_key: Option<String>,
+    /// Shutdown signal for the redaction reconciliation workers. Fired
+    /// from `shutdown()` so the workers exit before the tokio runtime
+    /// tears down — otherwise their in-flight sqlx queries (which use
+    /// `tokio::time::timeout` internally) panic with "A Tokio 1.x context
+    /// was found, but it is being shutdown."
+    redact_shutdown: Arc<Notify>,
 }
 
 impl ServerCore {
@@ -55,6 +62,9 @@ impl ServerCore {
     pub async fn start(
         config: &RecordingConfig,
         on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine>,
+        owned_browser: Option<
+            std::sync::Arc<screenpipe_connect::connections::browser::OwnedBrowser>,
+        >,
     ) -> Result<Self, String> {
         info!("Starting server core on port {}", config.port);
         crate::health::set_boot_phase("starting", Some("starting server"));
@@ -64,9 +74,7 @@ impl ServerCore {
         if !config.analytics_id.is_empty() {
             std::env::set_var("SCREENPIPE_ANALYTICS_ID", &config.analytics_id);
         }
-        let offline_mode = screenpipe_core::offline::is_offline_mode();
-        let analytics_effective = config.analytics_enabled && !offline_mode;
-        analytics::init(analytics_effective);
+        analytics::init(config.analytics_enabled);
 
         if config.use_chinese_mirror {
             std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
@@ -249,14 +257,11 @@ impl ServerCore {
         }
 
         crate::health::set_boot_phase("building_audio", Some("starting audio pipeline"));
-        let mut audio_manager = audio_manager_builder
-            .build(db.clone())
-            .await
-            .map_err(|e| {
-                let msg = format!("Failed to build audio manager: {}", e);
-                crate::health::set_boot_error(&msg);
-                msg
-            })?;
+        let mut audio_manager = audio_manager_builder.build(db.clone()).await.map_err(|e| {
+            let msg = format!("Failed to build audio manager: {}", e);
+            crate::health::set_boot_error(&msg);
+            msg
+        })?;
 
         // Wire audio → hot cache
         {
@@ -328,6 +333,7 @@ impl ServerCore {
         server.manual_meeting = Some(manual_meeting.clone());
         server.api_auth = config.api_auth;
         server.api_auth_key = config.api_auth_key.clone();
+        server.owned_browser = owned_browser;
 
         // Secret store — read-only keychain access on startup.
         // Never create a key automatically (that triggers a macOS modal).
@@ -473,6 +479,139 @@ impl ServerCore {
             warn!("mdns advertisement failed (non-fatal): {}", e);
         }
 
+        // ── Async PII reconciliation workers (issue #3185 / PR #3188) ─────
+        // Two independent workers — text and image — each gated by its
+        // own toggle. Both off by default; users opt in through
+        // Settings → Privacy → "AI PII removal".
+        //
+        // The single `pii_backend` config flag selects the inner
+        // adapter for BOTH modalities:
+        //   - "local"   → local ONNX (text: stub, image: rfdetr_v8)
+        //   - "tinfoil" → confidential-compute enclave (H200) for both
+        let backend = config.pii_backend.as_str();
+        let use_tinfoil = matches!(backend, "tinfoil" | "cloud" | "enclave");
+
+        // One shutdown signal, shared across both worker spawn paths and
+        // stored on Self for `shutdown()` to fire on app quit.
+        let redact_shutdown = Arc::new(Notify::new());
+
+        if config.async_pii_redaction {
+            use screenpipe_redact::adapters::opf::{OpfAdapter, OpfConfig};
+            use screenpipe_redact::adapters::tinfoil::TinfoilRedactor;
+            use screenpipe_redact::pipeline::{Pipeline, PipelineConfig};
+            use screenpipe_redact::worker::{Worker, WorkerConfig, ALL_TARGET_TABLES};
+            use screenpipe_redact::Redactor;
+
+            // Backend selection for the text "AI" step:
+            //   - "local"   → on-device candle OPF v3 (opf-rs). First
+            //                 run downloads ~2.8 GB from
+            //                 huggingface.co/screenpipe/pii-text-redactor
+            //                 in the background; until the download
+            //                 finishes the worker runs regex-only.
+            //   - "tinfoil" → Tinfoil confidential-compute enclave.
+            //
+            // The worker is destructive-only: it overwrites the source
+            // columns (`text` / `transcription` / `text_content` /
+            // `accessibility_text`) with the redacted text and stamps
+            // `*_redacted_at`. That's what the user-facing "AI PII
+            // removal" toggle means. The 20260507 migration drops the
+            // dead duplicate columns the old non-destructive mode used.
+            if use_tinfoil {
+                info!("starting async text-PII reconciliation worker (backend=tinfoil)");
+                let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::from_env());
+                let pipeline = Pipeline::regex_then_ai(ai, PipelineConfig::default());
+                let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
+                let cfg = WorkerConfig {
+                    tables: ALL_TARGET_TABLES.to_vec(),
+                    ..Default::default()
+                };
+                let _ = Worker::new(db.pool.clone(), pipeline_arc, cfg)
+                    .spawn_with_shutdown(redact_shutdown.clone());
+            } else {
+                // Local mode: spawn the download+load off the boot path
+                // so a slow first-run HF pull doesn't block the app
+                // launch. The worker is created inside the spawned
+                // task once the model is ready.
+                let pool = db.pool.clone();
+                let shutdown = redact_shutdown.clone();
+                tokio::spawn(async move {
+                    info!(
+                        "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
+                         ~/.screenpipe/models/opf-v6/)"
+                    );
+                    let pipeline = match OpfAdapter::load_or_download(OpfConfig::default()).await {
+                        Ok(adapter) => {
+                            info!(
+                                "starting async text-PII reconciliation worker (backend=local, \
+                                 opf-rs)"
+                            );
+                            let ai: Arc<dyn Redactor> = Arc::new(adapter);
+                            Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                        }
+                        Err(e) => {
+                            warn!(
+                                "couldn't load local OPF redactor ({e}); running text-PII \
+                                 worker in regex-only mode. Switch backend to 'tinfoil' in \
+                                 Settings → Privacy → AI PII removal to use the cloud enclave \
+                                 instead."
+                            );
+                            Pipeline::regex_only()
+                        }
+                    };
+                    let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
+                    let cfg = WorkerConfig {
+                        tables: ALL_TARGET_TABLES.to_vec(),
+                        ..Default::default()
+                    };
+                    let _ = Worker::new(pool, pipeline_arc, cfg)
+                        .spawn_with_shutdown(shutdown);
+                });
+            }
+        }
+
+        if config.async_image_pii_redaction {
+            use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
+            use screenpipe_redact::adapters::tinfoil_image::TinfoilImageRedactor;
+            use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
+            use screenpipe_redact::ImageRedactor;
+
+            let pool = db.pool.clone();
+            if use_tinfoil {
+                info!("starting async image-PII worker (backend=tinfoil)");
+                let detector =
+                    Arc::new(TinfoilImageRedactor::from_env()) as Arc<dyn ImageRedactor>;
+                let _ = ImageWorker::new(pool, detector, ImageWorkerConfig::default())
+                    .spawn_with_shutdown(redact_shutdown.clone());
+            } else {
+                // Local mode: rfdetr_v8 ONNX. First-run downloads
+                // ~108 MB from huggingface.co/screenpipe/pii-image-redactor
+                // and verifies SHA-256 before landing in ~/.screenpipe/models/.
+                let shutdown = redact_shutdown.clone();
+                tokio::spawn(async move {
+                    match RfdetrRedactor::load_or_download(RfdetrConfig::default()).await {
+                        Ok(detector) => {
+                            info!("starting async image-PII worker (backend=local)");
+                            let detector_arc =
+                                Arc::new(detector) as Arc<dyn ImageRedactor>;
+                            let _ = ImageWorker::new(
+                                pool,
+                                detector_arc,
+                                ImageWorkerConfig::default(),
+                            )
+                            .spawn_with_shutdown(shutdown);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "image-PII (local) enabled but couldn't load rfdetr_v8 model; \
+                                 skipping: {e}. switch to backend=tinfoil in Settings to use \
+                                 the cloud enclave instead."
+                            );
+                        }
+                    }
+                });
+            }
+        }
+
         Ok(Self {
             db,
             audio_manager,
@@ -486,6 +625,7 @@ impl ServerCore {
             data_path,
             port: config.port,
             local_api_key: config.api_auth_key.clone(),
+            redact_shutdown,
         })
     }
 
@@ -493,6 +633,14 @@ impl ServerCore {
     pub async fn shutdown(self) {
         info!("Shutting down server core");
         screenpipe_connect::mdns::shutdown();
+
+        // Tell redaction workers to exit BEFORE the tokio runtime tears
+        // down — otherwise their in-flight sqlx queries panic with
+        // "A Tokio 1.x context was found, but it is being shutdown."
+        // Workers loop polling, so signaling early gives them headroom
+        // to land on a select! boundary and exit cleanly.
+        self.redact_shutdown.notify_waiters();
+        info!("Signaled redaction workers to shut down");
 
         // Stop pipe scheduler
         {

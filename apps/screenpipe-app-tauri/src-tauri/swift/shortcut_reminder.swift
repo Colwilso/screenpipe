@@ -15,6 +15,13 @@ public func shortcutSetActionCallback(_ cb: @escaping ShortcutActionCallback) {
     gShortcutCallback = cb
 }
 
+@_cdecl("shortcut_set_meeting_active")
+public func shortcutSetMeetingActive(_ active: Int32) {
+    if #available(macOS 13.0, *) {
+        ShortcutReminderController.shared.setMeetingActive(active != 0)
+    }
+}
+
 // MARK: - Metrics data pushed from Rust
 
 struct OverlayMetrics {
@@ -185,8 +192,14 @@ struct ShortcutReminderView: View {
     var body: some View {
         ZStack {
             if isExpanded {
+                // Once expanded, collapse only when the mouse leaves the
+                // entire expanded bar (so hovering individual buttons inside
+                // doesn't bounce us back).
                 expandedView
                     .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .trailing)))
+                    .onHover { hovering in
+                        if !hovering { isExpanded = false }
+                    }
             } else {
                 collapsedView
                     .transition(.opacity.combined(with: .scale(scale: 1.2, anchor: .trailing)))
@@ -195,37 +208,42 @@ struct ShortcutReminderView: View {
         .fixedSize()
         .accessibilityHidden(true)
         .animation(.easeInOut(duration: kAnimDur), value: isExpanded)
-        .onHover { hovering in
-            isExpanded = hovering
-        }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     // MARK: - Collapsed pill
+    // Three zones, so the only thing that expands on hover is the middle
+    // (equalizer + screen matrix). The app icon opens the timeline; the
+    // phone toggles the meeting. Both stay put under the cursor.
     private var collapsedView: some View {
-        HStack(spacing: s(3)) {
-            if let appIcon = NSApp.applicationIconImage {
-                Image(nsImage: appIcon)
-                    .resizable()
-                    .frame(width: s(12), height: s(12))
+        HStack(spacing: 0) {
+            CollapsedAppIconButton(
+                scale: scale,
+                action: { onAction("open_timeline") }
+            )
+            .padding(.leading, s(5))
+
+            HStack(spacing: s(3)) {
+                AudioEqualizerView(active: metrics.audioActive, speechRatio: metrics.speechRatio)
+                    .frame(width: s(18), height: s(12))
+                ScreenMatrixView(active: metrics.screenActive, captureFps: metrics.captureFps)
+                    .frame(width: s(18), height: s(12))
+                    .clipShape(RoundedRectangle(cornerRadius: 1))
             }
-            AudioEqualizerView(active: metrics.audioActive, speechRatio: metrics.speechRatio)
-                .frame(width: s(18), height: s(12))
-            ScreenMatrixView(active: metrics.screenActive, captureFps: metrics.captureFps)
-                .frame(width: s(18), height: s(12))
-                .clipShape(RoundedRectangle(cornerRadius: 1))
-            ZStack {
-                Image(systemName: "phone.fill")
-                    .font(.system(size: s(6)))
-                    .foregroundColor(metrics.meetingActive ? .white : .white.opacity(0.2))
-                if metrics.meetingActive {
-                    Circle().fill(.white)
-                        .frame(width: s(4), height: s(4))
-                        .offset(x: s(5), y: s(-5))
-                }
+            .padding(.horizontal, s(3))
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { isExpanded = true }
             }
+
+            CollapsedPhoneButton(
+                isActive: metrics.meetingActive,
+                scale: scale,
+                action: { onAction("toggle_meeting") }
+            )
+            .padding(.trailing, s(5))
         }
-        .padding(.horizontal, s(5))
         .frame(height: kBaseCollapsedH * scale)
         .background(Capsule().fill(Color.black.opacity(0.75)))
         .overlay(Capsule().stroke(.white.opacity(0.15), lineWidth: 0.5))
@@ -306,6 +324,67 @@ struct ShortcutCellButton: View {
     }
 }
 
+// App icon button shown in the collapsed pill. Click opens the timeline;
+// hovering it does NOT expand the bar — same rationale as the phone button.
+@available(macOS 13.0, *)
+struct CollapsedAppIconButton: View {
+    let scale: CGFloat
+    let action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Group {
+                if let appIcon = NSApp.applicationIconImage {
+                    Image(nsImage: appIcon)
+                        .resizable()
+                        .frame(width: 12 * scale, height: 12 * scale)
+                        .opacity(hovered ? 1.0 : 0.85)
+                }
+            }
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { h in hovered = h }
+    }
+}
+
+// Phone button shown in the collapsed pill. Same look as the bare icon it
+// replaces, plus a subtle hover halo so the click target is discoverable.
+// Crucially: no .onHover wired to isExpanded — clicking it toggles the
+// meeting without forcing the user through the expanded layout.
+@available(macOS 13.0, *)
+struct CollapsedPhoneButton: View {
+    let isActive: Bool
+    let scale: CGFloat
+    let action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Image(systemName: "phone.fill")
+                    .font(.system(size: 6 * scale))
+                    .foregroundColor(
+                        isActive ? .white :
+                            (hovered ? .white.opacity(0.6) : .white.opacity(0.2))
+                    )
+                if isActive {
+                    Circle().fill(.white)
+                        .frame(width: 4 * scale, height: 4 * scale)
+                        .offset(x: 5 * scale, y: -5 * scale)
+                }
+            }
+            .frame(width: 14 * scale)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { h in hovered = h }
+    }
+}
+
 @available(macOS 13.0, *)
 struct HoverIconButton: View {
     let icon: String
@@ -336,17 +415,11 @@ struct HoverIconButton: View {
     }
 }
 
-// MARK: - Overlay scale (read from ~/.screenpipe/store.bin)
+// MARK: - Overlay scale
 
 private var gOverlayScale: CGFloat = 1.0
 
-private func loadOverlayScale() {
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let storePath = home.appendingPathComponent(".screenpipe/store.bin").path
-    guard let data = FileManager.default.contents(atPath: storePath),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let settings = json["settings"] as? [String: Any],
-          let size = settings["shortcutOverlaySize"] as? String else { return }
+private func setOverlayScale(_ size: String?) {
     switch size {
     case "large": gOverlayScale = 2.0
     case "medium": gOverlayScale = 1.5
@@ -371,20 +444,20 @@ class ShortcutReminderController: NSObject {
     @Published var isExpanded = false
     private var wsTask: URLSessionWebSocketTask?
     private var wsRetryTimer: Timer?
-    private var meetingPollTimer: Timer?
+    private var meetingWsTask: URLSessionWebSocketTask?
+    private var meetingWsRetryTimer: Timer?
     private var prevFramesCaptured: Int?
     private var prevOcrCompleted: Int?
     /// Set from Rust `show_shortcut_reminder` when API auth is enabled (includes ?token=).
     private var metricsWsUrl = "ws://127.0.0.1:3030/ws/metrics"
-    private var meetingsStatusUrl = "http://127.0.0.1:3030/meetings/status"
+    private var eventsWsUrl = "ws://127.0.0.1:3030/ws/meeting-status"
 
     func show(shortcuts: String?) {
         DispatchQueue.main.async { [self] in
+            let prevScale = gOverlayScale
             if let shortcuts = shortcuts {
                 parseShortcuts(shortcuts)
             }
-            let prevScale = gOverlayScale
-            loadOverlayScale()
             if panel == nil || prevScale != gOverlayScale {
                 panel?.orderOut(nil)
                 panel = nil
@@ -397,15 +470,14 @@ class ShortcutReminderController: NSObject {
             panel?.orderFrontRegardless()
             AnimationTick.shared.start()
             connectWebSocket()
-            startMeetingPoll()
+            connectMeetingEventsWebSocket()
         }
     }
 
     func hide() {
         AnimationTick.shared.stop()
         disconnectWebSocket()
-        meetingPollTimer?.invalidate()
-        meetingPollTimer = nil
+        disconnectMeetingEventsWebSocket()
         DispatchQueue.main.async { [self] in
             panel?.orderOut(nil)
         }
@@ -478,40 +550,70 @@ class ShortcutReminderController: NSObject {
         }
     }
 
-    // MARK: - Meeting status polling
+    // MARK: - Meeting status events
 
-    private func startMeetingPoll() {
-        checkMeetingStatus()
-        meetingPollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.checkMeetingStatus()
-        }
-        RunLoop.main.add(meetingPollTimer!, forMode: .common)
+    private func connectMeetingEventsWebSocket() {
+        disconnectMeetingEventsWebSocket()
+        guard let url = URL(string: eventsWsUrl) else { return }
+        let session = URLSession(configuration: .default)
+        let task = session.webSocketTask(with: url)
+        self.meetingWsTask = task
+        task.resume()
+        receiveMeetingEvent()
     }
 
-    private func checkMeetingStatus() {
-        guard let url = URL(string: meetingsStatusUrl) else { return }
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            guard let self = self, let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-            let active = json["active"] as? Bool ?? false
-            DispatchQueue.main.async {
-                if self.metrics.meetingActive != active {
-                    self.metrics.meetingActive = active
-                    self.updateContent()
+    private func disconnectMeetingEventsWebSocket() {
+        meetingWsRetryTimer?.invalidate()
+        meetingWsRetryTimer = nil
+        meetingWsTask?.cancel(with: .goingAway, reason: nil)
+        meetingWsTask = nil
+    }
+
+    private func receiveMeetingEvent() {
+        meetingWsTask?.receive { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let message):
+                if case .string(let text) = message {
+                    self.processMeetingEventMessage(text)
+                }
+                self.receiveMeetingEvent()
+            case .failure:
+                DispatchQueue.main.async {
+                    self.meetingWsRetryTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
+                        self?.connectMeetingEventsWebSocket()
+                    }
                 }
             }
-        }.resume()
+        }
+    }
+
+    private func processMeetingEventMessage(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        let active = payload["active"] as? Bool ?? false
+        setMeetingActive(active)
+    }
+
+    func setMeetingActive(_ active: Bool) {
+        DispatchQueue.main.async { [self] in
+            if self.metrics.meetingActive != active {
+                self.metrics.meetingActive = active
+                self.updateContent()
+            }
+        }
     }
 
     private func parseShortcuts(_ json: String) {
-        // Expects {"overlay":"…","chat":"…","search":"…"} plus optional URLs from Rust when API auth is on.
+        // Expects shortcut labels, size, and optional authenticated API URLs from Rust.
         guard let data = json.data(using: .utf8),
               let dict = try? JSONDecoder().decode([String: String].self, from: data) else { return }
         if let s = dict["overlay"] { overlayShortcut = prettifyShortcut(s) }
         if let s = dict["chat"] { chatShortcut = prettifyShortcut(s) }
         if let s = dict["search"] { searchShortcut = prettifyShortcut(s) }
+        if let s = dict["shortcutOverlaySize"] { setOverlayScale(s) }
         if let s = dict["metrics_ws_url"] { metricsWsUrl = s }
-        if let s = dict["meetings_status_url"] { meetingsStatusUrl = s }
+        if let s = dict["events_ws_url"] { eventsWsUrl = s }
     }
 
     /// Convert "Super+Ctrl+S" → "⌘⌃S" for compact overlay display.

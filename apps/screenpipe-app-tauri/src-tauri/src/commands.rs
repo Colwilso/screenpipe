@@ -47,8 +47,20 @@ static GLOBAL_APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::Onc
 /// Callback invoked from Swift when user clicks a notification action.
 /// Handles "manage" directly in Rust (opens home window to notifications settings).
 /// Other actions are forwarded as Tauri events to JS.
+///
+/// A Rust panic crossing this Cocoa→Rust trampoline aborts the whole app via
+/// `panic_cannot_unwind` (extern "C" can't unwind through ObjC frames). Catch
+/// any panic and log it instead — losing one notification click is much better
+/// than killing the user's session.
 #[cfg(target_os = "macos")]
 extern "C" fn native_notif_action_callback(json_ptr: *const std::os::raw::c_char) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        native_notif_action_callback_inner(json_ptr);
+    }));
+}
+
+#[cfg(target_os = "macos")]
+fn native_notif_action_callback_inner(json_ptr: *const std::os::raw::c_char) {
     if json_ptr.is_null() {
         return;
     }
@@ -146,8 +158,18 @@ extern "C" fn native_notif_action_callback(json_ptr: *const std::os::raw::c_char
 }
 
 /// Callback invoked from Swift when user clicks a shortcut reminder action.
+///
+/// Same panic_cannot_unwind hazard as native_notif_action_callback — wrap the
+/// body in catch_unwind so a runtime hiccup doesn't abort the app.
 #[cfg(target_os = "macos")]
 extern "C" fn native_shortcut_action_callback(action_ptr: *const std::os::raw::c_char) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        native_shortcut_action_callback_inner(action_ptr);
+    }));
+}
+
+#[cfg(target_os = "macos")]
+fn native_shortcut_action_callback_inner(action_ptr: *const std::os::raw::c_char) {
     if action_ptr.is_null() {
         return;
     }
@@ -189,32 +211,66 @@ extern "C" fn native_shortcut_action_callback(action_ptr: *const std::os::raw::c
                     let client = reqwest::blocking::Client::new();
                     let status_req =
                         api.apply_auth_blocking(client.get(api.url("/meetings/status")));
-                    let status: Option<bool> = status_req
+                    let status: Option<serde_json::Value> = status_req
                         .send()
                         .ok()
-                        .and_then(|r| r.json::<serde_json::Value>().ok())
+                        .and_then(|r| r.json::<serde_json::Value>().ok());
+                    let is_active = status
+                        .as_ref()
                         .and_then(|v| v["active"].as_bool());
+                    let stoppable_id = status
+                        .as_ref()
+                        .and_then(|v| v["stoppableMeetingId"].as_i64());
                     match status {
-                        Some(true) => {
-                            let req =
-                                api.apply_auth_blocking(client.post(api.url("/meetings/stop")));
-                            let _ = req.send();
+                        Some(_) if is_active == Some(true) => {
+                            let req = api.apply_auth_blocking(
+                                client
+                                    .post(api.url("/meetings/stop"))
+                                    .header("Content-Type", "application/json")
+                                    .body(serde_json::json!({ "id": stoppable_id }).to_string()),
+                            );
+                            if req.send().is_ok() {
+                                native_shortcut_reminder::set_meeting_active(false);
+                                let _ = app_clone.emit(
+                                    "native-shortcut-toggle-meeting",
+                                    serde_json::json!({
+                                        "active": false,
+                                        "manualActive": false,
+                                        "activeMeetingId": serde_json::Value::Null,
+                                        "stoppableMeetingId": serde_json::Value::Null,
+                                        "meetingApp": serde_json::Value::Null,
+                                        "detectionSource": serde_json::Value::Null,
+                                    }),
+                                );
+                            }
                         }
-                        Some(false) => {
+                        Some(_) if is_active == Some(false) => {
                             let req = api.apply_auth_blocking(
                                 client
                                     .post(api.url("/meetings/start"))
                                     .header("Content-Type", "application/json")
                                     .body(r#"{"app":"manual"}"#),
                             );
-                            let _ = req.send();
+                            if let Ok(res) = req.send() {
+                                let meeting = res.json::<serde_json::Value>().ok();
+                                native_shortcut_reminder::set_meeting_active(true);
+                                let _ = app_clone.emit(
+                                    "native-shortcut-toggle-meeting",
+                                    serde_json::json!({
+                                        "active": true,
+                                        "manualActive": true,
+                                        "activeMeetingId": meeting.as_ref().and_then(|v| v["id"].as_i64()),
+                                        "stoppableMeetingId": meeting.as_ref().and_then(|v| v["id"].as_i64()),
+                                        "meetingApp": meeting.as_ref().and_then(|v| v["meeting_app"].as_str()),
+                                        "detectionSource": meeting.as_ref().and_then(|v| v["detection_source"].as_str()).unwrap_or("manual"),
+                                    }),
+                                );
+                            }
                         }
-                        None => {
+                        _ => {
                             warn!("failed to check meeting status");
                         }
                     }
-                    // Also emit to JS so the home page UI updates immediately if open
-                    let _ = app_clone.emit("native-shortcut-toggle-meeting", "");
                 }
                 _ => {}
             }
@@ -267,6 +323,17 @@ pub async fn get_local_api_config(app_handle: tauri::AppHandle) -> serde_json::V
 pub async fn regenerate_api_auth_key() -> Result<String, String> {
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
     screenpipe_engine::auth_key::regenerate_api_auth_key(&data_dir)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Persist a user-supplied API auth key to the secret store.
+/// The running server keeps its in-memory key until restart.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_api_auth_key(key: String) -> Result<(), String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    screenpipe_engine::auth_key::set_api_auth_key(&data_dir, &key)
         .await
         .map_err(|e| e.to_string())
 }
@@ -476,11 +543,19 @@ pub fn show_main_window(app_handle: &tauri::AppHandle, _overlay: bool) {
 
             // NOTE: On macOS, Escape is registered only from the focus-gain handler
             // in window/show.rs (duplicate RegisterEventHotKey fails there).
-            // On Windows/Linux, set_focus can succeed without delivering a new
-            // Focused(true) event when Home already had focus — then Escape never
-            // re-registers until another focus cycle. Sync once after show.
+            // On Windows/Linux, bypass the is_visible() guard — window.show() posts
+            // an async Win32 message so IsWindowVisible returns false in the same
+            // synchronous frame, causing register_if_main_visible to skip silently.
+            // IMPORTANT: spawn a new thread — show_main_window is invoked from within
+            // the global-shortcut callback which holds the plugin's handler-map lock.
+            // Calling on_shortcut() from inside that callback deadlocks.
             #[cfg(not(target_os = "macos"))]
-            register_window_shortcuts_if_main_visible(app_handle.clone());
+            {
+                let app = app_handle.clone();
+                std::thread::spawn(move || {
+                    let _ = register_window_shortcuts_with_generation(app);
+                });
+            }
         }
         Err(e) => {
             error!("ShowRewindWindow::Main.show failed: {}", e);
@@ -655,7 +730,8 @@ pub async fn open_pipe_window(
     }
 
     let url = format!("http://localhost:{}", port);
-    let window = match tauri::WebviewWindowBuilder::new(
+    #[allow(unused_mut)]
+    let mut builder = tauri::WebviewWindowBuilder::new(
         &app_handle,
         &title,
         tauri::WebviewUrl::External(url.parse().unwrap()),
@@ -664,9 +740,16 @@ pub async fn open_pipe_window(
     .inner_size(1200.0, 850.0)
     .min_inner_size(600.0, 400.0)
     .focused(true)
-    .fullscreen(false)
-    .build()
-    .map(crate::window::finalize_webview_window)
+    .fullscreen(false);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.hidden_title(true);
+    }
+
+    let window = match builder
+        .build()
+        .map(crate::window::finalize_webview_window)
     {
         Ok(window) => window,
         Err(e) => {
@@ -777,15 +860,24 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
         let app_for_nav = app_handle.clone();
 
         const LOGIN_URL: &str = "https://screenpi.pe/login";
-        WebviewWindowBuilder::new(
+        let mut builder = WebviewWindowBuilder::new(
             &app_handle,
             label,
             WebviewUrl::External(LOGIN_URL.parse().unwrap()),
         )
         .title("sign in to screenpipe")
         .inner_size(460.0, 700.0)
-        .focused(true)
-        .on_navigation(move |url| {
+        .focused(true);
+
+        // Hide the title text on macOS — traffic lights stay, title bar
+        // stays opaque (no Overlay style), so the remote login page isn't
+        // covered by the bar. Same pattern used elsewhere in window/show.rs.
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.hidden_title(true);
+        }
+
+        builder = builder.on_navigation(move |url| {
             if url.scheme() == "screenpipe" {
                 info!("login window intercepted deep link: {}", url);
                 let _ = app_for_nav.emit("deep-link-received", url.to_string());
@@ -798,13 +890,14 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
             } else {
                 true // allow all https navigations (Clerk, OAuth providers, etc.)
             }
-        })
-        .build()
-        .map(crate::window::finalize_webview_window)
-        .map_err(|e| {
-            log_webview_build_failure(label, LOGIN_URL, &e);
-            e.to_string()
-        })?;
+        });
+        builder
+            .build()
+            .map(crate::window::finalize_webview_window)
+            .map_err(|e| {
+                log_webview_build_failure(label, LOGIN_URL, &e);
+                e.to_string()
+            })?;
 
         Ok(())
     }
@@ -836,15 +929,21 @@ pub async fn open_google_calendar_auth_window(
     let parsed_url = auth_url
         .parse()
         .map_err(|e| format!("invalid url: {e}"))?;
-    WebviewWindowBuilder::new(
+    let mut builder = WebviewWindowBuilder::new(
         &app_handle,
         label,
         WebviewUrl::External(parsed_url),
     )
     .title("connect google calendar")
     .inner_size(500.0, 700.0)
-    .focused(true)
-    .on_navigation(move |url| {
+    .focused(true);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.hidden_title(true);
+    }
+
+    builder = builder.on_navigation(move |url| {
         if url.scheme() == "screenpipe" {
             info!("google calendar auth window intercepted deep link: {}", url);
             let _ = app_for_nav.emit("deep-link-received", url.to_string());
@@ -855,9 +954,10 @@ pub async fn open_google_calendar_auth_window(
         } else {
             true // allow all https navigations (Google OAuth, etc.)
         }
-    })
-    .build()
-    .map(crate::window::finalize_webview_window)
+    });
+    builder
+        .build()
+        .map(crate::window::finalize_webview_window)
     .map_err(|e| {
         log_webview_build_failure(label, &auth_url, &e);
         e.to_string()
@@ -976,6 +1076,18 @@ pub async fn search_navigate_to_timeline(
     ShowRewindWindow::Main
         .show(&app_handle)
         .map_err(|e| e.to_string())?;
+
+    // Register Escape shortcut so it works even when the overlay doesn't gain keyboard
+    // focus (e.g. Home window keeps focus when a search result opens the overlay).
+    // Bypass register_if_main_visible: window.show() is async on Windows so
+    // IsWindowVisible returns false in the same frame, causing silent skip.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let app = app_handle.clone();
+        std::thread::spawn(move || {
+            let _ = register_window_shortcuts_with_generation(app);
+        });
+    }
 
     // Emit the navigation event multiple times — the Main webview may take
     // varying time to restore from order_out and mount the event listener.
@@ -1335,6 +1447,11 @@ pub async fn show_shortcut_reminder(
 
     info!("show_shortcut_reminder called");
 
+    let shortcut_overlay_size = crate::store::SettingsStore::get(&app_handle)
+        .unwrap_or_default()
+        .unwrap_or_default()
+        .shortcut_overlay_size;
+
     // On macOS, try the native SwiftUI shortcut reminder first
     #[cfg(target_os = "macos")]
     {
@@ -1390,24 +1507,27 @@ pub async fn show_shortcut_reminder(
                     );
                 }
             }
+            map.insert(
+                "shortcutOverlaySize".to_string(),
+                serde_json::Value::String(shortcut_overlay_size.clone()),
+            );
             if let Some(state) = app_handle.try_state::<RecordingState>() {
                 let guard = state.server.lock().await;
                 if let Some(ref core) = *guard {
                     let mut metrics_ws_url = format!("ws://127.0.0.1:{}/ws/metrics", core.port);
-                    let mut meetings_status_url =
-                        format!("http://127.0.0.1:{}/meetings/status", core.port);
+                    let mut events_ws_url = format!("ws://127.0.0.1:{}/ws/meeting-status", core.port);
                     if let Some(ref key) = core.local_api_key {
                         let enc = urlencoding::encode(key);
                         metrics_ws_url = format!("{}?token={}", metrics_ws_url, enc);
-                        meetings_status_url = format!("{}?token={}", meetings_status_url, enc);
+                        events_ws_url = format!("{}?token={}", events_ws_url, enc);
                     }
                     map.insert(
                         "metrics_ws_url".to_string(),
                         serde_json::json!(metrics_ws_url),
                     );
                     map.insert(
-                        "meetings_status_url".to_string(),
-                        serde_json::json!(meetings_status_url),
+                        "events_ws_url".to_string(),
+                        serde_json::json!(events_ws_url),
                     );
                 }
             }
@@ -1421,12 +1541,7 @@ pub async fn show_shortcut_reminder(
 
     // Window dimensions: 2-row grid (3 shortcuts + activity viz)
     // Scale based on overlay size setting
-    let scale = match crate::store::SettingsStore::get(&app_handle)
-        .unwrap_or_default()
-        .unwrap_or_default()
-        .shortcut_overlay_size
-        .as_str()
-    {
+    let scale = match shortcut_overlay_size.as_str() {
         "large" => 2.0_f64,
         "medium" => 1.5,
         _ => 1.0,
@@ -2076,13 +2191,16 @@ pub(crate) fn unregister_window_shortcuts_if_generation_unchanged(
 
 /// True if any Tauri webview in this process currently holds keyboard focus.
 /// Used on Windows/Linux to tell "focus left Main for another app" from
-/// "focus moved to Home while overlay stays visible".
+/// "focus moved to Home while overlay stays visible". macOS uses NSPanel
+/// ordering instead and doesn't need this.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn any_screenpipe_webview_has_focus(app: &tauri::AppHandle) -> bool {
     app.webview_windows()
         .values()
         .any(|w| w.is_focused().unwrap_or(false))
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn main_overlay_is_visible(app: &tauri::AppHandle) -> bool {
     for label in [RewindWindowId::Main.label(), "main-window"] {
         if let Some(w) = app.get_webview_window(label) {
@@ -2097,6 +2215,7 @@ pub(crate) fn main_overlay_is_visible(app: &tauri::AppHandle) -> bool {
 /// Re-register Escape when a non-Main window (e.g. Home) gains focus while the
 /// overlay is still shown — otherwise Main's blur path unregisters Escape and
 /// Esc stops working until Main is focused again.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn register_window_shortcuts_if_main_visible(app: tauri::AppHandle) {
     if is_main_close_in_progress() {
         info!("shortcut-sync: skip register_if_visible (reason=main_close_in_progress)");
@@ -2277,17 +2396,16 @@ pub async fn open_note_path(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
         let obsidian_uri = format!("obsidian://open?path={}", urlencoding::encode(&path));
-        if Command::new("cmd")
-            .args(["/C", "start", "", &obsidian_uri])
-            .spawn()
-            .is_ok()
-            || Command::new("cmd")
-                .args(["/C", "start", "", &path])
-                .spawn()
-                .is_ok()
-        {
+        let mut a = Command::new("cmd");
+        a.args(["/C", "start", "", &obsidian_uri]);
+        a.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let mut b = Command::new("cmd");
+        b.args(["/C", "start", "", &path]);
+        b.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        if a.spawn().is_ok() || b.spawn().is_ok() {
             Ok(())
         } else {
             Err(format!("failed to open note path: {}", path))

@@ -8,7 +8,7 @@ use anyhow::Result;
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 use cpal::traits::{DeviceTrait, StreamTrait};
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
-use cpal::StreamError;
+use cpal::Error as CpalError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -58,7 +58,7 @@ impl AudioStreamConfig {
 impl From<&cpal::SupportedStreamConfig> for AudioStreamConfig {
     fn from(config: &cpal::SupportedStreamConfig) -> Self {
         Self {
-            sample_rate: config.sample_rate().0,
+            sample_rate: config.sample_rate(),
             channels: config.channels(),
         }
     }
@@ -227,30 +227,73 @@ impl AudioStream {
         let device_name = device.name()?;
 
         Ok(tokio::task::spawn_blocking(move || {
-            let error_callback = create_error_callback(
+            // Primary attempt: the "best" config get_cpal_device_and_config
+            // picked (highest sample rate × most channels from
+            // supported_input_configs). On Windows 11 24H2 WASAPI sometimes
+            // over-reports what the shared-mode engine actually accepts and
+            // initialization returns AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008,
+            // surfaced as `OS error -2004287480`) — SCREENPIPE-CLI-S2.
+            // Recover by falling back to `default_input_config()` which is
+            // exactly the device's current shared-mode mix format, so it
+            // can't be rejected for shape reasons.
+            let primary_cb = create_error_callback(
                 device_name.clone(),
-                is_running_weak,
-                is_disconnected,
-                stream_control_tx,
+                is_running_weak.clone(),
+                is_disconnected.clone(),
+                stream_control_tx.clone(),
             );
-
-            let stream = build_input_stream(&device, &config, channels, tx, error_callback);
-
-            match stream {
-                Ok(stream) => {
-                    if let Err(e) = stream.play() {
-                        error!("failed to play stream for {}: {}", device_name, e);
-                        return;
-                    }
-
-                    if let Ok(StreamControl::Stop(response)) = stream_control_rx.recv() {
-                        stream.pause().ok();
-                        drop(stream);
-                        response.send(()).ok();
+            let stream = match build_input_stream(&device, &config, channels, tx.clone(), primary_cb) {
+                Ok(s) => Some(s),
+                Err(primary_err) if is_wasapi_unsupported_format(&primary_err) => {
+                    warn!(
+                        "primary input config rejected for {} ({}), retrying with default_input_config",
+                        device_name, primary_err
+                    );
+                    match device.default_input_config() {
+                        Ok(fallback) => {
+                            let fb_channels = fallback.channels();
+                            let fallback_cb = create_error_callback(
+                                device_name.clone(),
+                                is_running_weak,
+                                is_disconnected,
+                                stream_control_tx,
+                            );
+                            match build_input_stream(&device, &fallback, fb_channels, tx, fallback_cb) {
+                                Ok(s) => Some(s),
+                                Err(fallback_err) => {
+                                    error!(
+                                        "default_input_config also rejected for {}: {} (primary: {})",
+                                        device_name, fallback_err, primary_err
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "could not get default_input_config for {}: {} (primary: {})",
+                                device_name, e, primary_err
+                            );
+                            None
+                        }
                     }
                 }
                 Err(e) => {
                     error!("Failed to build input stream: {}", e);
+                    None
+                }
+            };
+
+            if let Some(stream) = stream {
+                if let Err(e) = stream.play() {
+                    error!("failed to play stream for {}: {}", device_name, e);
+                    return;
+                }
+
+                if let Ok(StreamControl::Stop(response)) = stream_control_rx.recv() {
+                    stream.pause().ok();
+                    drop(stream);
+                    response.send(()).ok();
                 }
             }
         }))
@@ -267,21 +310,46 @@ impl AudioStream {
         // on its own — no stream_control message needed.
         #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
         {
+            // Sources without a cpal control channel (e.g. `from_wav`,
+            // `from_sender_for_test`) drop the receiver, so the send/recv
+            // here will error. That's expected — `is_disconnected` already
+            // signals the playback task to exit. Don't propagate this error.
             let (tx, rx) = oneshot::channel();
-            self.stream_control.send(StreamControl::Stop(tx))?;
-            rx.await?;
+            if self.stream_control.send(StreamControl::Stop(tx)).is_ok() {
+                let _ = rx.await;
+            }
         }
 
         if let Some(thread_arc) = self.stream_thread.as_ref() {
             let thread_arc_clone = thread_arc.clone();
-            let thread_handle = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 let mut thread_guard = thread_arc_clone.blocking_lock();
                 if let Some(join_handle) = thread_guard.take() {
-                    join_handle.abort();
+                    // Wait up to 3s for the playback task to exit naturally so cpal
+                    // stream.pause()+drop() can run before the stream resources go
+                    // away — aborting mid-callback is what races the CoreAudio IO
+                    // thread into UAF (issue #3261). If the task is wedged in cpal
+                    // / CoreAudio though, fall back to abort() so stop() can't hang
+                    // forever on quit/device-switch.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while !join_handle.is_finished()
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    if !join_handle.is_finished() {
+                        // Fully-qualified — `use tracing::{error, warn}` above
+                        // is cfg-gated to non-pulseaudio builds, so on linux+
+                        // pulseaudio CI (Release CLI) `warn!` is out of scope.
+                        tracing::warn!(
+                            "audio stream thread did not exit within 3s; aborting (potential cpal/CoreAudio wedge)"
+                        );
+                        join_handle.abort();
+                    }
                 }
-            });
-
-            thread_handle.await?;
+            })
+            .await?;
         }
 
         Ok(())
@@ -317,6 +385,83 @@ impl AudioStream {
         };
         (stream, tx_arc)
     }
+
+    /// Build an AudioStream that plays back a wav (or any symphonia-decodable)
+    /// file into the broadcast channel, mimicking what a real cpal device
+    /// would produce. Lets the eval harness drive the full pipeline (VAD,
+    /// segmentation, embedding, clustering) on a fixture without needing
+    /// audio hardware.
+    ///
+    /// `realtime=true` sleeps `chunk_duration_ms` between chunks so VAD and
+    /// segmentation timeout logic see realistic wall-clock pacing. `false`
+    /// drains as fast as possible (CI/eval).
+    ///
+    /// The pipeline expects 16 kHz mono f32; non-matching wavs are resampled
+    /// up-front via `crate::resample` so VAD frame timing stays correct.
+    pub async fn from_wav(path: &std::path::Path, realtime: bool) -> Result<Self> {
+        const TARGET_SAMPLE_RATE: u32 = 16_000;
+        const CHUNK_SIZE: usize = 1024;
+
+        let (samples, source_rate) = crate::pcm_decode(path)
+            .map_err(|e| anyhow::anyhow!("failed to decode {}: {}", path.display(), e))?;
+
+        let samples = if source_rate != TARGET_SAMPLE_RATE {
+            crate::resample(&samples, source_rate, TARGET_SAMPLE_RATE)?
+        } else {
+            samples
+        };
+
+        // 1000-deep buffer matches `from_device`. Keeping the receiver
+        // unsubscribed at construction time mirrors cpal: the stream isn't
+        // started until subscribe(); use `start_wav_playback` below.
+        let (tx, _) = broadcast::channel::<Vec<f32>>(1000);
+        let tx_clone = tx.clone();
+        let (stream_control_tx, _rx) = mpsc::channel();
+        let is_disconnected = Arc::new(AtomicBool::new(false));
+        let is_disconnected_clone = is_disconnected.clone();
+
+        let device = Arc::new(AudioDevice::new(
+            format!("wav:{}", path.display()),
+            super::device::DeviceType::Input,
+        ));
+
+        let chunk_duration_ms = (CHUNK_SIZE as u64 * 1000) / TARGET_SAMPLE_RATE as u64;
+
+        let thread = tokio::spawn(async move {
+            // broadcast::Sender drops if no subscriber exists yet. Wait briefly
+            // so the eval binary has time to .subscribe() before chunks fly.
+            for _ in 0..50 {
+                if tx.receiver_count() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            for chunk in samples.chunks(CHUNK_SIZE) {
+                if is_disconnected_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                if tx.send(chunk.to_vec()).is_err() {
+                    break;
+                }
+                if realtime {
+                    tokio::time::sleep(std::time::Duration::from_millis(chunk_duration_ms)).await;
+                }
+            }
+            is_disconnected_clone.store(true, Ordering::Relaxed);
+        });
+
+        Ok(AudioStream {
+            device,
+            device_config: AudioStreamConfig::new(TARGET_SAMPLE_RATE, 1),
+            transmitter: Arc::new(tx_clone),
+            stream_control: stream_control_tx,
+            // Reuse the existing `Option<Arc<Mutex<Option<JoinHandle<()>>>>>`
+            // shape so `stop()` can abort the playback task uniformly.
+            stream_thread: Some(Arc::new(tokio::sync::Mutex::new(Some(thread)))),
+            is_disconnected,
+        })
+    }
 } // end impl AudioStream
 
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
@@ -325,8 +470,8 @@ fn create_error_callback(
     is_running_weak: std::sync::Weak<AtomicBool>,
     is_disconnected: Arc<AtomicBool>,
     stream_control_tx: mpsc::Sender<StreamControl>,
-) -> impl FnMut(StreamError) + Send + 'static {
-    move |err: StreamError| {
+) -> impl FnMut(CpalError) + Send + 'static {
+    move |err: CpalError| {
         if err
             .to_string()
             .contains("The requested device is no longer available")
@@ -357,18 +502,33 @@ fn create_error_callback(
     }
 }
 
+/// Detect WASAPI's `AUDCLNT_E_UNSUPPORTED_FORMAT` (HRESULT 0x88890008)
+/// surfaced through cpal as `failed to initialize audio client: OS Error
+/// -2004287480 (FormatMessageW() returned error 317)`. The HRESULT has
+/// no system message string, hence error 317 (`ERROR_MR_MID_NOT_FOUND`)
+/// from `FormatMessageW` — we recognize the numeric form instead. Also
+/// match a few text forms so we keep catching this if cpal's wrapper
+/// changes its formatting.
+#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+fn is_wasapi_unsupported_format(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("-2004287480")
+        || s.contains("0x88890008")
+        || s.to_lowercase().contains("unsupported format")
+}
+
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     channels: u16,
     tx: broadcast::Sender<Vec<f32>>,
-    error_callback: impl FnMut(StreamError) + Send + 'static,
+    error_callback: impl FnMut(CpalError) + Send + 'static,
 ) -> Result<cpal::Stream> {
     match config.sample_format() {
         cpal::SampleFormat::F32 => device
             .build_input_stream(
-                &config.config(),
+                config.config(),
                 move |data: &[f32], _: &_| {
                     let mono = audio_to_mono(data, channels);
                     let _ = tx.send(mono);
@@ -379,7 +539,7 @@ fn build_input_stream(
             .map_err(|e| anyhow!(e)),
         cpal::SampleFormat::I16 => device
             .build_input_stream(
-                &config.config(),
+                config.config(),
                 move |data: &[i16], _: &_| {
                     let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let mono = audio_to_mono(&f32_data, channels);
@@ -391,7 +551,7 @@ fn build_input_stream(
             .map_err(|e| anyhow!(e)),
         cpal::SampleFormat::I32 => device
             .build_input_stream(
-                &config.config(),
+                config.config(),
                 move |data: &[i32], _: &_| {
                     let f32_data: Vec<f32> = data
                         .iter()
@@ -406,7 +566,7 @@ fn build_input_stream(
             .map_err(|e| anyhow!(e)),
         cpal::SampleFormat::I8 => device
             .build_input_stream(
-                &config.config(),
+                config.config(),
                 move |data: &[i8], _: &_| {
                     let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 128.0).collect();
                     let mono = audio_to_mono(&f32_data, channels);
@@ -434,5 +594,72 @@ impl Drop for AudioStream {
             let _ = stream_control.send(StreamControl::Stop(oneshot::channel().0));
             is_disconnected.store(true, Ordering::Relaxed);
         });
+    }
+}
+
+#[cfg(test)]
+mod from_wav_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// 16 kHz mono sine wav round-trips through `from_wav`. The test counts
+    /// every chunk that lands on the broadcast receiver — sample count must
+    /// match the original signal exactly (resampling is bypassed for 16 kHz).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn from_wav_emits_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sine.wav");
+
+        let sample_rate: u32 = 16_000;
+        let total_samples: usize = 8_000; // 0.5s
+        let mut samples = Vec::with_capacity(total_samples);
+        for i in 0..total_samples {
+            let t = i as f32 / sample_rate as f32;
+            samples.push((t * 440.0 * std::f32::consts::TAU).sin() * 0.5);
+        }
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        {
+            let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+            for s in &samples {
+                writer.write_sample(*s).expect("write sample");
+            }
+            writer.finalize().expect("finalize wav");
+        }
+
+        let stream = AudioStream::from_wav(&path, false).await.expect("from_wav");
+        let mut rx = stream.subscribe().await;
+
+        let mut received = 0usize;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Ok(chunk)) => received += chunk.len(),
+                Ok(Err(_)) => break, // sender dropped — playback finished
+                Err(_) => break,     // timeout — done
+            }
+        }
+
+        // The wav writer pads the last chunk; allow the playback to undershoot
+        // by at most one chunk (1024 samples) but never overshoot.
+        assert!(
+            received <= total_samples,
+            "received {} > expected {}",
+            received,
+            total_samples
+        );
+        assert!(
+            received >= total_samples.saturating_sub(1024),
+            "received {} < expected {} (lost too many)",
+            received,
+            total_samples
+        );
+
+        // stop() must be a no-op clean shutdown for wav-backed streams.
+        stream.stop().await.expect("stop");
     }
 }

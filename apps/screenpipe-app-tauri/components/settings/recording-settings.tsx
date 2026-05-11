@@ -693,10 +693,7 @@ export function RecordingSettings() {
           throw new Error(`Failed to fetch audio devices: ${audioResult.error}`);
         }
         const audioDevices = audioResult.data;
-        console.log("audioDevices", audioDevices);
         setAvailableAudioDevices(audioDevices);
-
-        console.log("settings", settings);
 
         // Update monitors — match by stable ID, with backward compat for old numeric IDs
         // and fuzzy fallback when only position changed (name+resolution still match)
@@ -768,7 +765,8 @@ export function RecordingSettings() {
           false
         );
       } catch (error) {
-        console.error("Failed to load devices:", error);
+        const msg = (error as Error)?.stack ?? (error as Error)?.message ?? String(error);
+        console.error("Failed to load devices:", msg);
       }
     };
 
@@ -813,8 +811,6 @@ export function RecordingSettings() {
     });
 
     try {
-      console.log("Applying settings:", settings);
-
       if (!settings.analyticsEnabled) {
         posthog.capture("telemetry", {
           enabled: false,
@@ -1814,7 +1810,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     CoreAudio system audio capture
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    Captures system audio via the CoreAudio Process Tap API (macOS 14.4+). Survives SCK display-enumeration failures after sleep/wake. <strong>Off by default</strong> — the Process Tap can't see audio from voice-processing apps (Zoom / Google Meet / Microsoft Teams), so turning it on will silently drop all meeting audio. Leave off unless you specifically need the sleep/wake resilience. Falls back to ScreenCaptureKit automatically if unavailable. Restart recording after changing.
+                    New system audio API on macOS 14.4+. May fix some capture issues. Restart recording after changing.
                   </p>
                 </div>
               </div>
@@ -1865,6 +1861,39 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   </div>
                 </div>
                 <Switch id="useAllMonitors" checked={settings.useAllMonitors} onCheckedChange={(checked) => handleSettingsChange({ useAllMonitors: checked }, true)} />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Recording quality — single knob for crispness + disk cost */}
+        {!settings.disableVision && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center space-x-2.5 min-w-0">
+                  <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-medium text-foreground">Recording quality</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Pick "high" or "max" if your text looks blurry on a 4K / ultrawide. Higher = crisper + larger files.
+                    </p>
+                  </div>
+                </div>
+                <Select
+                  value={settings.videoQuality || "balanced"}
+                  onValueChange={(value) => handleSettingsChange({ videoQuality: value }, true)}
+                >
+                  <SelectTrigger className="w-[180px] h-8 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="low">low — 1280px, smallest</SelectItem>
+                    <SelectItem value="balanced">balanced — 1920px (default)</SelectItem>
+                    <SelectItem value="high">high — 3840px, ultrawide-safe</SelectItem>
+                    <SelectItem value="max">max — native, no downscale</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             </CardContent>
           </Card>

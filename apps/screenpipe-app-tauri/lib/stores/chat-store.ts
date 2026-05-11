@@ -76,6 +76,11 @@ export interface SessionRecord {
    *  instant the user makes that session current. Sidebar renders unread
    *  rows in bold, like an email inbox. */
   unread: boolean;
+  /** True until the assistant has replied at least once. Draft sessions
+   *  are hidden in the sidebar so the user can't accumulate empty chats
+   *  by clicking "New chat" repeatedly. Cleared on the first successful
+   *  save (after the assistant replies). */
+  draft?: boolean;
 
   // ── Live session content (Phase 3) ─────────────────────────────────
   // The chat panel reads these instead of holding its own per-render
@@ -325,7 +330,14 @@ export const useChatStore = create<ChatStore>((set) => ({
       set((s) => {
         const existing = s.sessions[id];
         if (!existing) return {};
-        if (s.currentId === id) return {}; // can't be unread for the current view
+        // Can't be unread for the chat the user is actively looking at.
+        if (s.currentId === id) return {};
+        // Also a no-op when the chat is still loaded in the (display:none)
+        // panel — the user already read what's there; trailing deltas that
+        // arrive after they navigate to Settings/Pipes/Memories/Timeline
+        // shouldn't re-light the unread dot. The panel keeps streaming in
+        // the background and panelSessionId tracks its current conversation.
+        if (s.panelSessionId === id) return {};
         if (existing.unread) return {}; // already unread, avoid re-render churn
         return {
           sessions: { ...s.sessions, [id]: { ...existing, unread: true } },
@@ -483,6 +495,16 @@ export const useChatStore = create<ChatStore>((set) => ({
         const incomingMsgs = snapshot.messages ?? [];
         const messages =
           incomingMsgs.length >= existingMsgs.length ? incomingMsgs : existingMsgs;
+        // Guard: never let a stale React closure re-enable streaming that
+        // endTurn() already cleared. endTurn writes synchronously into
+        // Zustand, but setIsStreaming/setIsLoading are async React state
+        // updates — a fast nav right after agent_end can snapshot
+        // isStreaming=true from the old render while the store already
+        // holds false. If the store says false, it wins.
+        const isStreaming =
+          existing.isStreaming === false ? false : snapshot.isStreaming;
+        const isLoading =
+          existing.isLoading === false ? false : snapshot.isLoading;
         return {
           sessions: {
             ...s.sessions,
@@ -493,8 +515,8 @@ export const useChatStore = create<ChatStore>((set) => ({
               streamingText: snapshot.streamingText,
               streamingMessageId: snapshot.streamingMessageId,
               contentBlocks: snapshot.contentBlocks,
-              isStreaming: snapshot.isStreaming,
-              isLoading: snapshot.isLoading,
+              isStreaming,
+              isLoading,
               hydratedAt: existing.hydratedAt ?? Date.now(),
               // No updatedAt bump — snapshot is plumbing, not user activity.
             },
@@ -570,14 +592,23 @@ function sortKey(s: SessionRecord): number {
   return s.lastUserMessageAt ?? s.createdAt;
 }
 
+/** Tier: user-touched chats (any lastUserMessageAt set) sit above
+ *  auto-generated rows (pipe-watch / pipe-run completions). Without
+ *  this, a pipe that finished 30 s ago would outrank a chat the user
+ *  typed in 2 min ago — `createdAt` of a fresh pipe session is more
+ *  recent than the user's last bump. Lower tier = higher in list. */
+function tier(s: SessionRecord): number {
+  return s.lastUserMessageAt ? 0 : 1;
+}
+
+function compareForSidebar(a: SessionRecord, b: SessionRecord): number {
+  return tier(a) - tier(b) || sortKey(b) - sortKey(a);
+}
+
 export function selectOrderedSessions(state: ChatStore): SessionRecord[] {
   const all = Object.values(state.sessions);
-  const pinned = all
-    .filter((s) => s.pinned)
-    .sort((a, b) => sortKey(b) - sortKey(a));
-  const recents = all
-    .filter((s) => !s.pinned)
-    .sort((a, b) => sortKey(b) - sortKey(a));
+  const pinned = all.filter((s) => s.pinned).sort(compareForSidebar);
+  const recents = all.filter((s) => !s.pinned).sort(compareForSidebar);
   return [...pinned, ...recents];
 }
 
@@ -592,12 +623,8 @@ export function useOrderedSessions(): SessionRecord[] {
   const sessionsMap = useChatStore((s) => s.sessions);
   return useMemo(() => {
     const all = Object.values(sessionsMap);
-    const pinned = all
-      .filter((s) => s.pinned)
-      .sort((a, b) => sortKey(b) - sortKey(a));
-    const recents = all
-      .filter((s) => !s.pinned)
-      .sort((a, b) => sortKey(b) - sortKey(a));
+    const pinned = all.filter((s) => s.pinned).sort(compareForSidebar);
+    const recents = all.filter((s) => !s.pinned).sort(compareForSidebar);
     return [...pinned, ...recents];
   }, [sessionsMap]);
 }

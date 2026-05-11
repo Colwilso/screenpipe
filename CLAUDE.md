@@ -212,3 +212,7 @@ The VisionManager uses event-driven capture triggered by OS events (clicks, app 
 - showing price in hero CTA ("$99/mo") slightly hurts vs plain "DOWNLOAD" (-18%)
 - prominent guarantee banner above pricing -- no effect
 - annual plan shown first doubles annual uptake (36% vs 18%), similar total checkout rate
+
+## context
+
+- always use progressive disclosure when designing agentic systems

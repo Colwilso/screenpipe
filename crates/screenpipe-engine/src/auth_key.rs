@@ -26,13 +26,33 @@ pub async fn resolve_api_auth_key(data_dir: &Path, settings_key: Option<&str>) -
 
     // Read the existing secret-store value once — used both as a fallback
     // source and to avoid a no-op write when nothing has changed.
+    //
+    // CRITICAL: distinguish "no row" from "row exists but unreadable". If
+    // `get()` errors (decrypt failure, IO error), we MUST log loudly — the
+    // chain below will fall through to "auto-generate" and silently rotate
+    // the user's API key, breaking every consumer that cached the prior
+    // value (webview, MCP, CLI). Concrete trigger: built-from-source dev
+    // build wrote an encrypted `api_auth_key` whose keychain ACL is scoped
+    // to the dev bundle id; user later switches to the prod build, which
+    // can read the secrets table but the keychain ACL denies the decrypt
+    // for `screenpi.pe`. Result: rotation, mismatched in-memory caches,
+    // 401 storms — observed for chris@lovephoenixhomes.com 2026-05-06.
     let stored_key: Option<String> = if let Some(ref s) = store {
-        s.get("api_auth_key")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .filter(|k| !k.is_empty())
+        match s.get("api_auth_key").await {
+            Ok(Some(bytes)) => String::from_utf8(bytes).ok().filter(|k| !k.is_empty()),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(
+                    "api auth: failed to read api_auth_key from secret store — \
+                     resolver will fall through to auto-generate, rotating the \
+                     key out from under cached consumers. Likely cause: keychain \
+                     ACL mismatch (dev↔prod bundle id, recent encryption toggle, \
+                     or revoked keychain item). Error: {}",
+                    e
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -79,6 +99,24 @@ fn resolve_without_env(
     (k, "auto-generated")
 }
 
+/// Persist a user-supplied key to the secret store, replacing whatever was
+/// there before. The running server keeps its in-memory key until restart.
+pub async fn set_api_auth_key(data_dir: &Path, key: &str) -> Result<()> {
+    anyhow::ensure!(!key.is_empty(), "api auth key must not be empty");
+    let store = open_secret_store(data_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not open secret store: {e}"))?;
+    store
+        .set("api_auth_key", key.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to persist api auth key: {e}"))?;
+    if let Some(home) = dirs::home_dir() {
+        let _ = std::fs::remove_file(home.join(".screenpipe/auth.json"));
+    }
+    tracing::info!("api auth: key updated by user");
+    Ok(())
+}
+
 /// Wipe the persisted key and write a fresh `sp-<uuid8>` to the secret store.
 /// The running server will keep using its in-memory key until restart — caller
 /// is responsible for prompting the user to apply & restart for the new key
@@ -105,7 +143,27 @@ async fn open_secret_store(data_dir: &Path) -> Result<screenpipe_secrets::Secret
     let db_path = data_dir.join("db.sqlite");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let pool = sqlx::SqlitePool::connect(&db_url).await?;
-    let store = screenpipe_secrets::SecretStore::new(pool, None).await?;
+    // Load the keychain encryption key if the user has opted into encryption,
+    // otherwise pass None (plaintext mode). Without this, the previous code
+    // ALWAYS opened the store unkeyed — so as soon as the user toggled
+    // encryption on the existing api_auth_key entry (now encrypted with a
+    // non-zero nonce) became unreadable, `get()` returned an Err that the
+    // resolver swallowed, and the chain fell through to "auto-generate".
+    // The new auto-generated key was persisted as a fresh plaintext row,
+    // overwriting the encrypted one and silently rotating the API key out
+    // from under every consumer that had cached the prior value (the
+    // desktop frontend, the running engine's in-memory token, the tray
+    // menu, the embedded WebSocket clients) — ⇒ "unauthorized API access"
+    // on the next request the user issued (e.g. "Delete last 5 minutes").
+    let key = if screenpipe_secrets::is_encryption_requested(data_dir) {
+        match screenpipe_secrets::keychain::get_key() {
+            screenpipe_secrets::keychain::KeyResult::Found(k) => Some(k),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let store = screenpipe_secrets::SecretStore::new(pool, key).await?;
     Ok(store)
 }
 
@@ -117,4 +175,45 @@ fn read_legacy_auth_json() -> Option<String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// Read-only counterpart to `resolve_api_auth_key`. Same priority chain
+/// (env → encrypted SecretStore → legacy file) but does NOT auto-generate
+/// or persist anything when no key is found — returns `None` instead.
+///
+/// Use this from CLI callers that need to *find* the running server's key,
+/// not mint a fresh one. The full resolver auto-generates on miss, which is
+/// correct for the server's startup path but would silently produce a key
+/// that doesn't match the running server's in-memory value when called from
+/// a sibling process.
+pub async fn find_api_auth_key() -> Option<String> {
+    if let Ok(k) = std::env::var("SCREENPIPE_API_KEY") {
+        if !k.is_empty() {
+            return Some(k);
+        }
+    }
+    // Tauri sidecar processes (pi-agent shelling into bash) inherit the
+    // app's env under different names. Honor those too — without this the
+    // agent's `connection list` couldn't authenticate even though the key
+    // was right there.
+    for var in ["SCREENPIPE_LOCAL_API_KEY", "SCREENPIPE_API_AUTH_KEY"] {
+        if let Ok(k) = std::env::var(var) {
+            if !k.is_empty() {
+                return Some(k);
+            }
+        }
+    }
+
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    if let Ok(store) = open_secret_store(&data_dir).await {
+        if let Ok(Some(bytes)) = store.get("api_auth_key").await {
+            if let Ok(s) = String::from_utf8(bytes) {
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    read_legacy_auth_json()
 }

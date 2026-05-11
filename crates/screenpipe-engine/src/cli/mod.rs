@@ -11,6 +11,7 @@ pub mod install;
 pub mod login;
 pub mod mcp;
 pub mod pipe;
+pub mod presets;
 pub mod status;
 pub mod sync;
 pub mod vault;
@@ -326,6 +327,33 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub use_pii_removal: bool,
 
+    /// Enable the async PII reconciliation worker. Runs a background
+    /// task after capture that OVERWRITES PII in the source columns
+    /// of ocr_text, audio_transcriptions, frames.accessibility_text,
+    /// and ui_events.text_content. Raw secrets are gone after the
+    /// worker processes the row. Off by default — capture path is
+    /// unaffected either way.
+    #[arg(long, default_value_t = false)]
+    pub async_pii_redaction: bool,
+
+    /// Enable the async IMAGE-PII reconciliation worker. Independent
+    /// of `--async-pii-redaction` (text). Runs the rfdetr_v8 detector
+    /// over each captured frame, blacks out detected PII regions in
+    /// the JPG (atomic overwrite of the source file). Requires
+    /// `rfdetr_v8.onnx` at `~/.screenpipe/models/` and the binary
+    /// built with one of the `onnx-*` cargo features. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub async_image_pii_redaction: bool,
+
+    /// Backend for the AI PII workers — `local` (on-device ONNX,
+    /// privacy by construction, slower on weak hardware) or
+    /// `tinfoil` (screenpipe-hosted confidential-compute enclave on
+    /// H200, fast everywhere, requires network). Single flag for
+    /// both text + image — flipping it swaps the inner adapter for
+    /// both worker types.
+    #[arg(long, default_value = "local")]
+    pub pii_backend: String,
+
     /// Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise)
     #[arg(long, default_value_t = false)]
     pub filter_music: bool,
@@ -393,6 +421,13 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub pause_on_drm_content: bool,
 
+    /// Disable clipboard capture entirely. The UI recorder will not record
+    /// clipboard copy/paste events or contents — useful when piping
+    /// ~/.screenpipe data into a remote LLM (passwords, keys, secrets often
+    /// pass through the clipboard).
+    #[arg(long, default_value_t = false)]
+    pub disable_clipboard_capture: bool,
+
     /// Require authentication for remote API access. When enabled, non-localhost
     /// requests must include Authorization: Bearer <SCREENPIPE_API_KEY>.
     /// Localhost requests are always allowed.
@@ -416,6 +451,13 @@ pub struct RecordArgs {
     /// Set to 0 to disable retention (keep data forever).
     #[arg(long, default_value_t = 14)]
     pub retention_days: u32,
+
+    /// What gets cleaned up past the retention cutoff.
+    /// `media` (default) reclaims mp4/wav/jpeg files but keeps transcripts,
+    /// ocr text, and the timeline searchable. `all` permanently deletes
+    /// everything (legacy behavior).
+    #[arg(long, value_enum, default_value_t = crate::retention::RetentionMode::Media)]
+    pub retention_mode: crate::retention::RetentionMode,
 }
 
 impl RecordArgs {
@@ -438,6 +480,10 @@ impl RecordArgs {
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            // --disable-clipboard-capture flips both flags off. Defaults are
+            // `true` for both, so opting out has to be explicit.
+            capture_clipboard: !self.disable_clipboard_capture,
+            capture_clipboard_content: !self.disable_clipboard_capture,
             ..Default::default()
         }
     }
@@ -456,11 +502,10 @@ impl RecordArgs {
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
+            async_pii_redaction: self.async_pii_redaction,
+            async_image_pii_redaction: self.async_image_pii_redaction,
+            pii_backend: self.pii_backend.clone(),
             filter_music: self.filter_music,
-            #[allow(deprecated)]
-            enable_input_capture: true,
-            #[allow(deprecated)]
-            enable_accessibility: true,
             audio_transcription_engine: engine_str.to_string(),
             transcription_mode: mode_str.to_string(),
             audio_devices: self.audio_device.clone(),
@@ -485,6 +530,7 @@ impl RecordArgs {
             analytics_enabled: !self.disable_telemetry,
             ignore_incognito_windows: true,
             pause_on_drm_content: self.pause_on_drm_content,
+            disable_clipboard_capture: self.disable_clipboard_capture,
             listen_on_lan: self.listen_on_lan,
             ..screenpipe_config::RecordingSettings::default()
         }
@@ -665,6 +711,14 @@ pub enum PipeCommand {
         /// Pipe slug (registry identifier)
         slug: String,
     },
+    /// Set which AI preset(s) a pipe uses (overrides inline model/provider)
+    SetPreset {
+        /// Pipe name
+        name: String,
+        /// Preset id(s) — multiple ids form a fallback chain (first works wins)
+        #[arg(required = true, num_args = 1..)]
+        preset: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -674,6 +728,84 @@ pub enum ModelCommand {
         /// Output as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// Show one preset's full configuration (api key is masked in human view; raw in --json)
+    Show {
+        /// Preset id
+        id: String,
+        /// Output as JSON (returns raw api key — for scripting / backup)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Create a new preset
+    Create {
+        /// Preset id (letters, digits, '-', '_'; max 64 chars)
+        id: String,
+        /// Provider: openai | anthropic | native-ollama | custom | screenpipe-cloud
+        #[arg(long)]
+        provider: String,
+        /// Model name (e.g. claude-sonnet-4-5, gpt-4o, llama3.2)
+        #[arg(long)]
+        model: String,
+        /// Base URL (required for native-ollama and custom)
+        #[arg(long)]
+        url: Option<String>,
+        /// API key (required for openai/anthropic; forbidden for ollama/cloud)
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Optional system prompt prepended to pipe bodies
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Max input context characters (1000–2_000_000)
+        #[arg(long)]
+        max_context_chars: Option<i64>,
+        /// Max output tokens (1–200000)
+        #[arg(long)]
+        max_tokens: Option<i64>,
+        /// Make this the default preset for new pipes
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+    },
+    /// Update fields on an existing preset (only provided flags change)
+    Update {
+        /// Preset id to modify
+        id: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Empty string clears url
+        #[arg(long)]
+        url: Option<String>,
+        /// Empty string clears api key
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Empty string clears prompt
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        max_context_chars: Option<i64>,
+        #[arg(long)]
+        max_tokens: Option<i64>,
+        /// Promote this preset to default (unsets others atomically)
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+        /// Clear default flag on this preset
+        #[arg(long, default_value_t = false)]
+        unset_default: bool,
+    },
+    /// Mark a preset as the default (atomically unsets others)
+    SetDefault {
+        /// Preset id
+        id: String,
+    },
+    /// Delete a preset; refuses if any pipe references it (use --force to override)
+    Delete {
+        /// Preset id
+        id: String,
+        /// Delete even if pipes reference it (those pipes will fall back to default)
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 

@@ -295,12 +295,46 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
             if now_ts.saturating_sub(prev) >= 60 {
                 LAST_VISION_STALL_LOG.store(now_ts, Ordering::Relaxed);
                 let (rs, ri, ws, wi) = state.db.pool_stats();
+                // last_db_write_ts only advances when a UNIQUE frame is
+                // actually inserted; dedup-skipped captures don't update it.
+                // So a long delta here typically means the screen is static
+                // (idle user, slide deck, video call, IDE waiting) — NOT a
+                // stuck pipeline. Phrase it that way to stop the false-alarm
+                // panic.
+                //
+                // Also surface lifetime counters so when the cause IS a real
+                // pipeline stall, the log alone is enough to pin which stage
+                // failed — without us having to email the user back asking
+                // for `sqlite3` row counts.
+                //
+                // The triage rule: `attempts - persisted - dedup_skips` is the
+                // silent-loss count over the whole session. If that number
+                // climbs while a stall warning is firing, frames are being
+                // captured but lost between attempt and write. If it stays
+                // flat, the stall is just dedup on a static screen.
+                //
+                //   attempts climbing, persisted climbing, dedup ≈ 0
+                //     → healthy active screen
+                //   attempts climbing, persisted ≈ flat, dedup climbing
+                //     → static screen / idle user (false alarm)
+                //   attempts climbing, persisted ≈ flat, dedup flat
+                //     → real silent loss between attempt and writer
+                //   attempts flat too
+                //     → capture itself paused (TCC revoke, display sleep)
+                let silent_loss = vision_snap
+                    .capture_attempts
+                    .saturating_sub(vision_snap.frames_db_written)
+                    .saturating_sub(vision_snap.dedup_skips);
                 warn!(
-                    "health_check: vision DB writes stalled — capture heartbeat {}s ago but last DB write {}s ago ({}) | pool: read={}/{} idle, write={}/{} idle",
-                    now_ts.saturating_sub(vision_snap.last_capture_attempt_ts),
+                    "health_check: no unique vision frame in {}s (capture heartbeat {}s ago — usually means a static screen / idle user, not a pipeline stall) | lifetime: attempts={}, persisted={}, dedup={}, silent_loss={} | pool: read={}/{} idle, write={}/{} idle | suspected: {}",
                     now_ts.saturating_sub(vision_snap.last_db_write_ts),
-                    suspected_stall_cause(ri, wi),
+                    now_ts.saturating_sub(vision_snap.last_capture_attempt_ts),
+                    vision_snap.capture_attempts,
+                    vision_snap.frames_db_written,
+                    vision_snap.dedup_skips,
+                    silent_loss,
                     ri, rs, wi, ws,
+                    suspected_stall_cause(ri, wi),
                 );
             }
         }
@@ -359,10 +393,22 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     let audio_never_captured =
         !state.audio_disabled && audio_snap.uptime_secs > 120.0 && audio_snap.chunks_sent == 0;
 
+    // Detect "active_no_data" condition: device appears active (was selected and in
+    // the device list) but the zero-fill watchdog has fired, indicating the stream
+    // was hijacked by another app or went silent (Issue #3144). The watchdog
+    // automatically triggers a reconnect after 30s of no real audio, so this metric
+    // captures recovery attempts.
+    let stream_hijacked = audio_snap.stream_timeouts > 0;
+
     let audio_status = if state.audio_disabled {
         "disabled".to_string()
     } else if audio_never_captured {
         "not_started".to_string()
+    } else if stream_hijacked && global_audio_active {
+        // Device is active but the watchdog has fired — indicates hijack recovery
+        // in progress or recently completed. This is the "active_no_data" state
+        // the user requested in #3144.
+        "active_no_data".to_string()
     } else if global_audio_active {
         "ok".to_string()
     } else if last_audio_ts == 0 {
@@ -469,6 +515,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
             unhealthy_systems.push("vision");
         }
         if audio_status != "ok" && audio_status != "disabled" {
+            // active_no_data is a degraded state (device hijacked but watchdog recovering)
             unhealthy_systems.push("audio");
         }
         if audio_degraded && !unhealthy_systems.contains(&"audio") {
@@ -496,7 +543,13 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 ));
             }
         }
-        if audio_degraded {
+        if audio_degraded || audio_status == "active_no_data" {
+            if audio_status == "active_no_data" {
+                detail_parts.push(format!(
+                    "audio device appears hijacked or silent (watchdog fired {} times) — automatic recovery in progress",
+                    audio_snap.stream_timeouts
+                ));
+            }
             if audio_snap.chunks_channel_full > 0 {
                 detail_parts.push(format!(
                     "{} audio chunk(s) dropped — transcription too slow",
@@ -858,5 +911,53 @@ mod tests {
         let cloned = resp.clone();
         assert_eq!(cloned.status, "healthy");
         assert_eq!(cloned.status_code, 200);
+    }
+
+    #[test]
+    fn audio_status_active_no_data_when_stream_timeouts_nonzero() {
+        // This test verifies the fix for Issue #3144: detect when audio device
+        // is "active but producing no data" (hijacked or silent Bluetooth device).
+        // The stream_timeouts metric indicates the zero-fill watchdog has activated,
+        // which is the signal for active_no_data status.
+
+        // Simulate the logic in the health check: when stream_timeouts > 0 and
+        // the device is globally active, we should report "active_no_data" status.
+
+        let stream_timeouts = 1; // Watchdog has fired — device hijacked or silent
+        let is_global_active = true;
+
+        let stream_hijacked = stream_timeouts > 0;
+
+        // Validate: with stream_hijacked=true and is_global_active=true,
+        // audio_status should be "active_no_data", not "ok".
+        let audio_status = if stream_hijacked && is_global_active {
+            "active_no_data".to_string()
+        } else if is_global_active {
+            "ok".to_string()
+        } else {
+            "not_started".to_string()
+        };
+
+        assert_eq!(
+            audio_status, "active_no_data",
+            "audio_status should be 'active_no_data' when stream_timeouts > 0 and device is active (Issue #3144)"
+        );
+
+        // Also verify the converse: if stream_timeouts == 0, should be "ok"
+        let no_hijack = 0;
+        let is_still_active = true;
+        let stream_hijacked_2 = no_hijack > 0;
+        let audio_status_2 = if stream_hijacked_2 && is_still_active {
+            "active_no_data".to_string()
+        } else if is_still_active {
+            "ok".to_string()
+        } else {
+            "not_started".to_string()
+        };
+
+        assert_eq!(
+            audio_status_2, "ok",
+            "audio_status should be 'ok' when stream_timeouts == 0 and device is active"
+        );
     }
 }

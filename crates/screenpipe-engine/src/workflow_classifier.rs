@@ -26,9 +26,44 @@ const DEDUP_COOLDOWN: Duration = Duration::from_secs(300);
 /// System prompt for the cloud classifier.
 const CLASSIFIER_SYSTEM_PROMPT: &str = r#"You are a desktop activity classifier for screenpipe. Given a sequence of app activities (timestamps, app names, window titles), identify the high-level workflow event happening. Respond with a JSON object: {"event": "event_name", "confidence": 0.0-1.0, "description": "brief explanation"}. If no specific workflow is detected, respond with {"event": "no_event", "confidence": 1.0, "description": "normal activity"}."#;
 
-/// Default vLLM endpoint for the event classifier.
-/// Direct to the self-hosted A100 — no Cloudflare Worker overhead.
-pub const DEFAULT_CLASSIFIER_URL: &str = "http://34.122.128.37:8080";
+/// Closed set of workflow event labels — must mirror the taxonomy the
+/// classifier was fine-tuned on. Sent to vLLM via OpenAI-style
+/// `response_format.json_schema` so the `event` field is constrained to this
+/// enum at decode time, eliminating hallucinated paraphrases like
+/// "post_meeting_writeup". Note: vLLM's older `guided_json` field is silently
+/// ignored on 0.19+; only `response_format` works.
+const EVENT_LABELS: &[&str] = &[
+    "prospect_research",
+    "crm_update_from_social",
+    "post_meeting_followup",
+    "email_to_crm",
+    "outreach_drafting",
+    "debugging_session",
+    "code_review",
+    "deploy_and_monitor",
+    "documentation_session",
+    "incident_response",
+    "research_session",
+    "meeting_prep",
+    "content_creation",
+    "data_analysis",
+    "email_triage",
+    "work_day_start",
+    "work_day_end",
+    "context_switch",
+    "distraction_detected",
+    "deep_work_session",
+    "learning_session",
+    "collaboration_session",
+    "no_event",
+];
+
+/// Default endpoint for the event classifier — routes through the screenpipe
+/// AI gateway, which forwards the `screenpipe-event-classifier` model to the
+/// self-hosted vLLM. Going through the gateway means infra moves only need a
+/// `wrangler secret put EVENT_CLASSIFIER_URL` — no client release.
+/// Override with the `SCREENPIPE_EVENT_CLASSIFIER_URL` env var for self-host.
+pub const DEFAULT_CLASSIFIER_URL: &str = "https://api.screenpi.pe";
 
 /// Start the workflow classifier polling loop.
 pub async fn start_workflow_classifier(
@@ -215,26 +250,48 @@ async fn get_recent_activities(client: &Client, port: u16) -> Option<Vec<Activit
     }
 }
 
-/// Call the vLLM classifier directly (self-hosted, no auth needed).
+/// Call the classifier through the screenpipe gateway (default) or directly
+/// against a self-hosted vLLM (`SCREENPIPE_EVENT_CLASSIFIER_URL` override).
+/// The model name `screenpipe-event-classifier` is recognized by both: vLLM
+/// exposes it via `--served-model-name`, and the gateway routes it to the
+/// vLLM URL stored in its `EVENT_CLASSIFIER_URL` secret.
 async fn classify(
     client: &Client,
     classifier_url: &str,
-    _token: &str,
+    token: &str,
     activity_text: &str,
 ) -> Result<ClassifierResult, String> {
     let body = json!({
-        "model": "/home/louisbeaumont/model/event-classifier-merged",
+        "model": "screenpipe-event-classifier",
         "messages": [
             {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
             {"role": "user", "content": format!("What workflow event is happening?\n\n{}", activity_text)}
         ],
-        "max_tokens": 60,
-        "temperature": 0.1,
-        "chat_template_kwargs": {"enable_thinking": false}
+        "max_tokens": 80,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": false},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "workflow_event",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "event": {"type": "string", "enum": EVENT_LABELS},
+                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "description": {"type": "string"}
+                    },
+                    "required": ["event", "confidence", "description"]
+                }
+            }
+        }
     });
 
-    let response = client
-        .post(format!("{}/v1/chat/completions", classifier_url))
+    let mut request = client.post(format!("{}/v1/chat/completions", classifier_url));
+    if !token.is_empty() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .json(&body)
         .send()
         .await

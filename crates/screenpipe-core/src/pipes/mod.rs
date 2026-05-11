@@ -497,6 +497,13 @@ fn remove_pid_file(pipes_dir: &Path, pipe_name: &str) {
 
 /// Check if a process with the given PID is still alive.
 fn is_process_alive(pid: u32) -> bool {
+    // 0 is reserved as the "claimed-but-no-child-yet" placeholder. Treating it as
+    // alive on unix would be catastrophic — kill(0, 0) targets the whole process
+    // group, which means the existence check would return true and any kill that
+    // followed would signal every sibling.
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // kill(pid, 0) checks existence without sending a signal
@@ -529,6 +536,7 @@ fn is_process_alive(pid: u32) -> bool {
 
 /// On startup, remove any PID files whose processes are no longer alive.
 fn cleanup_orphaned_pid_files(pipes_dir: &Path) {
+    let self_pid = std::process::id();
     let entries = match std::fs::read_dir(pipes_dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -539,6 +547,14 @@ fn cleanup_orphaned_pid_files(pipes_dir: &Path) {
         }
         let pipe_name = entry.file_name().to_string_lossy().to_string();
         if let Some(pid) = read_pid_file(pipes_dir, &pipe_name) {
+            // Never kill ourselves. In-process (pi-agent) pipes never have a
+            // child PID, so the pre-spawn placeholder claim used to be the
+            // running app's own PID — meaning the next backend bounce would
+            // SIGKILL the app. Treat self-PID files as stale claims.
+            if pid == self_pid {
+                remove_pid_file(pipes_dir, &pipe_name);
+                continue;
+            }
             if is_process_alive(pid) {
                 info!(
                     "startup: killing orphaned pipe '{}' process {}",
@@ -1100,16 +1116,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 /// Set up permissions for a Pi pipe: install extension, filtered skills,
 /// write the permissions JSON file, and register the token with the server.
 /// Returns the generated token (if any) so the caller can clean it up later.
-///
-/// In offline mode, the permissions extension is always installed (even for
-/// unrestricted pipes) so it can block external network requests.
 async fn setup_pipe_permissions(
     pipe_dir: &Path,
     config: &PipeConfig,
     token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
 ) -> Option<String> {
-    let offline = crate::offline::is_offline_mode();
-
     if let Err(e) = PiExecutor::ensure_permissions_extension(pipe_dir, config) {
         warn!("failed to install permissions extension: {}", e);
     }
@@ -1126,31 +1137,11 @@ async fn setup_pipe_permissions(
         warn!("failed to install filtered skills: {}", e);
     }
 
-    // In offline mode, always install the permissions extension so it can
-    // block external curl commands, even if the pipe has no other restrictions.
-    if offline {
-        let ext_dir = pipe_dir.join(".pi").join("extensions");
-        let ext_path = ext_dir.join("screenpipe-permissions.ts");
-        if !ext_path.exists() {
-            if let Err(e) = std::fs::create_dir_all(&ext_dir) {
-                warn!("failed to create extensions dir for offline mode: {}", e);
-            } else {
-                let ext_content = include_str!("../../assets/extensions/screenpipe-permissions.ts");
-                if let Err(e) = std::fs::write(&ext_path, ext_content) {
-                    warn!(
-                        "failed to install permissions extension for offline mode: {}",
-                        e
-                    );
-                }
-            }
-        }
-    }
-
     let mut perms = permissions::PipePermissions::from_config(config);
     perms.pipe_dir = Some(pipe_dir.to_string_lossy().to_string());
 
-    // In offline mode or with filesystem sandbox, force restrictions so the permissions JSON is always written
-    let force_write = offline || perms.pipe_dir.is_some();
+    // Always write permissions JSON when filesystem sandbox is active.
+    let force_write = perms.pipe_dir.is_some();
 
     if perms.has_any_restrictions() || force_write {
         // Generate a unique pipe token for server-side enforcement
@@ -1238,6 +1229,9 @@ pub struct PipeManager {
     token_registry: Option<Arc<dyn permissions::PipeTokenRegistry>>,
     /// Extra context appended to every pipe prompt (e.g. connected integrations).
     extra_context: Option<String>,
+    /// Connected integrations context injected into every pipe *system* prompt.
+    /// Set by the engine layer (which owns the SecretStore) via `set_connections_context`.
+    connections_context: Option<String>,
     /// Local API auth key — injected into pipe subprocesses as SCREENPIPE_LOCAL_API_KEY
     /// so pipes can authenticate to localhost:3030 when API auth is enabled.
     local_api_key: Option<String>,
@@ -1279,6 +1273,7 @@ impl PipeManager {
             )),
             token_registry: None,
             extra_context: None,
+            connections_context: None,
             local_api_key: None,
             fallback_registry: registry,
         }
@@ -1307,6 +1302,18 @@ impl PipeManager {
     /// Clear extra context.
     pub fn clear_extra_context(&mut self) {
         self.extra_context = None;
+    }
+
+    /// Set connected integrations context for the system prompt.
+    /// Called by the engine layer after computing it via `render_context`.
+    pub fn set_connections_context(&mut self, ctx: String) {
+        self.connections_context = if ctx.is_empty() { None } else { Some(ctx) };
+    }
+
+    /// Expose the API port so callers (e.g. engine layer) can pass it to
+    /// `render_context` without needing a separate field.
+    pub fn api_port(&self) -> u16 {
+        self.api_port
     }
 
     /// Set the local API auth key. Injected into pipe subprocesses as
@@ -1797,8 +1804,11 @@ impl PipeManager {
             }
         }
 
-        // Write a pre-emptive PID file to claim the lock before spawn
-        write_pid_file(&self.pipes_dir, name, std::process::id());
+        // Pre-emptive lock claim. Sentinel 0 means "claimed, no child PID yet";
+        // the spawn watcher overwrites it with the real subprocess PID. Never
+        // write our own PID — for in-process pi-agent runs there is no child,
+        // and a self-PID file would make the next startup SIGKILL the app.
+        write_pid_file(&self.pipes_dir, name, 0);
 
         // Resolve preset
         let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt, run_aws_profile, run_aws_region) =
@@ -1876,8 +1886,12 @@ impl PipeManager {
 
         let pipe_dir = self.pipes_dir.clone().join(name);
 
-        let pipe_system_prompt =
-            render_pipe_system_prompt(&body, self.api_port, preset_prompt.as_deref());
+        let pipe_system_prompt = render_pipe_system_prompt(
+            &body,
+            self.api_port,
+            preset_prompt.as_deref(),
+            self.connections_context.as_deref(),
+        );
         let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
         let pipe_name = name.to_string();
 
@@ -2238,8 +2252,9 @@ impl PipeManager {
                 }
             }
 
-            // Write a pre-emptive PID file to claim the lock before spawn
-            write_pid_file(&self.pipes_dir, name, std::process::id());
+            // Pre-emptive lock claim with sentinel 0. See start_pipe_background
+            // for the rationale — never write our own PID here.
+            write_pid_file(&self.pipes_dir, name, 0);
 
             let started_at = Utc::now();
             let pipe_dir = self.pipes_dir.join(name);
@@ -2363,8 +2378,12 @@ impl PipeManager {
                 .unwrap_or(false);
 
             // Build prompt with context header
-            let pipe_system_prompt =
-                render_pipe_system_prompt(&body, self.api_port, preset_prompt.as_deref());
+            let pipe_system_prompt = render_pipe_system_prompt(
+                &body,
+                self.api_port,
+                preset_prompt.as_deref(),
+                self.connections_context.as_deref(),
+            );
             let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
 
             // Shared PID — set synchronously by the executor right after spawn
@@ -2657,6 +2676,12 @@ impl PipeManager {
 
         let content = std::fs::read_to_string(&pipe_md)?;
         let (mut config, body) = parse_frontmatter(&content)?;
+        // Block enabling a stale one-off — would either silently no-op
+        // (caught by the scheduler's stale guard) or fire a confusingly
+        // old reminder. User must set a new `at <iso>` first.
+        if enabled {
+            validate_one_off_freshness(&config.schedule)?;
+        }
         config.enabled = enabled;
         let new_content = serialize_pipe(&config, &body)?;
         atomic_write(&pipe_md, &new_content)?;
@@ -3109,6 +3134,7 @@ impl PipeManager {
         let api_port = self.api_port;
         let token_registry = self.token_registry.clone();
         let extra_context = self.extra_context.clone();
+        let connections_context = self.connections_context.clone();
         let _local_api_key = self.local_api_key.clone();
 
         let handle = tokio::spawn(async move {
@@ -3362,6 +3388,23 @@ impl PipeManager {
                     );
                     last_run.insert(name.clone(), Utc::now());
 
+                    // One-off (`schedule: at <iso>`) auto-disables on fire so
+                    // it never runs twice — even across crashes/restarts. The
+                    // pipe.md stays on disk; only the local-override flag flips.
+                    if matches!(
+                        parse_schedule(&config.schedule),
+                        Some(ParsedSchedule::Once(_))
+                    ) {
+                        if let Err(e) = set_local_override(&pipes_dir, name, false) {
+                            warn!(
+                                "scheduler: failed to auto-disable one-off pipe '{}': {}",
+                                name, e
+                            );
+                        } else {
+                            info!("scheduler: one-off pipe '{}' fired, auto-disabled", name);
+                        }
+                    }
+
                     // Mark as queued so the next tick doesn't double-queue
                     {
                         let mut qr = queued_or_running.lock().await;
@@ -3462,8 +3505,12 @@ impl PipeManager {
 
                     let pipe_dir = pipes_dir.join(name);
 
-                    let pipe_system_prompt =
-                        render_pipe_system_prompt(body, api_port, preset_prompt.as_deref());
+                    let pipe_system_prompt = render_pipe_system_prompt(
+                        body,
+                        api_port,
+                        preset_prompt.as_deref(),
+                        connections_context.as_deref(),
+                    );
                     let prompt = render_prompt_with_port(
                         config,
                         body,
@@ -3506,7 +3553,8 @@ impl PipeManager {
                             let mut r = running_ref.lock().await;
                             r.insert(pipe_name.clone(), ExecutionHandle { pid: 0 });
                         }
-                        write_pid_file(&pipes_dir_for_mark, &pipe_name, std::process::id());
+                        // Sentinel 0 — see start_pipe_background.
+                        write_pid_file(&pipes_dir_for_mark, &pipe_name, 0);
 
                         info!("scheduler: running pipe '{}'", pipe_name);
 
@@ -4072,7 +4120,12 @@ pub fn serialize_pipe(config: &PipeConfig, body: &str) -> Result<String> {
 /// Contains the pipe body (instructions from pipe.md) and the preset system prompt.
 /// These are identical across runs and across turns within a run, making them
 /// ideal for Anthropic prompt caching (90% input cost reduction on cache hits).
-fn render_pipe_system_prompt(body: &str, api_port: u16, system_prompt: Option<&str>) -> String {
+fn render_pipe_system_prompt(
+    body: &str,
+    api_port: u16,
+    system_prompt: Option<&str>,
+    connections_context: Option<&str>,
+) -> String {
     let os = std::env::consts::OS;
     let mut sys = String::new();
 
@@ -4092,6 +4145,13 @@ fn render_pipe_system_prompt(body: &str, api_port: u16, system_prompt: Option<&s
         "CRITICAL: You ARE this pipe. You are already running inside it. NEVER run `screenpipe pipe run` — that would create a recursive duplicate. Execute the task directly using the tools available to you (bash, file I/O, HTTP requests, etc.).\n\nOS: {os}\nOutput directory: ./output/\nScreenpipe API: http://localhost:{api_port}{api_auth_note}\nPrefer bun/TypeScript for scripts. Python may not be installed.\nSend notifications via POST http://localhost:11435/notify with {{\"title\": \"...\", \"body\": \"...\"}}. Body supports markdown. File links MUST use absolute paths (e.g. [View log](/Users/me/file.md)), never relative paths like ./output/file.md — relative paths break the notification link handler.\n\n"
     ));
     sys.push_str(body);
+
+    if let Some(ctx) = connections_context {
+        sys.push_str("\n\n");
+        sys.push_str(ctx);
+        sys.push_str("\n\nConnection write policy: never POST, PUT, or PATCH to a connection proxy unless the pipe body or user explicitly asks you to create, write, or modify something in that service. Read first, write only when clearly instructed.");
+    }
+
     sys
 }
 
@@ -4148,20 +4208,65 @@ Pipe name: {}
 // Schedule parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed schedule — either a fixed interval or a cron expression.
+/// Maximum lateness before a one-off pipe is considered stale and refused.
+/// Tolerates clock skew, brief app downtime, and crash-then-restart. Any
+/// longer than this, the user almost certainly didn't expect the task to
+/// run "now" — they expected it then. Better to no-op than surprise them.
+const ONE_OFF_STALE_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
+
+/// Validate that a `schedule: at <iso>` timestamp isn't already stale.
+/// Returns `Ok(())` for any non-one-off schedule. Called from `install_pipe`
+/// and `enable_pipe` so a stale one-off never lands on disk in the active
+/// state — the user gets a clear error instead of a silent no-op pipe.
+fn validate_one_off_freshness(schedule: &str) -> Result<()> {
+    if let Some(ParsedSchedule::Once(run_at)) = parse_schedule(schedule) {
+        let lateness = Utc::now().signed_duration_since(run_at);
+        if lateness > ONE_OFF_STALE_THRESHOLD {
+            let mins = lateness.num_minutes();
+            let pretty = if mins < 60 {
+                format!("{}m", mins)
+            } else if mins < 1440 {
+                format!("{}h", mins / 60)
+            } else {
+                format!("{}d", mins / 1440)
+            };
+            return Err(anyhow!(
+                "one-off `at <iso>` schedule is {} in the past — set a future RFC3339 \
+                 timestamp (e.g. `at {}`) or use `schedule: manual` for a non-firing template",
+                pretty,
+                (Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parsed schedule — fixed interval, cron, or a single fire-once timestamp.
 pub enum ParsedSchedule {
     Interval(std::time::Duration),
     Cron(Box<CronSchedule>),
+    /// One-off: fire once at this UTC instant, then never again. Used for
+    /// AI-scheduled "remind me in 2 days" tasks. After firing, the pipe
+    /// is disabled via local-override so it stays on disk as history.
+    Once(DateTime<Utc>),
 }
 
-/// Parse a schedule string into an interval or cron expression.
+/// Parse a schedule string into an interval, cron expression, or one-off.
 /// Returns `None` for `"manual"`.
 ///
-/// Supports: `"every 30m"`, `"every 2h"`, `"daily"`, cron (`"0 */2 * * *"`).
+/// Supports: `"every 30m"`, `"every 2h"`, `"daily"`, cron (`"0 */2 * * *"`),
+/// and `"at 2026-04-29T17:00:00-07:00"` (RFC3339 timestamp; fires once).
 pub fn parse_schedule(schedule: &str) -> Option<ParsedSchedule> {
     let s = schedule.trim();
     if s.eq_ignore_ascii_case("manual") {
         return None;
+    }
+    // One-off: "at <RFC3339 timestamp>" — fires once, never again.
+    if let Some(rest) = s.strip_prefix("at ").or_else(|| s.strip_prefix("AT ")) {
+        if let Ok(t) = DateTime::parse_from_rfc3339(rest.trim()) {
+            return Some(ParsedSchedule::Once(t.with_timezone(&Utc)));
+        }
+        // Malformed `at <whatever>` — fall through to other parsers, then None.
     }
     if s.eq_ignore_ascii_case("daily") {
         return Some(ParsedSchedule::Interval(std::time::Duration::from_secs(
@@ -4359,6 +4464,25 @@ fn should_run(schedule: &str, last_run: DateTime<Utc>) -> bool {
                 Some(next) => now >= next,
                 None => false,
             }
+        }
+        Some(ParsedSchedule::Once(run_at)) => {
+            // Fire if we've reached the timestamp AND haven't run since
+            // (cheap re-fire guard against in-memory last_run resets).
+            // The auto-disable happens in the scheduler tick after queueing.
+            //
+            // Defense in depth against stale timestamps: if the run-at is
+            // more than ONE_OFF_STALE_THRESHOLD in the past (e.g. AI
+            // hallucinated a past time, or app was off for days and is
+            // catching up), refuse to fire — surprising the user with a
+            // "weeks-old reminder running now" is worse than missing it.
+            // Install / enable validation also rejects stale timestamps so
+            // a stale pipe never reaches the scheduler in the first place;
+            // this is the runtime backstop.
+            let now = Utc::now();
+            if now.signed_duration_since(run_at) > ONE_OFF_STALE_THRESHOLD {
+                return false;
+            }
+            now >= run_at && last_run < run_at
         }
     }
 }
@@ -4972,6 +5096,111 @@ mod tests {
         assert!(parse_schedule("not a schedule").is_none());
     }
 
+    // -- one-off `at <iso>` --------------------------------------------------
+
+    #[test]
+    fn test_parse_schedule_at_rfc3339() {
+        match parse_schedule("at 2099-01-01T12:00:00Z") {
+            Some(ParsedSchedule::Once(t)) => {
+                assert_eq!(t.to_rfc3339(), "2099-01-01T12:00:00+00:00");
+            }
+            other => panic!("expected Once, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_at_with_offset() {
+        match parse_schedule("at 2099-01-01T05:00:00-07:00") {
+            Some(ParsedSchedule::Once(t)) => {
+                // -07:00 05:00 == UTC 12:00
+                assert_eq!(t.to_rfc3339(), "2099-01-01T12:00:00+00:00");
+            }
+            other => panic!("expected Once, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_at_malformed_returns_none() {
+        assert!(parse_schedule("at not-a-date").is_none());
+        assert!(parse_schedule("at ").is_none());
+    }
+
+    #[test]
+    fn test_should_run_once_in_past_unfired() {
+        // Past timestamp within the freshness window (30m < ONE_OFF_STALE_THRESHOLD),
+        // never fired (last_run = epoch) → fire now.
+        let thirty_min_ago = Utc::now() - chrono::Duration::minutes(30);
+        let schedule = format!("at {}", thirty_min_ago.to_rfc3339());
+        assert!(should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_should_run_once_already_fired() {
+        // Past timestamp, already fired (last_run after run_at) → don't fire.
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        let an_hour_ago = Utc::now() - chrono::Duration::hours(1);
+        let schedule = format!("at {}", two_hours_ago.to_rfc3339());
+        assert!(!should_run(&schedule, an_hour_ago));
+    }
+
+    #[test]
+    fn test_should_run_once_in_future() {
+        // Future timestamp → don't fire yet.
+        let in_an_hour = Utc::now() + chrono::Duration::hours(1);
+        let schedule = format!("at {}", in_an_hour.to_rfc3339());
+        assert!(!should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_should_run_once_stale_refused() {
+        // Stale past timestamp (>1h) → runtime guard refuses to fire even
+        // if the pipe somehow got past install/enable validation.
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        let schedule = format!("at {}", two_hours_ago.to_rfc3339());
+        assert!(!should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_should_run_once_recent_past_fires() {
+        // Past timestamp within freshness window (e.g. 5 min ago — clock
+        // skew, brief downtime) still fires. Prevents needless misses.
+        let five_min_ago = Utc::now() - chrono::Duration::minutes(5);
+        let schedule = format!("at {}", five_min_ago.to_rfc3339());
+        assert!(should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_future_ok() {
+        let in_an_hour = Utc::now() + chrono::Duration::hours(1);
+        let schedule = format!("at {}", in_an_hour.to_rfc3339());
+        assert!(validate_one_off_freshness(&schedule).is_ok());
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_recent_past_ok() {
+        let twenty_min_ago = Utc::now() - chrono::Duration::minutes(20);
+        let schedule = format!("at {}", twenty_min_ago.to_rfc3339());
+        assert!(validate_one_off_freshness(&schedule).is_ok());
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_stale_err() {
+        let three_days_ago = Utc::now() - chrono::Duration::days(3);
+        let schedule = format!("at {}", three_days_ago.to_rfc3339());
+        let err = validate_one_off_freshness(&schedule).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("in the past"), "msg = {}", msg);
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_non_one_off_passes_through() {
+        // Recurring / cron / manual schedules are out-of-scope for this
+        // validator — must always return Ok.
+        assert!(validate_one_off_freshness("every 1h").is_ok());
+        assert!(validate_one_off_freshness("manual").is_ok());
+        assert!(validate_one_off_freshness("0 */2 * * *").is_ok());
+    }
+
     // -- should_run ---------------------------------------------------------
 
     #[test]
@@ -5021,7 +5250,7 @@ mod tests {
         assert!(prompt.contains("Time range:"));
         assert!(prompt.contains("Do the work described above now."));
         // Port / body go into system prompt, not user prompt
-        let sys = render_pipe_system_prompt("body text", 3031, None);
+        let sys = render_pipe_system_prompt("body text", 3031, None, None);
         assert!(sys.contains("http://localhost:3031"));
         assert!(!sys.contains("http://localhost:3030"));
         assert!(sys.contains("body text"));
@@ -5048,7 +5277,7 @@ mod tests {
             privacy_filter: false,
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("hello", 3030, None);
+        let sys = render_pipe_system_prompt("hello", 3030, None, None);
         assert!(sys.contains("http://localhost:3030"));
     }
 
@@ -5073,7 +5302,8 @@ mod tests {
             privacy_filter: false,
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("body text", 3030, Some("You are a helpful assistant"));
+        let sys =
+            render_pipe_system_prompt("body text", 3030, Some("You are a helpful assistant"), None);
         assert!(sys.starts_with("You are a helpful assistant\n\n"));
         assert!(sys.contains("body text"));
         assert!(sys.contains("http://localhost:3030"));
@@ -5100,14 +5330,14 @@ mod tests {
             privacy_filter: false,
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("body text", 3030, None);
+        let sys = render_pipe_system_prompt("body text", 3030, None, None);
         assert!(!sys.contains("System prompt:"));
         assert!(sys.contains("body text"));
     }
 
     #[test]
     fn test_system_prompt_contains_anti_recursion_warning() {
-        let sys = render_pipe_system_prompt("task body", 3030, None);
+        let sys = render_pipe_system_prompt("task body", 3030, None, None);
         assert!(sys.contains("NEVER run `screenpipe pipe run`"));
         assert!(sys.contains("You ARE this pipe"));
     }

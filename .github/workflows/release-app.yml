@@ -166,9 +166,9 @@ jobs:
         include:
           # GitHub-hosted macOS 26 runner for Apple Silicon + Apple Intelligence
           - platform: ${{ needs.check_commit.outputs.macos_arm_runner || 'macos-latest' }}
-            args: "--target aarch64-apple-darwin --features metal,parakeet-mlx"
+            args: "--target aarch64-apple-darwin --features metal,parakeet-mlx,rfdetr-mlx"
             target: aarch64-apple-darwin
-            tauri-args: "--target aarch64-apple-darwin --features metal,parakeet-mlx,official-build"
+            tauri-args: "--target aarch64-apple-darwin --features metal,parakeet-mlx,rfdetr-mlx,official-build"
             os_type: "macos"
           - platform: "macos-26"
             args: "--target x86_64-apple-darwin --features metal"
@@ -463,6 +463,35 @@ jobs:
       - name: Set up MSVC
         if: matrix.os_type == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
+
+      # `tauri.windows.conf.json` bundles `onnxruntime*\lib\onnxruntime.dll`
+      # as a Tauri resource. Without this file in place at build time,
+      # tauri_build::build() inside the screenpipe-app build script panics
+      # with `glob pattern ... didn't match any files`, killing the cargo
+      # build before it can even compile our crate. The ORT setup that used
+      # to live here was removed in d62360bc4 (Windows ARM64 PR); v2.4.165
+      # only succeeded because a stale rust-cache / artifacts cache still
+      # contained the directory. Re-add the download so we don't depend on
+      # cache hits for a load-bearing path. release-cli.yml has the same
+      # step; keep them in sync if the pinned ORT version moves.
+      - name: Download ONNX Runtime
+        if: matrix.os_type == 'windows'
+        shell: pwsh
+        run: |
+          if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') {
+            $arch = 'arm64'
+          } else {
+            $arch = 'x64'
+          }
+          $version = '1.19.2'
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$version/onnxruntime-win-$arch-$version.zip"
+          $zipFile = "onnxruntime-win-$arch-$version.zip"
+          $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-$arch-$version"
+          Invoke-WebRequest -Uri $url -OutFile $zipFile
+          if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+          7z x $zipFile -o"apps/screenpipe-app-tauri/src-tauri/" -y
+          Write-Host "ONNX Runtime extracted to $extractDir"
+          Get-ChildItem "$extractDir/lib" | ForEach-Object { Write-Host $_.Name }
 
       - name: Install Ninja (ARM64)
         if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
@@ -855,6 +884,9 @@ jobs:
         # installer is built AFTER signCommand runs - so we sign it here
         # and re-generate the .sig (Tauri Updater signature) since the
         # installer file content changes after Authenticode signing.
+        # Reuses sign-ssl.ps1 to inherit its retry-with-backoff against
+        # transient SSL.com CSC API failures (HTML-instead-of-JSON,
+        # "Unexpected character (<) at position 0").
         if: matrix.os_type == 'windows'
         shell: powershell
         env:
@@ -865,37 +897,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: |
-          $cstDest = $env:CODESIGNTOOL_PATH
-          $jarFile = Get-ChildItem $cstDest -Recurse -Filter "code_sign_tool*.jar" | Select-Object -First 1
-          $javaFile = Get-ChildItem $cstDest -Recurse -Filter "java.exe" | Select-Object -First 1
-          if (-not $jarFile) { throw "CodeSignTool jar not found" }
-          if (-not $javaFile) { throw "Java not found in CodeSignTool" }
-
           $nsisDir = "apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/nsis"
           $exe = Get-ChildItem "$nsisDir/*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "No installer exe found in $nsisDir" }
-          Write-Host "Signing installer: $($exe.Name)"
 
-          $signedDir = Join-Path $cstDest "signed_installer"
-          if (Test-Path $signedDir) { Remove-Item $signedDir -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $signedDir | Out-Null
-
-          Push-Location $cstDest
-          & $javaFile.FullName -jar $jarFile.FullName sign `
-            "-username=$env:ESIGNER_USERNAME" `
-            "-password=$env:ESIGNER_PASSWORD" `
-            "-totp_secret=$env:ESIGNER_TOTP_SECRET" `
-            "-credential_id=$env:ESIGNER_CREDENTIAL_ID" `
-            "-input_file_path=$($exe.FullName)" `
-            "-output_dir_path=$signedDir"
-          Pop-Location
-
+          & apps/screenpipe-app-tauri/src-tauri/sign-ssl.ps1 $exe.FullName
           if ($LASTEXITCODE -ne 0) { throw "Code signing failed with exit code $LASTEXITCODE" }
-
-          $signedExe = Join-Path $signedDir $exe.Name
-          if (-not (Test-Path $signedExe)) { throw "Signed file not found at $signedExe" }
-          Copy-Item $signedExe $exe.FullName -Force
-          Write-Host "Installer signed: $($exe.Name)"
 
           # Re-generate Tauri Updater signature since the installer content changed
           $sigFile = "$($exe.FullName).sig"
@@ -1039,6 +1046,142 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Inject mlx.metallib into Contents/MacOS/ + re-sign (macOS)
+        # MLX's runtime library search looks for mlx.metallib next to the
+        # binary (Contents/MacOS/), not in the app's Resources dir. Tauri's
+        # `bundle.resources` always lands in Contents/Resources/, so we have
+        # to physically copy the file into Contents/MacOS/ ourselves.
+        #
+        # This must happen BEFORE notarization. Adding files inside an already
+        # signed bundle invalidates the cdhash — that was the v2.4.133–149
+        # "screenpipe is damaged" bug, which surfaced as repeated Gatekeeper
+        # popups + the embedded server (port 3030) being killed mid-launch.
+        # The runtime symlink approach we used to do is gone (see main.rs).
+        # Now: copy + re-sign + rebuild DMG so the very first signature
+        # already covers Contents/MacOS/mlx.metallib.
+        #
+        # Only runs for the macOS aarch64 build, which is the only target
+        # that enables parakeet-mlx. Other macOS targets (x86_64) ship the
+        # metallib via bundle.resources too (because build.rs downloads it
+        # whenever the build host is aarch64), but parakeet-mlx isn't
+        # compiled in for x86_64 so MLX never tries to load it — and the
+        # disk-mount + DMG-rebuild step blew through CI runner disk space
+        # on x86_64 in v2.4.154 ("fcopyfile failed: No space left on
+        # device") for no benefit. Narrow to where it actually matters.
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          APP_DIR="${BUNDLE_DIR}/macos"
+
+          # Find the .app bundle Tauri produced
+          shopt -s nullglob
+          apps=( "${APP_DIR}"/*.app )
+          if [ ${#apps[@]} -eq 0 ]; then
+            echo "no .app to patch — skipping mlx.metallib inject"
+            exit 0
+          fi
+          APP="${apps[0]}"
+          RES_LIB="${APP}/Contents/Resources/mlx.metallib"
+
+          if [ ! -f "$RES_LIB" ]; then
+            echo "no Contents/Resources/mlx.metallib — non-mlx build, skipping"
+            exit 0
+          fi
+
+          # Empty/placeholder metallib (created by build.rs on non-aarch64 macOS,
+          # or when the GitHub release download failed) — don't bother injecting,
+          # MLX would fail anyway. Real metallib is ~84 MB.
+          SIZE=$(stat -f%z "$RES_LIB")
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "Resources/mlx.metallib is only ${SIZE} bytes (placeholder) — skipping inject"
+            exit 0
+          fi
+
+          echo "=== Injecting mlx.metallib into Contents/MacOS/ (${SIZE} bytes) ==="
+          cp "$RES_LIB" "${APP}/Contents/MacOS/mlx.metallib"
+
+          # Re-unlock the keychain before re-signing — same retry pattern the
+          # build step uses, since codesign needs the cert.
+          BUILD_KC="$HOME/Library/Keychains/build.keychain-db"
+          if [ -f "$BUILD_KC" ]; then
+            security unlock-keychain -p "build_password" "$BUILD_KC"
+            security set-keychain-settings -t 3600 "$BUILD_KC"
+          fi
+
+          # Re-sign the bundle. --deep so all inner binaries stay covered;
+          # --force so the existing signature is replaced. Same identity +
+          # entitlements + hardened-runtime flags Tauri used.
+          codesign --force --deep \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime \
+            --entitlements apps/screenpipe-app-tauri/src-tauri/entitlements.plist \
+            --timestamp \
+            "$APP"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "✅ ${APP##*/} re-signed with mlx.metallib in Contents/MacOS/"
+
+          # Rebuild the DMG so it ships the modified .app.
+          #
+          # The mount-and-swap approach (UDRW convert → attach → cp .app →
+          # detach → UDZO convert) blew through CI runner disk space — the
+          # ~600 MB .app gets duplicated into the mounted DMG, on top of
+          # the existing UDRW + UDZO copies (~3× peak disk usage). v2.4.154
+          # hit "fcopyfile failed: No space left on device".
+          #
+          # Cheaper: delete the original DMG to free space, then create a
+          # fresh DMG from a staging dir that contains BOTH the patched
+          # .app AND an `Applications` symlink → /Applications. The
+          # symlink is what gives users the drag-to-install affordance
+          # — without it, opening the DMG just shows the app icon with
+          # nowhere to drag it (regression: v2.4.156 shipped a bare
+          # `-srcfolder "$APP"` and dropped the Applications symlink;
+          # users opened the DMG and couldn't install).
+          DMG_DIR="${BUNDLE_DIR}/dmg"
+          dmgs=( "${DMG_DIR}"/*.dmg )
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "no DMG produced — skipping DMG patch"
+            exit 0
+          fi
+          DMG="${dmgs[0]}"
+          echo "=== Replacing DMG: ${DMG##*/} ==="
+          df -h "$DMG_DIR" | tail -1
+          rm -f "$DMG"
+
+          # Stage the .app alongside an Applications symlink. The
+          # symlink itself adds zero bytes to the DMG — when hdiutil
+          # walks the staging dir, the Applications target is OUTSIDE
+          # the staging root so it's preserved as a symlink (not
+          # followed, which would copy /Applications recursively).
+          # We `cp -R` rather than `mv` because the next workflow step
+          # ("Staple .app and rebuild updater tarball") needs the
+          # original .app at bundle/macos/ to staple + repackage for
+          # the Tauri auto-updater.
+          DMG_STAGE="${RUNNER_TEMP:-/tmp}/screenpipe-dmg-stage-$$"
+          mkdir -p "$DMG_STAGE"
+          cp -R "$APP" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+
+          hdiutil create \
+            -volname "Screenpipe" \
+            -srcfolder "$DMG_STAGE" \
+            -ov \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            "$DMG"
+
+          rm -rf "$DMG_STAGE"
+
+          # Sign the new DMG so notarization sees a clean cdhash.
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG"
+          codesign --verify --verbose=2 "$DMG"
+          echo "✅ ${DMG##*/} re-created + signed from patched .app (with Applications symlink)"
 
       - name: Clean up signing cert from login keychain (macOS)
         if: matrix.os_type == 'macos' && always()

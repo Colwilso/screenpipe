@@ -158,6 +158,24 @@ describe("chat-store: stable sort by createdAt", () => {
     expect(ordered.map((s) => s.id)).toEqual(["older", "newer"]);
   });
 
+  it("user-touched chats outrank pipe completions even with older lastUserMessageAt", () => {
+    // Bug: pipe-watch / pipe-run sessions are upserted with
+    // createdAt: Date.now() when they spawn. After they finish they
+    // appear in Recents. Their `createdAt` is more recent than a
+    // user's last user-send timestamp from a few minutes earlier, so
+    // pipes were burying the chat the user just typed in.
+    // Tiered sort fixes this: rows with `lastUserMessageAt` set
+    // always rank above rows without one.
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "user-chat", createdAt: 100, lastUserMessageAt: 1_000 }),
+    );
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "pipe-completion", kind: "pipe-watch", createdAt: 9_000 }),
+    );
+    const ordered = selectOrderedSessions(useChatStore.getState());
+    expect(ordered.map((s) => s.id)).toEqual(["user-chat", "pipe-completion"]);
+  });
+
   it("pinned rows float above unpinned, both sorted by createdAt within group", () => {
     useChatStore.getState().actions.upsert(baseRecord({ id: "p1", createdAt: 100, pinned: true }));
     useChatStore.getState().actions.upsert(baseRecord({ id: "r1", createdAt: 200 }));
@@ -246,5 +264,37 @@ describe("chat-store: setCurrent clears unread atomically", () => {
     const state = useChatStore.getState();
     expect(state.currentId).toBe("A");
     expect(state.sessions.A.unread).toBe(false);
+  });
+});
+
+describe("chat-store: markUnread guards", () => {
+  beforeEach(reset);
+
+  it("no-ops when the session is the current one", () => {
+    useChatStore.getState().actions.upsert(baseRecord({ id: "A", unread: false }));
+    useChatStore.getState().actions.setCurrent("A");
+    useChatStore.getState().actions.markUnread("A");
+    expect(useChatStore.getState().sessions.A.unread).toBe(false);
+  });
+
+  it("no-ops when the session is loaded in the panel even if currentId was cleared", () => {
+    // Bug: navigating away from /home reset currentId to null. Late deltas
+    // for the still-loaded panel chat then re-marked it unread, even though
+    // the user had read everything on screen. Guard on panelSessionId fixes
+    // that — the panel keeps the chat visible-on-return, so deltas there
+    // don't count as "new since last seen".
+    useChatStore.getState().actions.upsert(baseRecord({ id: "A", unread: false }));
+    useChatStore.setState({ currentId: null, panelSessionId: "A" });
+    useChatStore.getState().actions.markUnread("A");
+    expect(useChatStore.getState().sessions.A.unread).toBe(false);
+  });
+
+  it("DOES mark a different session unread when nav'd away", () => {
+    useChatStore.getState().actions.upsert(baseRecord({ id: "A", unread: false }));
+    useChatStore.getState().actions.upsert(baseRecord({ id: "B", unread: false }));
+    useChatStore.setState({ currentId: null, panelSessionId: "A" });
+    useChatStore.getState().actions.markUnread("B");
+    expect(useChatStore.getState().sessions.A.unread).toBe(false);
+    expect(useChatStore.getState().sessions.B.unread).toBe(true);
   });
 });
