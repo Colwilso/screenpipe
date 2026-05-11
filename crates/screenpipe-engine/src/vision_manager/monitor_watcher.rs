@@ -166,9 +166,25 @@ pub async fn start_monitor_watcher(
             }
 
             // ── Normal monitor polling ──────────────────────────────────────
-            // Only poll when running
+            // If the VisionManager is stopped (e.g. start() failed because no
+            // monitors matched after undock/wake), retry with backoff. This
+            // handles the case where external monitors were disconnected and the
+            // laptop lid was closed, causing list_monitors to return 0 displays
+            // momentarily. Once displays reappear, start() will succeed.
             if vision_manager.status().await != VisionManagerStatus::Running {
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                match vision_manager.start().await {
+                    Ok(()) => {
+                        info!("VisionManager recovered after previous start failure");
+                        if let Ok(monitors) = list_monitors_detailed().await {
+                            known_monitors = monitors.iter().map(|m| m.id()).collect();
+                        }
+                    }
+                    Err(_) => {
+                        // Still no monitors available -- keep retrying next cycle
+                        debug!("VisionManager retry: still no monitors available");
+                    }
+                }
                 continue;
             }
 

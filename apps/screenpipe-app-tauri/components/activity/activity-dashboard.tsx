@@ -19,7 +19,7 @@ import {
   useActivityLog,
   type DateRange,
 } from "@/lib/hooks/use-activity-data";
-import type { CategoryKey } from "@/lib/activity-categories";
+import { CATEGORY_KEYS, type CategoryKey } from "@/lib/activity-categories";
 
 interface ActivityDashboardProps {
   onNavigateToTimeline?: (timestamp: string) => void;
@@ -103,13 +103,13 @@ export function ActivityDashboard({ onNavigateToTimeline }: ActivityDashboardPro
   }, []);
 
   const exportCsv = useCallback(() => {
-    const headers = ["date", "meetings", "coding", "writing", "reading", "communication", "design", "other", "total"];
+    const headers = ["date", ...CATEGORY_KEYS, "total"];
     const csvRows = [headers.join(",")];
     for (const d of dailyData) {
       csvRows.push(
         [
           d.date,
-          ...Object.values(d.categories).map((v) => v.toFixed(2)),
+          ...CATEGORY_KEYS.map((k) => d.categories[k].toFixed(2)),
           d.totalHours.toFixed(2),
         ].join(",")
       );

@@ -456,24 +456,23 @@ export function useActivityData(
     return { totalHours, topApp, meetingHours, activeDays };
   }, [dailyData, appData]);
 
-  // Aggregated per-app usage sorted by hours descending
+  // Aggregated per-app usage sorted by hours descending, respecting category filter
   const appUsage = useMemo((): AppUsage[] => {
     const byApp = new Map<string, { category: CategoryKey; hours: number }>();
     for (const app of appData) {
+      const cat = categorizeApp(app.appName);
+      if (categoryFilter.length > 0 && !categoryFilter.includes(cat)) continue;
       const existing = byApp.get(app.appName);
       if (existing) {
         existing.hours += app.hours;
       } else {
-        byApp.set(app.appName, {
-          category: categorizeApp(app.appName),
-          hours: app.hours,
-        });
+        byApp.set(app.appName, { category: cat, hours: app.hours });
       }
     }
     return Array.from(byApp.entries())
       .map(([appName, { category, hours }]) => ({ appName, category, hours }))
       .sort((a, b) => b.hours - a.hours);
-  }, [appData]);
+  }, [appData, categoryFilter]);
 
   return {
     dailyData: filteredDaily,
@@ -512,8 +511,10 @@ export function useActivityLog(
       setError(null);
 
       try {
+        // Match the 5am logical day boundary used in the chart aggregation:
+        // "date" represents activity from 5am on that day to 5am the next day.
         const conditions = [
-          `timestamp >= '${date}' AND timestamp < DATE('${date}', '+1 day')`,
+          `DATE(timestamp, 'localtime', '-${DAY_START_HOUR} hours') = '${date}'`,
           `app_name IS NOT NULL AND app_name != ''`,
         ];
 
@@ -523,38 +524,35 @@ export function useActivityLog(
           );
         }
 
-        const countSql = `
-          SELECT COUNT(*) as cnt FROM frames
-          WHERE ${conditions.join(" AND ")}
-          LIMIT 1
-        `;
+        const whereClause = conditions.join(" AND ");
 
+        // Fetch all rows for this logical day (typically well under 10k for
+        // one day). Category filtering uses categorizeApp() which respects
+        // user overrides from localStorage, so it must happen client-side.
         const dataSql = `
           SELECT timestamp, app_name, window_name FROM frames
-          WHERE ${conditions.join(" AND ")}
+          WHERE ${whereClause}
           ORDER BY timestamp DESC
-          LIMIT ${pageSize} OFFSET ${page * pageSize}
+          LIMIT 10000
         `;
 
-        const [countResult, dataResult] = await Promise.all([
-          rawSql<{ cnt: number }>(countSql),
-          rawSql<RawLogRow>(dataSql),
-        ]);
+        const dataResult = await rawSql<RawLogRow>(dataSql);
 
         if (cancelled) return;
 
-        setTotalRows(countResult[0]?.cnt || 0);
+        let mapped: ActivityLogRow[] = dataResult.map((r) => ({
+          timestamp: r.timestamp,
+          appName: r.app_name,
+          windowName: r.window_name || "",
+          category: categorizeApp(r.app_name),
+        }));
 
-        const mapped: ActivityLogRow[] = dataResult
-          .map((r) => ({
-            timestamp: r.timestamp,
-            appName: r.app_name,
-            windowName: r.window_name || "",
-            category: categorizeApp(r.app_name),
-          }))
-          .filter((r) => (category ? r.category === category : true));
+        if (category) {
+          mapped = mapped.filter((r) => r.category === category);
+        }
 
-        setRows(mapped);
+        setTotalRows(mapped.length);
+        setRows(mapped.slice(page * pageSize, (page + 1) * pageSize));
       } catch (e) {
         if (!cancelled) {
           setError(
