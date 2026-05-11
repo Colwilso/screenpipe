@@ -41,7 +41,8 @@
     ],
     "macOS": {
       "entitlements": "entitlements.plist",
-      "hardenedRuntime": true
+      "hardenedRuntime": true,
+      "signingIdentity": "Screenpipe Dev Signing"
     }
   },
   "plugins": {

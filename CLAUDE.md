@@ -161,10 +161,13 @@ Note: The Tauri app (`apps/screenpipe-app-tauri/src-tauri`) is excluded from the
 - `release-dev` — Fast local release builds: thin LTO, codegen-units=16
 
 ## macOS Dev Builds
-- Dev builds are signed with a developer certificate for consistent permissions
+- Dev builds are signed with a self-signed "Screenpipe Dev Signing" certificate
 - Config: `apps/screenpipe-app-tauri/src-tauri/tauri.conf.json` → `bundle.macOS.signingIdentity`
 - This ensures macOS TCC recognizes the app across rebuilds (permissions persist)
-- Other devs without the cert will see permission issues — onboarding has "continue anyway" button after 5s
+- The app must be in `/Applications` for macOS to grant TCC permissions properly
+- After building, copy to Applications: `cp -R "src-tauri/target/release/bundle/macos/screenpipe - Development.app" "/Applications/screenpipe - Development.app"`
+- Other devs need their own self-signed code signing cert (Keychain Access > create certificate with Code Signing type, or via openssl + security import)
+- Onboarding has "continue anyway" button after 5s for devs without the cert
 
 ## macOS Build Dependencies
 ```bash
@@ -187,11 +190,15 @@ The engine and desktop app must both be running for full functionality. MCP is o
 
 The desktop app needs these macOS TCC permissions, which can be revoked silently after rebuilds or OS updates:
 
-- **Screen Recording** -- required for screen capture
+- **Screen Recording** -- required for screen capture (ScreenCaptureKit)
 - **Microphone** -- required for audio capture
-- **Accessibility** -- required for accessibility tree capture
+- **Accessibility** -- required for event-driven capture triggers (click, app_switch, typing detection) and accessibility tree text extraction. Without this, the VisionManager starts but never captures frames because no events arrive.
 
-If the app enters a permission-recovery loop on startup, re-grant these in System Settings > Privacy & Security.
+If the app enters a permission-recovery loop on startup, re-grant these in System Settings > Privacy & Security. The signing identity ensures permissions persist across rebuilds when the app is in `/Applications`.
+
+### VisionManager resilience
+
+The VisionManager uses event-driven capture triggered by OS events (clicks, app switches, visual changes, idle timer). If monitors disconnect (e.g., undocking a laptop), the monitor_watcher retries `start()` every 5 seconds until displays become available again. Audio capture has independent recovery and continues working even when vision is stalled.
 
 ## Git Usage
 - Multiple agents work on this codebase in parallel -- never delete local code, use `git reset --hard`, or force-push

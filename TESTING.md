@@ -88,7 +88,7 @@ commits that broke this area: `0752ea59`, `7562ec62`, `2a2bd9b5`, `f2f7f770`, `5
 
 ### 3. monitor plug/unplug
 
-commits: `28e5c247`
+commits: `28e5c247`, `2251aceab`
 
 - [ ] **unplug external monitor while recording** — recording continues on remaining monitor(s). no crash. log shows "Monitor X disconnected".
 - [ ] **plug in external monitor while recording** — new monitor is detected within 5 seconds. recording starts on it. log shows "Monitor X reconnected".
@@ -100,6 +100,8 @@ commits: `28e5c247`
 - [ ] **resolution change (e.g., clamshell mode)** — closing MacBook lid with external monitor. recording continues on external.
 - [ ] **queue stats after unplug** — check logs. no queue stats for disconnected monitor after disconnect.
 - [ ] **--use-all-monitors flag override** — Verify that the `--use-all-monitors` CLI flag correctly overrides tier-based defaults (e.g., if a tier defaults to a single monitor, the flag should still enable all monitors). (`bd5b94328`)
+- [ ] **undock + sleep/wake recovery** — disconnect all external monitors and close lid (sleep). Re-open lid or re-dock. VisionManager must recover within 10 seconds. Log shows "VisionManager recovered after previous start failure". Frames appear in DB. Before `2251aceab`, this scenario caused permanent vision death (audio kept working but zero frames written until app restart).
+- [ ] **stale monitor_ids after undock** — with specific monitor IDs configured (e.g., external monitors 8, 9), undock so only laptop display remains. VisionManager retries every 5s. Re-dock with external monitors. Capture resumes on matching monitors. No app restart needed.
 
 ### 4. audio device handling
 
