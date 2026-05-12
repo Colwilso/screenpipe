@@ -161,13 +161,28 @@ Note: The Tauri app (`apps/screenpipe-app-tauri/src-tauri`) is excluded from the
 - `release-dev` — Fast local release builds: thin LTO, codegen-units=16
 
 ## macOS Dev Builds
+- Product name is **Alioth** (not "screenpipe") -- `tauri.conf.json` → `productName`
 - Dev builds are signed with a self-signed "Screenpipe Dev Signing" certificate
 - Config: `apps/screenpipe-app-tauri/src-tauri/tauri.conf.json` → `bundle.macOS.signingIdentity`
 - This ensures macOS TCC recognizes the app across rebuilds (permissions persist)
 - The app must be in `/Applications` for macOS to grant TCC permissions properly
-- After building, copy to Applications: `cp -R "src-tauri/target/release/bundle/macos/screenpipe - Development.app" "/Applications/screenpipe - Development.app"`
-- Other devs need their own self-signed code signing cert (Keychain Access > create certificate with Code Signing type, or via openssl + security import)
-- Onboarding has "continue anyway" button after 5s for devs without the cert
+- Deploy after building:
+  ```bash
+  rm -rf "/Applications/Alioth.app"
+  cp -R "src-tauri/target/release/bundle/macos/Alioth.app" "/Applications/Alioth.app"
+  chmod +x "/Applications/Alioth.app/Contents/MacOS/bun"
+  codesign --force --sign "Screenpipe Dev Signing" --deep "/Applications/Alioth.app"
+  open "/Applications/Alioth.app"
+  ```
+- The `chmod +x` on bun is needed because Tauri's bundler strips execute bits
+- Other devs need their own self-signed code signing cert (via openssl + security import)
+
+## Post-Merge Verification
+After every upstream merge, run:
+```bash
+bun test __tests__/merge-integration-checklist.test.ts
+```
+This verifies: Bedrock credential chain (5 links), preset defaults, binary permissions, signing config, Alioth branding, and Activity nav wiring. All 16 tests must pass before building.
 
 ## macOS Build Dependencies
 ```bash
