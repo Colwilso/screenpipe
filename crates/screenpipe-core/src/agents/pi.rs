@@ -323,6 +323,8 @@ pub struct PiExecutor {
     /// is also exported as a deprecated alias (one release) for old pipe.md
     /// files on disk. None = auth disabled.
     pub api_auth_key: Option<String>,
+    /// AWS credentials for Bedrock provider (profile, region). Set per-pipe run.
+    aws_bedrock_creds: std::sync::Mutex<(Option<String>, Option<String>)>,
 }
 
 impl PiExecutor {
@@ -344,6 +346,7 @@ impl PiExecutor {
             user_token,
             api_url: SCREENPIPE_API_URL.to_string(),
             api_auth_key: None,
+            aws_bedrock_creds: std::sync::Mutex::new((None, None)),
         }
     }
 
@@ -1430,6 +1433,19 @@ impl PiExecutor {
         // pipe.md files that hardcoded the old name (e.g. an older
         // meeting-summary install on disk that install_builtin_pipes won't
         // overwrite). TODO(remove next release): drop SCREENPIPE_API_AUTH_KEY.
+
+        // Bedrock: inject AWS credentials from the per-run mutex
+        if resolved_provider == "amazon-bedrock" {
+            if let Ok(creds) = self.aws_bedrock_creds.lock() {
+                if let Some(ref profile) = creds.0 {
+                    cmd.env("AWS_PROFILE", profile);
+                }
+                if let Some(ref region) = creds.1 {
+                    cmd.env("AWS_REGION", region);
+                }
+            }
+        }
+
         if let Some(ref key) = self.api_auth_key {
             cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
             cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
@@ -1579,6 +1595,19 @@ impl PiExecutor {
         }
 
         // See spawn_pi above — TODO(remove next release): drop the deprecated alias.
+
+        // Bedrock: inject AWS credentials from the per-run mutex
+        if resolved_provider == "amazon-bedrock" {
+            if let Ok(creds) = self.aws_bedrock_creds.lock() {
+                if let Some(ref profile) = creds.0 {
+                    cmd.env("AWS_PROFILE", profile);
+                }
+                if let Some(ref region) = creds.1 {
+                    cmd.env("AWS_REGION", region);
+                }
+            }
+        }
+
         if let Some(ref key) = self.api_auth_key {
             cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
             cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
@@ -2130,6 +2159,12 @@ impl AgentExecutor for PiExecutor {
 
     fn screenpipe_api_url(&self) -> &str {
         &self.api_url
+    }
+
+    fn set_aws_credentials(&self, profile: Option<String>, region: Option<String>) {
+        if let Ok(mut creds) = self.aws_bedrock_creds.lock() {
+            *creds = (profile, region);
+        }
     }
 }
 

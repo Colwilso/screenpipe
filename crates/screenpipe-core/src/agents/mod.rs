@@ -224,4 +224,7 @@ pub trait AgentExecutor: Send + Sync {
     fn screenpipe_api_url(&self) -> &str {
         pi::SCREENPIPE_API_URL
     }
+
+    /// Set AWS credentials for the next Bedrock run. Default no-op.
+    fn set_aws_credentials(&self, _profile: Option<String>, _region: Option<String>) {}
 }

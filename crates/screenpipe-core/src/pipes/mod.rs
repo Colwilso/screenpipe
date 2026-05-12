@@ -1356,6 +1356,10 @@ pub struct ResolvedPreset {
     pub api_key: Option<String>,
     /// System prompt from the preset (injected before the pipe body).
     pub prompt: Option<String>,
+    /// AWS profile name for Bedrock provider.
+    pub aws_profile: Option<String>,
+    /// AWS region for Bedrock provider.
+    pub aws_region: Option<String>,
 }
 
 /// Read the ChatGPT OAuth access token, with auto-refresh if expired.
@@ -1646,6 +1650,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             "openai" => Some("openai"),
             "openai-chatgpt" => Some("openai-chatgpt"),
             "anthropic" => Some("anthropic"),
+            "bedrock" => Some("amazon-bedrock"),
             "custom" => Some("custom"), // custom uses openai-compatible API at a user-specified URL
             _ => None,
         })
@@ -1675,12 +1680,26 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    let aws_profile = preset
+        .get("awsProfile")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let aws_region = preset
+        .get("awsRegion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
     Some(ResolvedPreset {
         model,
         provider,
         url,
         api_key,
         prompt,
+        aws_profile,
+        aws_region,
     })
 }
 
@@ -3168,7 +3187,7 @@ impl PipeManager {
         write_pid_file(&self.pipes_dir, name, 0);
 
         // Resolve preset
-        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) = if let Some(
+        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt, run_aws_profile, run_aws_region) = if let Some(
             preset_id,
         ) =
             config.preset.first()
@@ -3180,6 +3199,8 @@ impl PipeManager {
                     resolved.url,
                     resolved.api_key,
                     resolved.prompt,
+                    resolved.aws_profile,
+                    resolved.aws_region,
                 ),
                 None if is_enterprise_managed(&config) => {
                     remove_pid_file(&self.pipes_dir, name);
@@ -3197,6 +3218,8 @@ impl PipeManager {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 ),
             }
         } else {
@@ -3208,10 +3231,14 @@ impl PipeManager {
                     resolved.url,
                     resolved.api_key,
                     resolved.prompt,
+                    resolved.aws_profile,
+                    resolved.aws_region,
                 ),
                 None => (
                     config.model.clone(),
                     config.provider.clone(),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -3369,6 +3396,10 @@ impl PipeManager {
                         .await;
                 }
             }
+
+            // Bedrock: set AWS credentials before spawning the pipe agent
+            executor.set_aws_credentials(run_aws_profile, run_aws_region);
+
             let run_result = tokio::time::timeout(
                 timeout_duration,
                 executor.run_streaming(
@@ -3693,6 +3724,8 @@ impl PipeManager {
                 preset_prompt,
                 active_preset_id,
                 active_preset_idx,
+                run_aws_profile,
+                run_aws_region,
             ) = if !config.preset.is_empty() {
                 // Pick the best available preset using the circuit breaker, but
                 // start at `retry_depth` so an in-run fallback retry advances to
@@ -3725,6 +3758,8 @@ impl PipeManager {
                             resolved.prompt,
                             Some(preset_id.to_string()),
                             Some(idx),
+                            resolved.aws_profile,
+                            resolved.aws_region,
                         )
                     }
                     None => {
@@ -3764,6 +3799,8 @@ impl PipeManager {
                             resolved.prompt,
                             None,
                             None,
+                            resolved.aws_profile,
+                            resolved.aws_region,
                         )
                     }
                     None => {
@@ -3771,6 +3808,8 @@ impl PipeManager {
                         (
                             config.model.clone(),
                             config.provider.clone(),
+                            None,
+                            None,
                             None,
                             None,
                             None,
@@ -3907,6 +3946,10 @@ impl PipeManager {
                         .await;
                 }
             }
+
+            // Bedrock: set AWS credentials before spawning the pipe agent
+            executor.set_aws_credentials(run_aws_profile, run_aws_region);
+
             let run_result = tokio::time::timeout(
                 timeout_duration,
                 executor.run_streaming(
@@ -5256,7 +5299,7 @@ impl PipeManager {
                     }
 
                     // Resolve preset → model/provider overrides (same as run_pipe)
-                    let (model, provider, provider_url, api_key, preset_prompt) = if let Some(
+                    let (model, provider, provider_url, api_key, preset_prompt, sched_aws_profile, sched_aws_region) = if let Some(
                         preset_id,
                     ) =
                         config.preset.first()
@@ -5271,6 +5314,8 @@ impl PipeManager {
                                     resolved.url,
                                     resolved.api_key,
                                     resolved.prompt,
+                                    resolved.aws_profile,
+                                    resolved.aws_region,
                                 )
                             }
                             None if is_enterprise_managed(config) => {
@@ -5359,6 +5404,8 @@ impl PipeManager {
                                 None,
                                 None,
                                 None,
+                                None,
+                                None,
                             ),
                         }
                     } else {
@@ -5377,11 +5424,15 @@ impl PipeManager {
                                     resolved.url,
                                     resolved.api_key,
                                     resolved.prompt,
+                                    resolved.aws_profile,
+                                    resolved.aws_region,
                                 )
                             }
                             None => (
                                 config.model.clone(),
                                 config.provider.clone(),
+                                None,
+                                None,
                                 None,
                                 None,
                                 None,
@@ -5607,6 +5658,10 @@ impl PipeManager {
                                     .await;
                             }
                         }
+
+                        // Bedrock: set AWS credentials before spawning the pipe agent
+                        executor.set_aws_credentials(sched_aws_profile.clone(), sched_aws_region.clone());
+
                         let run_result = tokio::time::timeout(
                             timeout_duration,
                             executor.run_streaming(
