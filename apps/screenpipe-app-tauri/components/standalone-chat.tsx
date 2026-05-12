@@ -2664,6 +2664,8 @@ export function StandaloneChat({
       model: p.model || "",
       apiKey: ("apiKey" in p ? (p.apiKey as string) : null) || null,
       maxTokens: (p as any).maxTokens ?? 4096,
+      awsProfile: ("awsProfile" in p ? (p as any).awsProfile : null) || null,
+      awsRegion: ("awsRegion" in p ? (p as any).awsRegion : null) || null,
       systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
