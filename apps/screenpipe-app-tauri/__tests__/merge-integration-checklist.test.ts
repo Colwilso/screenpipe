@@ -159,7 +159,7 @@ describe("Bundled binaries", () => {
   });
 });
 
-describe("Signing configuration", () => {
+describe("Signing and branding configuration", () => {
   it("tauri.conf.json has signingIdentity set", () => {
     const content = fs.readFileSync(
       path.resolve(APP_ROOT, "src-tauri/tauri.conf.json"),
@@ -167,6 +167,15 @@ describe("Signing configuration", () => {
     );
     const config = JSON.parse(content);
     expect(config.bundle.macOS.signingIdentity).toBe("Screenpipe Dev Signing");
+  });
+
+  it("productName is Alioth (not screenpipe)", () => {
+    const content = fs.readFileSync(
+      path.resolve(APP_ROOT, "src-tauri/tauri.conf.json"),
+      "utf-8"
+    );
+    const config = JSON.parse(content);
+    expect(config.productName).toBe("Alioth");
   });
 });
 
