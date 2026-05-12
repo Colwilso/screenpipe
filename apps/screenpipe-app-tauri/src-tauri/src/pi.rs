@@ -1590,6 +1590,10 @@ pub struct PiProviderConfig {
     pub model: String,
     /// Optional API key for the provider
     pub api_key: Option<String>,
+    /// AWS profile name for Bedrock provider (authenticates via ~/.aws/credentials)
+    pub aws_profile: Option<String>,
+    /// AWS region for Bedrock provider (e.g. "us-east-1")
+    pub aws_region: Option<String>,
     /// Max output tokens (default 4096)
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
@@ -3634,6 +3638,7 @@ pub async fn pi_set_model(
         "openai-chatgpt" => "openai-chatgpt",
         "native-ollama" => "ollama",
         "anthropic" => "anthropic-byok",
+        "bedrock" => "amazon-bedrock",
         "custom" if !provider_config.url.is_empty() => "custom",
         "screenpipe-cloud" | "pi" | _ => "screenpipe",
     };
