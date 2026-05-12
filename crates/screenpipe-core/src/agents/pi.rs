@@ -294,6 +294,26 @@ impl PiExecutor {
         Ok(())
     }
 
+    pub fn ensure_mcp_bridge_extension(project_dir: &Path) -> Result<()> {
+        let config_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".screenpipe")
+            .join("mcp-servers.json");
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        let ext_path = ext_dir.join("mcp-bridge.ts");
+
+        if config_path.exists() {
+            std::fs::create_dir_all(&ext_dir)?;
+            let ext_content = include_str!("../../assets/extensions/mcp-bridge.ts");
+            std::fs::write(&ext_path, ext_content)?;
+            debug!("mcp-bridge extension installed at {:?}", ext_path);
+        } else if ext_path.exists() {
+            std::fs::remove_file(&ext_path)?;
+            debug!("mcp-bridge extension removed (no config)");
+        }
+        Ok(())
+    }
+
     /// Install or remove the sub-agent extension based on the `subagent` frontmatter flag.
     /// When enabled, the agent can spawn parallel child pi processes via
     /// `sub-agent run "prompt"` bash commands.
@@ -971,6 +991,7 @@ impl AgentExecutor for PiExecutor {
         Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
         Self::ensure_context_pruning_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
+        Self::ensure_mcp_bridge_extension(working_dir)?;
 
         let pi_path = find_pi_executable().ok_or_else(|| {
             anyhow!(
@@ -1062,6 +1083,7 @@ impl AgentExecutor for PiExecutor {
         Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
         Self::ensure_context_pruning_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
+        Self::ensure_mcp_bridge_extension(working_dir)?;
 
         let pi_path = find_pi_executable().ok_or_else(|| {
             anyhow!(
