@@ -181,6 +181,21 @@ describe("Activity view files exist and are wired up", () => {
     expect(content).toContain("case \"activity\"");
   });
 
+  it("Activity nav item exists in mainSections with BarChart3 icon", () => {
+    const content = fs.readFileSync(
+      path.resolve(APP_ROOT, "app/home/page.tsx"),
+      "utf-8"
+    );
+    expect(content).toContain("BarChart3");
+    expect(content).toContain('id: "activity"');
+    // Must be in the mainSections array, not just anywhere in the file
+    const sectionsBlock = content.slice(
+      content.indexOf("const mainSections"),
+      content.indexOf(".filter((s) => !isSectionHidden")
+    );
+    expect(sectionsBlock).toContain('"activity"');
+  });
+
   it("use-activity-data.ts uses 5am day boundary consistently", () => {
     const content = fs.readFileSync(
       path.resolve(APP_ROOT, "lib/hooks/use-activity-data.ts"),
