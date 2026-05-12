@@ -22,6 +22,7 @@ import {
   Phone,
   Plug,
   NotebookPen,
+  BarChart3,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
 import { useChatStore } from "@/lib/stores/chat-store";
@@ -549,6 +550,7 @@ function HomeContent() {
     { id: "meetings", label: "Meeting notes", icon: <NotebookPen className="h-3.5 w-3.5" /> },
     { id: "memories", label: "Memories", icon: <Sparkles className="h-3.5 w-3.5" /> },
     { id: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
+    { id: "activity", label: "Activity", icon: <BarChart3 className="h-3.5 w-3.5" /> },
   ].filter((s) => !isSectionHidden(s.id));
 
   // Listen for navigation events from other windows (e.g. tray, Rust-side links)
