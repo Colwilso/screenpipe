@@ -651,7 +651,7 @@ function HomeContent() {
               {/* Row 1: name (collapse moved out — pinned top-left next
                   to the traffic lights, see above). */}
               <div className={cn("flex items-center", sidebarCollapsed ? "justify-center" : "justify-between")}>
-                {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>screenpipe</h1>}
+                {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>alioth</h1>}
               </div>
               {/* Row 2: device status + action buttons */}
               {!sidebarCollapsed && (() => {
