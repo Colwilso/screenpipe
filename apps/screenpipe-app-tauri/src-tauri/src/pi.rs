@@ -1292,6 +1292,18 @@ pub async fn pi_start_inner(
         }
     }
 
+    // Bedrock: inject AWS credentials so Pi can authenticate with the provider
+    if pi_provider == "amazon-bedrock" {
+        if let Some(ref config) = provider_config {
+            if let Some(ref profile) = config.aws_profile {
+                cmd.env("AWS_PROFILE", profile);
+            }
+            if let Some(ref region) = config.aws_region {
+                cmd.env("AWS_REGION", region);
+            }
+        }
+    }
+
     // For local/small models (Ollama, custom), explicitly tell them to read the
     // screenpipe-api skill file — they often skip reading skills on their own.
     let is_local_model = matches!(pi_provider.as_str(), "ollama" | "custom");

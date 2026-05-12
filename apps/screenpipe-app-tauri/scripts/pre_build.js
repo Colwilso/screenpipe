@@ -212,6 +212,7 @@ async function copyBunBinary() {
 				const entries = await fs.readdir(tmpDir);
 				const extractedBun = path.join(tmpDir, entries[0], 'bun');
 				await copyFile(extractedBun, dest);
+				await fs.chmod(dest, 0o755);
 				console.log(`bun ${label} binary installed to ${dest}`);
 				await fs.rm(tmpZip, { force: true });
 				await fs.rm(tmpDir, { recursive: true, force: true });
