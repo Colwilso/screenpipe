@@ -1811,51 +1811,58 @@ impl PipeManager {
         write_pid_file(&self.pipes_dir, name, 0);
 
         // Resolve preset
-        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt, run_aws_profile, run_aws_region) =
-            if let Some(preset_id) = config.preset.first() {
-                match resolve_preset(&self.pipes_dir, preset_id) {
-                    Some(resolved) => (
-                        resolved.model,
-                        resolved.provider,
-                        resolved.url,
-                        resolved.api_key,
-                        resolved.prompt,
-                        resolved.aws_profile,
-                        resolved.aws_region,
-                    ),
-                    None => (
-                        config.model.clone(),
-                        config.provider.clone(),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    ),
-                }
-            } else {
-                // No preset — use user's default preset
-                match resolve_preset(&self.pipes_dir, "default") {
-                    Some(resolved) => (
-                        resolved.model,
-                        resolved.provider,
-                        resolved.url,
-                        resolved.api_key,
-                        resolved.prompt,
-                        resolved.aws_profile,
-                        resolved.aws_region,
-                    ),
-                    None => (
-                        config.model.clone(),
-                        config.provider.clone(),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    ),
-                }
-            };
+        let (
+            run_model,
+            run_provider,
+            run_provider_url,
+            run_api_key,
+            preset_prompt,
+            run_aws_profile,
+            run_aws_region,
+        ) = if let Some(preset_id) = config.preset.first() {
+            match resolve_preset(&self.pipes_dir, preset_id) {
+                Some(resolved) => (
+                    resolved.model,
+                    resolved.provider,
+                    resolved.url,
+                    resolved.api_key,
+                    resolved.prompt,
+                    resolved.aws_profile,
+                    resolved.aws_region,
+                ),
+                None => (
+                    config.model.clone(),
+                    config.provider.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            }
+        } else {
+            // No preset — use user's default preset
+            match resolve_preset(&self.pipes_dir, "default") {
+                Some(resolved) => (
+                    resolved.model,
+                    resolved.provider,
+                    resolved.url,
+                    resolved.api_key,
+                    resolved.prompt,
+                    resolved.aws_profile,
+                    resolved.aws_region,
+                ),
+                None => (
+                    config.model.clone(),
+                    config.provider.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            }
+        };
 
         // Create DB execution row
         let exec_id = if let Some(ref store) = self.store {
@@ -3412,11 +3419,15 @@ impl PipeManager {
                     }
 
                     // Resolve preset → model/provider overrides (same as run_pipe)
-                    let (model, provider, provider_url, api_key, preset_prompt, aws_profile, aws_region) = if let Some(
-                        preset_id,
-                    ) =
-                        config.preset.first()
-                    {
+                    let (
+                        model,
+                        provider,
+                        provider_url,
+                        api_key,
+                        preset_prompt,
+                        aws_profile,
+                        aws_region,
+                    ) = if let Some(preset_id) = config.preset.first() {
                         match resolve_preset(&pipes_dir, preset_id) {
                             Some(resolved) => {
                                 info!("scheduler: pipe '{}' using preset '{}' → model={}, provider={:?}",

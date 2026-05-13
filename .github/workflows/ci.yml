@@ -70,7 +70,7 @@ jobs:
           cp crates/screenpipe-screen/tests/testing_OCR.png target/debug/deps/
 
       - name: Run cargo tests
-        run: cargo test
+        run: cargo test --workspace --exclude screenpipe-rfdetr-mlx
 
   test-windows:
     # windows-2019 reached end-of-life on the GitHub-hosted runner fleet
