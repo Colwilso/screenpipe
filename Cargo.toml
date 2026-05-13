@@ -2,7 +2,7 @@
 members = [
     "crates/*",
 ]
-exclude = ["apps/screenpipe-app-tauri/src-tauri", "crates/screenpipe-integrations", "crates/screenpipe-rfdetr-mlx"]
+exclude = ["apps/screenpipe-app-tauri/src-tauri", "crates/screenpipe-integrations"]
 resolver = "2"
 
 [workspace.package]

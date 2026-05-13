@@ -32,10 +32,11 @@ jobs:
 
       - name: Run Clippy
         run: |
-          # Skip packages with macOS-specific Objective-C code that won't compile on Linux
+          # Skip packages with macOS-specific Objective-C code or Apple Silicon-only deps
           cargo clippy --workspace \
             --exclude screenpipe-screen \
             --exclude screenpipe-audio \
+            --exclude screenpipe-rfdetr-mlx \
             --all-targets -- -W clippy::all
 
   optimize:
