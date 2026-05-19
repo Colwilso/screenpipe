@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -40,6 +40,30 @@ lazy_static! {
 
         // Stripe keys and secrets (sk_live_, sk_test_, pk_live_, pk_test_, whsec_, rk_live_, rk_test_)
         (Regex::new(r"\b(?:sk_live|sk_test|pk_live|pk_test|whsec|rk_live|rk_test)_[A-Za-z0-9]{10,}").unwrap(), "STRIPE_KEY"),
+
+        // Anthropic API keys (sk-ant-api03-..., sk-ant-admin01-...). The
+        // user-visible reveal pane on platform.claude.com/settings/keys
+        // shows the full secret in plaintext — common screenpipe failure
+        // surface. Note hyphen separator (NOT underscore like Stripe).
+        (Regex::new(r"\bsk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{40,}").unwrap(), "ANTHROPIC_KEY"),
+
+        // OpenAI API keys (sk-..., sk-proj-...). Modern OpenAI keys are
+        // base58-shaped; legacy format kept for back-compat.
+        (Regex::new(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{40,}\b").unwrap(), "OPENAI_KEY"),
+
+        // Google API keys / Cloud / GenerativeAI. Fixed-length 39 chars.
+        (Regex::new(r"\bAIza[A-Za-z0-9_-]{35}\b").unwrap(), "GOOGLE_API_KEY"),
+
+        // Hugging Face access tokens (hf_..., 37 chars total).
+        (Regex::new(r"\bhf_[A-Za-z0-9]{34}\b").unwrap(), "HUGGINGFACE_TOKEN"),
+
+        // GitHub modern PAT/OAuth/server/user tokens (ghp_, gho_, ghu_,
+        // ghs_, ghr_) — 36-40 chars. Existing legacy 40-hex SHA path
+        // doesn't catch these.
+        (Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36,40}\b").unwrap(), "GITHUB_TOKEN"),
+
+        // Cloudflare API tokens (40 base64-url chars after "v1.0-").
+        (Regex::new(r"\bv1\.0-[A-Za-z0-9_-]{40,}\b").unwrap(), "CLOUDFLARE_TOKEN"),
 
         // Supabase keys (sb_publishable_, sb_secret_, service_role key patterns)
         (Regex::new(r"\bsb_(?:publishable|secret)_[A-Za-z0-9_-]{5,}").unwrap(), "SUPABASE_KEY"),
@@ -135,6 +159,12 @@ lazy_static! {
     static ref PASSWORD_CONTEXT_PATTERN: Regex = Regex::new(
         r"(?i)((?:master\s+)?(?:password|passcode|passphrase|pin|secret\s*key|unlock\s*code|security\s*code)[\s]*[:=][\s]*)(\S+)"
     ).unwrap();
+
+    // RegexSet for fast "any PII present?" check — single DFA pass over the text.
+    // Most captures have zero PII so this avoids running 27 individual replace_all calls.
+    static ref PII_REGEX_SET: RegexSet = RegexSet::new(
+        PII_PATTERNS.iter().map(|(re, _)| re.as_str())
+    ).unwrap();
 }
 
 /// Represents a region in an image that contains PII and should be redacted
@@ -153,15 +183,21 @@ pub struct PiiRegion {
 }
 
 pub fn remove_pii(text: &str) -> String {
-    let mut sanitized = text.to_string();
+    // Fast path: single RegexSet DFA pass checks all patterns at once.
+    // Most captured text has zero PII, so we avoid 27 individual replace_all calls.
+    let matches: Vec<usize> = PII_REGEX_SET.matches(text).into_iter().collect();
+    if matches.is_empty() {
+        return text.to_string();
+    }
 
     // First, handle password context specially - preserve the keyword, redact only the value
-    sanitized = PASSWORD_CONTEXT_PATTERN
-        .replace_all(&sanitized, "$1[PASSWORD]")
+    let mut sanitized = PASSWORD_CONTEXT_PATTERN
+        .replace_all(text, "$1[PASSWORD]")
         .to_string();
 
-    // Then apply other PII patterns (skip PASSWORD_CONTEXT as it's already handled)
-    for (pattern, replacement) in PII_PATTERNS.iter() {
+    // Only run replace_all for patterns that actually matched
+    for idx in matches {
+        let (pattern, replacement) = &PII_PATTERNS[idx];
         if *replacement == "PASSWORD_CONTEXT" {
             continue; // Already handled above
         }
@@ -194,12 +230,7 @@ pub fn remove_pii_from_text_json(
 
 /// Check if a given text contains PII
 pub fn contains_pii(text: &str) -> bool {
-    for (pattern, _) in PII_PATTERNS.iter() {
-        if pattern.is_match(text) {
-            return true;
-        }
-    }
-    false
+    PII_REGEX_SET.is_match(text)
 }
 
 /// Get the PII type for a given text, if any
@@ -479,6 +510,56 @@ mod tests {
             remove_pii("Reach me at +1-800-555-1234"),
             "Reach me at [PHONE]"
         );
+    }
+
+    #[test]
+    fn test_phone_no_false_positive_on_accessibility_bounds() {
+        // Accessibility tree bounding box coordinates must NOT be redacted as phone numbers.
+        // Real bug: the TS redactPii() in share-logs-button.tsx was mangling these values
+        // e.g. "left": 47692 became "left": [PHONE]7692
+        let bounds_json = r#"{"left": 47692, "top": 111658, "width": 44767, "height": 39496}"#;
+        assert_eq!(remove_pii(bounds_json), bounds_json);
+
+        // Individual coordinate values should not match
+        assert!(!contains_pii("47692"));
+        assert!(!contains_pii("111658"));
+        assert!(!contains_pii("44767"));
+        assert!(!contains_pii("39496"));
+        assert!(!contains_pii("62796"));
+        assert!(!contains_pii("16272"));
+
+        // Coordinates in structured text (Pi chat output)
+        let structured = r#""left_bound": 47692, "top_bound": 111658, "width_bound": 44767"#;
+        assert_eq!(remove_pii(structured), structured);
+    }
+
+    #[test]
+    fn test_phone_no_false_positive_on_numeric_ids_and_hashes() {
+        // Frame IDs, hash values, monitor IDs from logs
+        assert!(!contains_pii("frame_id: 549130407"));
+        assert!(!contains_pii("monitor 605818409"));
+        assert!(!contains_pii("hash=5542957767813040527"));
+        assert!(!contains_pii("pid: 25616"));
+        assert!(!contains_pii("elapsed=100.4287155s"));
+        assert!(!contains_pii("rows_returned=1434"));
+
+        // Timestamps and durations should not match
+        assert!(!contains_pii("age: 2624s"));
+        assert!(!contains_pii("poll=300s"));
+
+        // Meeting IDs
+        assert!(!contains_pii("meeting started (id=68)"));
+    }
+
+    #[test]
+    fn test_phone_no_false_positive_on_pixel_dimensions() {
+        // Monitor resolution strings
+        assert!(!contains_pii("2880x1800"));
+        assert!(!contains_pii("1920x1080"));
+
+        // Size/compression stats from snapshot compaction
+        let compaction = "snapshot compaction: 59 frames, 22.2MB to 8.9MB (2.5x), 59 JPEGs deleted";
+        assert_eq!(remove_pii(compaction), compaction);
     }
 
     #[test]
@@ -900,14 +981,14 @@ mod tests {
         // Based on actual leaks found in the user's data
 
         // Stripe webhook secret from terminal
-        let stripe_leak = "whsec BnlsS222bkRvslineRtsak70Nxo10467";
+        let _stripe_leak = "whsec BnlsS222bkRvslineRtsak70Nxo10467";
         // Note: This has a space instead of underscore - edge case
         // The pattern expects underscore, so let's test the proper format
         let stripe_proper = "whsec_BnlsS222bkRvslineRtsak70Nxo10467";
         assert!(contains_pii(stripe_proper));
 
         // Supabase JWT from dashboard
-        let supabase_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+        let _supabase_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
         // This is truncated but should still match the pattern start
         assert!(contains_pii(
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSJ9.abc123"
@@ -995,7 +1076,7 @@ mod tests {
     #[test]
     fn test_discord_token_detection() {
         // Discord token format: base64.timestamp.hmac
-        let discord_token = "MjM4NDk0NzU2NTIxMzc3Nzky.CunGFQ.wUILz7z6HoJzVeq6pyHPmVgQgV4";
+        let _discord_token = "MjM4NDk0NzU2NTIxMzc3Nzky.CunGFQ.wUILz7z6HoJzVeq6pyHPmVgQgV4";
         // Note: This is a fake token format
         assert!(contains_pii(
             "NTk0NzU2NTIxMzc3Nzk2NDEy.XQ0bXQ.vHc7MzY3NDk0NzU2NTIxMzc3Nzk"

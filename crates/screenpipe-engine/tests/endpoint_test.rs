@@ -32,7 +32,11 @@ mod tests {
     }
 
     async fn setup_test_app() -> (Router, Arc<DatabaseManager>) {
-        let db = Arc::new(DatabaseManager::new("sqlite::memory:").await.unwrap());
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
 
         let audio_manager = Arc::new(
             AudioManagerBuilder::new()
@@ -277,6 +281,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -298,6 +303,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -319,6 +325,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -340,6 +347,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -361,6 +369,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -382,6 +391,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -403,6 +413,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -493,6 +504,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -515,6 +529,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -538,6 +555,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -565,6 +585,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -591,6 +614,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -611,6 +635,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -698,6 +723,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -729,6 +757,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -748,7 +779,7 @@ mod tests {
 
         // Open database in read-only mode for safety
         let db = Arc::new(
-            DatabaseManager::new(&format!("sqlite:{}?mode=ro", db_path))
+            DatabaseManager::new(&format!("sqlite:{}?mode=ro", db_path), Default::default())
                 .await
                 .unwrap(),
         );
@@ -776,6 +807,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -800,6 +834,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();

@@ -38,6 +38,20 @@ pub enum ContentItem {
     UI(UiContent),
     /// User input actions (clicks, keystrokes, clipboard)
     Input(InputContent),
+    /// Persistent memory: fact, preference, decision, insight
+    Memory(MemoryContent),
+}
+
+#[derive(OaSchema, Serialize, Deserialize, Debug, Clone)]
+pub struct MemoryContent {
+    pub id: i64,
+    pub content: String,
+    pub source: String,
+    pub source_context: Option<serde_json::Value>,
+    pub tags: Vec<String>,
+    pub importance: f64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(OaSchema, Serialize, Deserialize, Debug, Clone)]
@@ -61,6 +75,9 @@ pub struct OCRContent {
 pub struct AudioContent {
     pub chunk_id: i64,
     pub transcription: String,
+    /// Convenience alias for generic clients and agents that read `text` on
+    /// every content row. Same value as `transcription`.
+    pub text: String,
     pub timestamp: DateTime<Utc>,
     pub file_path: String,
     pub offset_index: i64,
@@ -68,8 +85,20 @@ pub struct AudioContent {
     pub device_name: String,
     pub device_type: DeviceType,
     pub speaker: Option<Speaker>,
+    pub speaker_label: Option<String>,
+    pub speaker_source: Option<String>,
+    pub speaker_confidence: Option<f64>,
+    pub speaker_provisional: bool,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(OaSchema, Serialize, Deserialize, Debug, Clone)]
@@ -507,10 +536,17 @@ fn validate_raw_sql(query: &str) -> Result<(), String> {
         .join(" ");
     let upper = normalized.to_uppercase();
 
-    // Only SELECT queries need limit validation
+    // Only allow read-only queries — block writes via /raw_sql
     let trimmed = upper.trim_start();
-    if !trimmed.starts_with("SELECT") {
-        return Ok(());
+    if !trimmed.starts_with("SELECT")
+        && !trimmed.starts_with("WITH")
+        && !trimmed.starts_with("EXPLAIN")
+    {
+        return Err(
+            "Query rejected: /raw_sql only allows SELECT, WITH, and EXPLAIN queries. \
+             Use the dedicated API endpoints for writes."
+                .to_string(),
+        );
     }
 
     // Check for LIMIT clause

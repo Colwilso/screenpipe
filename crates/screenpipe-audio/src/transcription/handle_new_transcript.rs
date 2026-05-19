@@ -39,6 +39,7 @@ pub async fn handle_new_transcript(
     db: Arc<DatabaseManager>,
     transcription_receiver: Arc<crossbeam::channel::Receiver<TranscriptionResult>>,
     transcription_engine: Arc<AudioTranscriptionEngine>,
+    diarization_mode: &'static str,
     use_pii_removal: bool,
     metrics: Arc<AudioPipelineMetrics>,
     on_insert: Option<AudioInsertCallback>,
@@ -50,6 +51,11 @@ pub async fn handle_new_transcript(
     let mut prev_transcript_by_device: HashMap<String, String> = HashMap::new();
     let mut prev_id_by_device: HashMap<String, i64> = HashMap::new();
     while let Ok(mut transcription) = transcription_receiver.recv() {
+        // Heartbeat: record that the consumer is alive and processing, even when
+        // VAD filters everything. The health check uses this to distinguish
+        // "silence, nothing to write" from "pipeline stalled, writes blocked".
+        metrics.record_transcription_attempt();
+
         if transcription
             .transcription
             .clone()
@@ -141,6 +147,7 @@ pub async fn handle_new_transcript(
             &db,
             transcription,
             transcription_engine.clone(),
+            diarization_mode,
             processed_previous,
             previous_transcript_id,
             use_pii_removal,

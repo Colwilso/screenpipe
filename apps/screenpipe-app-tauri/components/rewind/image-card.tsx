@@ -8,21 +8,22 @@ import { cn } from "@/lib/utils";
 import { throttle } from "lodash";
 import { Loader2, ImageOff, ExternalLink } from "lucide-react";
 import { useKeywordParams } from "@/lib/hooks/use-keyword-params";
-import { useFrameOcrData } from "@/lib/hooks/use-frame-ocr-data";
+import { useFrameTextData } from "@/lib/hooks/use-frame-text-data";
 import { TextOverlay } from "@/components/text-overlay";
+import { getApiBaseUrl } from "@/lib/api";
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 
 const useImageWithRetry = (frameId: number) => {
-	const [src, setSrc] = useState(`http://localhost:3030/frames/${frameId}`);
+	const [src, setSrc] = useState(`${getApiBaseUrl()}/frames/${frameId}`);
 	const [isLoading, setIsLoading] = useState(true);
 	const [hasError, setHasError] = useState(false);
 	const retryCount = useRef(0);
 
 	// Reset state when frameId changes
 	useEffect(() => {
-		setSrc(`http://localhost:3030/frames/${frameId}`);
+		setSrc(`${getApiBaseUrl()}/frames/${frameId}`);
 		setIsLoading(true);
 		setHasError(false);
 		retryCount.current = 0;
@@ -37,7 +38,7 @@ const useImageWithRetry = (frameId: number) => {
 		if (retryCount.current < MAX_RETRIES) {
 			retryCount.current += 1;
 			setTimeout(() => {
-				setSrc(`http://localhost:3030/frames/${frameId}?retry=${retryCount.current}`);
+				setSrc(`${getApiBaseUrl()}/frames/${frameId}?retry=${retryCount.current}`);
 			}, RETRY_DELAY * retryCount.current);
 		} else {
 			setIsLoading(false);
@@ -256,7 +257,7 @@ export const MainImage = () => {
 	const { src, isLoading, hasError, handleLoad, handleError } = useImageWithRetry(currentFrame?.frame_id ?? 0);
 
 	// Fetch OCR text positions for text selection overlay
-	const { textPositions, isLoading: isOcrLoading } = useFrameOcrData(
+	const { textPositions, isLoading: isOcrLoading } = useFrameTextData(
 		currentFrame?.frame_id ?? null
 	);
 

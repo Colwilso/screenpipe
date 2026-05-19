@@ -9,6 +9,9 @@ const POLL_INTERVAL_MS = 30 * 1000; // 30 seconds (lightweight IPC read)
 
 export interface Suggestion {
   text: string;
+  preview?: string | null;
+  priority?: number;
+  connectionIcon?: string | null;
 }
 
 export type ActivityMode =
@@ -29,14 +32,17 @@ export function useAutoSuggestions() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const prevTextsRef = useRef<string>("");
+  const prevSignatureRef = useRef<string>("");
 
   const applySuggestions = useCallback(
-    (data: { suggestions: Suggestion[]; mode: string; tags?: string[] }) => {
-      const newTexts = data.suggestions.map((s) => s.text).join("|");
-      // Only update state if suggestions actually changed (avoids re-render flicker)
-      if (newTexts !== prevTextsRef.current) {
-        prevTextsRef.current = newTexts;
+    (data: { suggestions: Suggestion[]; mode: string; tags?: string[] }, options?: { force?: boolean }) => {
+      const newSignature = JSON.stringify(
+        data.suggestions.map((s) => [s.text, s.preview ?? "", s.priority ?? "", s.connectionIcon ?? ""])
+      );
+      // Only update state if suggestions actually changed (avoids re-render flicker),
+      // except for a manual refresh where the user expects visible feedback.
+      if (options?.force || newSignature !== prevSignatureRef.current) {
+        prevSignatureRef.current = newSignature;
         setSuggestions(data.suggestions);
       }
       setMode(data.mode as ActivityMode);
@@ -57,9 +63,12 @@ export function useAutoSuggestions() {
     } catch {
       // Fallback if Tauri command not available yet
       setSuggestions([
-        { text: "what did I do in the last hour?" },
+        { text: "what did I work on in the last hour?", priority: 1 },
         { text: "summarize my day so far" },
-        { text: "which apps did I use most today?" },
+        { text: "which apps did I use most today" },
+        { text: "show my recent screen activity" },
+        { text: "what was I working on" },
+        { text: "how much time did I spend on each app" },
       ]);
       setMode("idle");
       setTags([]);
@@ -74,7 +83,7 @@ export function useAutoSuggestions() {
     try {
       const result = await commands.forceRegenerateSuggestions();
       if (result.status === "ok") {
-        applySuggestions(result.data);
+        applySuggestions(result.data, { force: true });
       }
     } catch (err) {
       console.error("force refresh failed:", err);

@@ -22,7 +22,11 @@ fn init() {
 }
 
 async fn setup_test_app() -> (Router, Arc<DatabaseManager>) {
-    let db = Arc::new(DatabaseManager::new("sqlite::memory:").await.unwrap());
+    let db = Arc::new(
+        DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap(),
+    );
 
     let audio_manager = Arc::new(
         AudioManagerBuilder::new()
@@ -158,8 +162,45 @@ async fn test_add_tags_and_search() {
             ContentItem::Input(_) => {
                 unreachable!()
             }
+            ContentItem::Memory(_) => {
+                unreachable!()
+            }
         }
     }
+}
+
+#[tokio::test]
+async fn test_openapi_includes_meeting_retranscribe() {
+    let (app, _) = setup_test_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let paths = spec["paths"].as_object().unwrap();
+    let retranscribe_paths = paths
+        .keys()
+        .filter(|path| path.contains("retranscribe"))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert!(
+        paths.contains_key("/meetings/{id}/retranscribe")
+            || paths.contains_key("/meetings/:id/retranscribe"),
+        "missing meeting retranscribe path; retranscribe paths: {:?}",
+        retranscribe_paths
+    );
 }
 
 #[tokio::test]
@@ -324,13 +365,13 @@ async fn test_search_by_multiple_tags() {
         .await
         .unwrap();
 
-    // Search for items with multiple tags, excluding UI content
+    // Search for items with multiple tags (vision+audio), excluding UI content
     let search_response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/search?content_type=audio")
+                .uri("/search?content_type=all")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -360,6 +401,9 @@ async fn test_search_by_multiple_tags() {
             }
             ContentItem::Input(_) => {
                 panic!("Input content should not be included in the results");
+            }
+            ContentItem::Memory(_) => {
+                panic!("Memory content should not be included in the results");
             }
         }
     }

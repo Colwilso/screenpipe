@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use screenpipe_core::pii_removal::remove_pii;
-use screenpipe_db::{DatabaseManager, Speaker};
-use tracing::{debug, error};
+use screenpipe_db::{DatabaseManager, NewDiarizationSegment, Speaker};
+use tracing::{debug, error, warn};
 
 use crate::core::engine::AudioTranscriptionEngine;
 
-use super::{text_utils::longest_common_word_substring, AudioInput};
+use super::{
+    text_utils::longest_common_word_substring, AudioInput, TranscriptionDiarizationSegment,
+};
 
 #[derive(Debug, Clone)]
 pub struct TranscriptionResult {
@@ -23,6 +25,8 @@ pub struct TranscriptionResult {
     pub error: Option<String>,
     pub start_time: f64,
     pub end_time: f64,
+    pub diarization_provider: Option<String>,
+    pub diarization_segments: Vec<TranscriptionDiarizationSegment>,
 }
 
 impl TranscriptionResult {
@@ -65,6 +69,7 @@ pub async fn process_transcription_result(
     db: &DatabaseManager,
     result: TranscriptionResult,
     audio_transcription_engine: Arc<AudioTranscriptionEngine>,
+    diarization_mode: &str,
     previous_transcript: Option<String>,
     previous_transcript_id: Option<i64>,
     use_pii_removal: bool,
@@ -77,11 +82,16 @@ pub async fn process_transcription_result(
         return Ok(None);
     }
 
-    let speaker = get_or_create_speaker_from_embedding(db, &result.speaker_embedding).await?;
+    let speaker_id = if result.speaker_embedding.is_empty() {
+        debug!("empty speaker embedding; storing transcript without speaker");
+        None
+    } else {
+        let speaker = get_or_create_speaker_from_embedding(db, &result.speaker_embedding).await?;
+        debug!("detected speaker id={}", speaker.id);
+        Some(speaker.id)
+    };
 
-    debug!("detected speaker id={}", speaker.id);
-
-    let raw_transcription = result.transcription.unwrap();
+    let raw_transcription = result.transcription.clone().unwrap();
     // Apply PII removal if enabled
     let transcription = if use_pii_removal {
         remove_pii(&raw_transcription)
@@ -89,7 +99,6 @@ pub async fn process_transcription_result(
         raw_transcription
     };
     let transcription_engine = audio_transcription_engine.to_string();
-    let speaker_id = Some(speaker.id);
     let mut chunk_id: Option<i64> = None;
 
     debug!("device {} inserting audio chunk", result.input.device);
@@ -120,42 +129,131 @@ pub async fn process_transcription_result(
     // if smart mode deferred transcription by 20 minutes.
     let capture_ts: Option<DateTime<Utc>> = DateTime::from_timestamp(result.timestamp as i64, 0);
 
-    match db
-        .insert_audio_chunk_and_transcription(
-            &result.path,
-            &transcription,
-            0,
-            &transcription_engine,
-            &screenpipe_db::AudioDevice {
-                name: result.input.device.name.clone(),
-                device_type: match result.input.device.device_type {
-                    crate::core::device::DeviceType::Input => screenpipe_db::DeviceType::Input,
-                    crate::core::device::DeviceType::Output => screenpipe_db::DeviceType::Output,
+    // Retry DB insertion with backoff to survive transient pool saturation.
+    // Without this, transcribed audio is silently dropped from the timeline.
+    for retry in 0..3u32 {
+        match db
+            .insert_audio_chunk_and_transcription(
+                &result.path,
+                &transcription,
+                0,
+                &transcription_engine,
+                &screenpipe_db::AudioDevice {
+                    name: result.input.device.name.clone(),
+                    device_type: match result.input.device.device_type {
+                        crate::core::device::DeviceType::Input => screenpipe_db::DeviceType::Input,
+                        crate::core::device::DeviceType::Output => {
+                            screenpipe_db::DeviceType::Output
+                        }
+                    },
                 },
-            },
-            Some(speaker.id),
-            Some(result.start_time),
-            Some(result.end_time),
-            capture_ts,
-        )
-        .await
-    {
-        Ok(audio_chunk_id) => {
-            debug!(
-                "Inserted audio chunk+transcription for device {} using {}",
-                result.input.device, transcription_engine
-            );
-            chunk_id = Some(audio_chunk_id);
+                speaker_id,
+                Some(result.start_time),
+                Some(result.end_time),
+                capture_ts,
+            )
+            .await
+        {
+            Ok(audio_chunk_id) => {
+                debug!(
+                    "Inserted audio chunk+transcription for device {} using {}",
+                    result.input.device, transcription_engine
+                );
+                let segments = diarization_segments_for_insert(&result, speaker_id);
+                let provider = result.diarization_provider.as_deref().unwrap_or(
+                    if result.speaker_embedding.is_empty() {
+                        "none"
+                    } else {
+                        "local"
+                    },
+                );
+                if let Err(e) = db
+                    .insert_diarization_run_with_segments(
+                        audio_chunk_id,
+                        diarization_mode,
+                        provider,
+                        Some(&transcription_engine),
+                        None,
+                        &segments,
+                    )
+                    .await
+                {
+                    warn!(
+                        "failed to insert diarization segments for audio chunk {}: {}",
+                        audio_chunk_id, e
+                    );
+                }
+                chunk_id = Some(audio_chunk_id);
+                break;
+            }
+            Err(e) => {
+                if retry < 2 {
+                    warn!(
+                        "Failed to insert audio chunk+transcription for device {} (attempt {}/3): {}, retrying...",
+                        result.input.device, retry + 1, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * (retry as u64 + 1)))
+                        .await;
+                } else {
+                    // device as a structured field so Sentry dedups across
+                    // different devices into a single issue.
+                    error!(
+                        device = %result.input.device,
+                        error = %e,
+                        "Failed to insert audio chunk+transcription after 3 retries"
+                    );
+                }
+            }
         }
-        Err(e) => error!(
-            "Failed to insert audio chunk+transcription for device {}: {}",
-            result.input.device, e
-        ),
     }
     Ok(chunk_id.map(|id| AudioInsertResult {
         audio_chunk_id: id,
         speaker_id,
     }))
+}
+
+fn diarization_segments_for_insert(
+    result: &TranscriptionResult,
+    speaker_id: Option<i64>,
+) -> Vec<NewDiarizationSegment> {
+    if !result.diarization_segments.is_empty() {
+        return result
+            .diarization_segments
+            .iter()
+            .map(|segment| NewDiarizationSegment {
+                provider_speaker_label: segment.provider_speaker_label.clone(),
+                speaker_id: None,
+                source: "provider".to_string(),
+                start_time: segment.start_time,
+                end_time: segment.end_time,
+                confidence: segment.confidence,
+                overlap: segment.overlap,
+                metadata: Some(
+                    serde_json::json!({
+                        "text": segment.transcription,
+                    })
+                    .to_string(),
+                ),
+            })
+            .collect();
+    }
+
+    let (provider_speaker_label, source) = if let Some(id) = speaker_id {
+        (format!("speaker:{id}"), "local_embedding")
+    } else {
+        ("unknown".to_string(), "none")
+    };
+
+    vec![NewDiarizationSegment {
+        provider_speaker_label,
+        speaker_id,
+        source: source.to_string(),
+        start_time: result.start_time,
+        end_time: result.end_time,
+        confidence: None,
+        overlap: false,
+        metadata: None,
+    }]
 }
 
 pub async fn get_or_create_speaker_from_embedding(
@@ -164,6 +262,15 @@ pub async fn get_or_create_speaker_from_embedding(
 ) -> Result<Speaker, anyhow::Error> {
     let speaker = db.get_speaker_from_embedding(embedding).await?;
     if let Some(speaker) = speaker {
+        debug!(
+            "matched speaker id={} name={:?}",
+            speaker.id,
+            if speaker.name.is_empty() {
+                "unnamed"
+            } else {
+                &speaker.name
+            }
+        );
         // Improve cluster over time: update centroid and store diverse embeddings
         if let Err(e) = db.update_speaker_centroid(speaker.id, embedding).await {
             debug!("failed to update speaker centroid: {}", e);
@@ -173,6 +280,7 @@ pub async fn get_or_create_speaker_from_embedding(
         }
         Ok(speaker)
     } else {
+        // insert_speaker logs the creation at info level
         let speaker = db.insert_speaker(embedding).await?;
         Ok(speaker)
     }
@@ -318,5 +426,61 @@ mod tests {
             "PII removal too slow: {:?} for 1000 iterations",
             duration
         );
+    }
+
+    #[tokio::test]
+    async fn test_empty_speaker_embedding_stores_no_speaker() {
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let timestamp = Utc::now().timestamp();
+        let file_path = format!("/tmp/speaker-none-{}.wav", timestamp);
+
+        let result = TranscriptionResult {
+            path: file_path.clone(),
+            input: AudioInput {
+                data: Arc::new(vec![]),
+                sample_rate: 16_000,
+                channels: 1,
+                device: Arc::new(crate::core::device::AudioDevice::new(
+                    "test-mic (input)".to_string(),
+                    crate::core::device::DeviceType::Input,
+                )),
+                capture_timestamp: timestamp as u64,
+            },
+            speaker_embedding: vec![],
+            transcription: Some("hello world".to_string()),
+            timestamp: timestamp as u64,
+            error: None,
+            start_time: 0.0,
+            end_time: 1.0,
+            diarization_provider: None,
+            diarization_segments: Vec::new(),
+        };
+
+        let insert_result = process_transcription_result(
+            &db,
+            result,
+            Arc::new(AudioTranscriptionEngine::WhisperLargeV3Turbo),
+            "background",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(insert_result.speaker_id.is_none());
+
+        let rows = db
+            .get_recent_transcriptions_without_speaker(Utc::now() - Duration::minutes(5), 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, file_path);
     }
 }

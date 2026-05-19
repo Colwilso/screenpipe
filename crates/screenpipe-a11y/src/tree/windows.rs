@@ -8,7 +8,8 @@
 //! the focused window's tree and extract all visible text — matching macOS behavior.
 
 use super::{
-    AccessibilityTreeNode, NodeBounds, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform,
+    AccessibilityTreeNode, NodeBounds, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
+    TreeWalkerPlatform,
 };
 use crate::events::AccessibilityNode;
 use crate::platform::windows_uia::UiaContext;
@@ -25,7 +26,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
 };
 
 /// Excluded apps — password managers and security tools (matches macOS list).
@@ -45,9 +46,6 @@ const EXCLUDED_APPS: &[&str] = &[
     "snippingtool",
 ];
 
-/// Window title patterns that indicate sensitive content.
-const SENSITIVE_TITLES: &[&str] = &["password", "private", "incognito", "secret"];
-
 /// UIA control types that should be skipped (decorative, not text-bearing).
 const SKIP_TYPES: &[&str] = &[
     "ScrollBar",
@@ -57,6 +55,8 @@ const SKIP_TYPES: &[&str] = &[
     "ToolTip",
     "ProgressBar",
 ];
+
+const RPC_E_CHANGED_MODE_CODE: i32 = 0x80010106u32 as i32;
 
 /// UIA control types that carry user-visible text in name or value.
 const TEXT_TYPES: &[&str] = &[
@@ -84,7 +84,8 @@ const TEXT_TYPES: &[&str] = &[
 /// to mutate on first call (lazy init). The walker is single-threaded.
 struct WalkerState {
     uia: Option<UiaContext>,
-    com_initialized: bool,
+    com_initialized_by_us: bool,
+    com_ready: bool,
 }
 
 /// Windows tree walker using UI Automation CacheRequest.
@@ -105,7 +106,8 @@ impl WindowsTreeWalker {
             config,
             state: UnsafeCell::new(WalkerState {
                 uia: None,
-                com_initialized: false,
+                com_initialized_by_us: false,
+                com_ready: false,
             }),
         }
     }
@@ -115,11 +117,23 @@ impl WindowsTreeWalker {
     /// Safety: caller must ensure single-threaded access (guaranteed by walker design).
     unsafe fn ensure_init(&self) -> Result<&UiaContext> {
         let state = &mut *self.state.get();
-        if !state.com_initialized {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-                .ok()
-                .map_err(|e| anyhow::anyhow!("COM init failed: {:?}", e))?;
-            state.com_initialized = true;
+        if !state.com_ready {
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            if hr.is_ok() {
+                state.com_initialized_by_us = true;
+                state.com_ready = true;
+            } else if hr.0 == RPC_E_CHANGED_MODE_CODE {
+                // Tokio's blocking pool can reuse a thread that some other
+                // Windows API already initialized as MTA. UI Automation is
+                // usable from MTA too; the important part is not calling
+                // CoUninitialize for an apartment we did not initialize.
+                tracing::debug!(
+                    "COM already initialized with a different apartment; using existing COM apartment for UIA"
+                );
+                state.com_ready = true;
+            } else {
+                return Err(anyhow::anyhow!("COM init failed: {:?}", hr));
+            }
         }
         if state.uia.is_none() {
             let mut last_err = None;
@@ -158,7 +172,7 @@ impl Drop for WindowsTreeWalker {
         let state = self.state.get_mut();
         // Drop UIA before CoUninitialize
         state.uia.take();
-        if state.com_initialized {
+        if state.com_initialized_by_us {
             unsafe {
                 windows::Win32::System::Com::CoUninitialize();
             }
@@ -167,7 +181,7 @@ impl Drop for WindowsTreeWalker {
 }
 
 impl TreeWalkerPlatform for WindowsTreeWalker {
-    fn walk_focused_window(&self) -> Result<Option<TreeSnapshot>> {
+    fn walk_focused_window(&self) -> Result<TreeWalkResult> {
         let start = Instant::now();
 
         // Safety: single-threaded access guaranteed by walker thread design
@@ -176,7 +190,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         // Get the focused window
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd == HWND::default() {
-            return Ok(None);
+            return Ok(TreeWalkResult::NotFound);
         }
 
         // Get process info
@@ -188,7 +202,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         // Skip excluded apps
         let app_lower = app_name.to_lowercase();
         if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex)) {
-            return Ok(None);
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
         // Get window title
@@ -198,18 +212,19 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             String::from_utf16_lossy(&buf[..len as usize])
         };
 
-        // Skip sensitive windows
-        let window_lower = window_name.to_lowercase();
-        if SENSITIVE_TITLES.iter().any(|s| window_lower.contains(s)) {
-            return Ok(None);
+        // Skip incognito / private browsing windows (localized title check)
+        if self.config.ignore_incognito_windows && crate::incognito::is_title_private(&window_name)
+        {
+            return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
         }
 
         // Apply user-configured ignored windows (check app name and window title)
+        let window_lower = window_name.to_lowercase();
         if self.config.ignored_windows.iter().any(|pattern| {
             let p = pattern.to_lowercase();
             app_lower.contains(&p) || window_lower.contains(&p)
         }) {
-            return Ok(None);
+            return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
         }
 
         // Apply user-configured included windows (whitelist mode)
@@ -219,28 +234,43 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
                 app_lower.contains(&p) || window_lower.contains(&p)
             });
             if !matches {
-                return Ok(None);
+                return Ok(TreeWalkResult::Skipped(SkipReason::NotInIncludeList));
             }
         }
 
+        // Use adaptive budget overrides when set
+        let effective_timeout = self.config.effective_walk_timeout();
+        let effective_max_nodes = self.config.effective_max_nodes();
+
         // Check timeout budget
-        if start.elapsed() >= self.config.walk_timeout {
-            return Ok(None);
+        if start.elapsed() >= effective_timeout {
+            return Ok(TreeWalkResult::NotFound);
         }
 
         // Capture the accessibility tree
-        let root = match uia.capture_window_tree(hwnd, self.config.max_nodes) {
+        let root = match uia.capture_window_tree(hwnd, effective_max_nodes) {
             Some(tree) => tree,
-            None => return Ok(None),
+            None => return Ok(TreeWalkResult::NotFound),
         };
 
         // Get monitor dimensions for normalizing element bounds to 0-1 coords
         let monitor_rect = get_monitor_rect(hwnd);
+        // Window rect for the on-screen visibility check (issue #2436).
+        // Stored once per walk — GetWindowRect is cheap and the focused
+        // window doesn't move during the sub-second walk in practice.
+        let window_rect = get_window_rect(hwnd);
 
         // Extract text from the tree (matching macOS text extraction behavior)
         let mut text_buffer = String::with_capacity(4096);
         let mut nodes = Vec::with_capacity(256);
         let mut browser_url: Option<String> = None;
+        let ignored_lower: Vec<String> = self
+            .config
+            .ignored_windows
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        let mut hit_ignored_extension = false;
         extract_text_from_tree(
             &root,
             0,
@@ -249,7 +279,18 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             &mut nodes,
             &mut browser_url,
             &monitor_rect,
+            &window_rect,
+            &ignored_lower,
+            &mut hit_ignored_extension,
         );
+
+        if hit_ignored_extension {
+            debug!(
+                "skipping capture: browser extension popup matched ignored window in app={}",
+                app_name
+            );
+            return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
+        }
 
         // Don't bail on empty text — we still need the app_name and window_name
         // for frame metadata. Electron apps (Discord, Slack, etc.) often return
@@ -279,12 +320,18 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         );
 
         // Windows walker doesn't have timeout-based truncation yet — report as complete
-        Ok(Some(TreeSnapshot {
+        // Per-app document_path resolution from on-disk state files
+        // (Obsidian config + VS Code-fork state.vscdb). Returns None
+        // for any unknown app or any failure — never panics.
+        let document_path =
+            super::electron_docs::resolve_electron_doc_path(&app_name.to_lowercase());
+        Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name,
             text_content: text_buffer,
             nodes,
             browser_url,
+            document_path,
             timestamp: Utc::now(),
             node_count,
             walk_duration,
@@ -303,6 +350,58 @@ struct MonitorRect {
     y: f64,
     width: f64,
     height: f64,
+}
+
+/// Focused-window rectangle in screen coordinates. Used for the "is the
+/// element actually visible in the captured pixels?" check (issue #2436)
+/// — distinct from `MonitorRect` because we need the *window* clip, not
+/// the monitor's full extent (UIA can report element bounds inside the
+/// monitor but outside the window's visible area for scrolled-off
+/// terminal/editor content).
+struct WindowRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// Get the focused window's screen rectangle via Win32 GetWindowRect.
+/// Returns None if the call fails or the rect is degenerate; callers
+/// fall back to `on_screen = None` (unknown) in that case rather than
+/// guessing.
+fn get_window_rect(hwnd: HWND) -> Option<WindowRect> {
+    unsafe {
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            let w = (r.right - r.left) as f64;
+            let h = (r.bottom - r.top) as f64;
+            if w > 0.0 && h > 0.0 {
+                return Some(WindowRect {
+                    x: r.left as f64,
+                    y: r.top as f64,
+                    width: w,
+                    height: h,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// True iff the element's screen-absolute frame intersects the focused
+/// window's rect — the on-screen visibility test for issue #2436.
+/// Delegates to the shared pure-geometry helper.
+fn is_on_screen(bounds: &crate::events::ElementBounds, window: &WindowRect) -> bool {
+    super::rects_intersect(
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        window.x,
+        window.y,
+        window.width,
+        window.height,
+    )
 }
 
 /// Get the monitor rectangle containing the given window.
@@ -358,8 +457,41 @@ fn normalize_bounds(
     })
 }
 
+/// Build an AccessibilityTreeNode from a UIA AccessibilityNode, propagating automation properties.
+fn make_tree_node(
+    uia_node: &AccessibilityNode,
+    role: &str,
+    text: &str,
+    depth: usize,
+    bounds: Option<NodeBounds>,
+    on_screen: Option<bool>,
+) -> AccessibilityTreeNode {
+    let mut n = AccessibilityTreeNode::new(
+        role.to_string(),
+        text.to_string(),
+        depth.min(255) as u8,
+        bounds,
+    );
+    n.on_screen = on_screen;
+    n.automation_id = uia_node.automation_id.clone();
+    n.class_name = uia_node.class_name.clone();
+    n.value = uia_node.value.clone();
+    n.is_enabled = Some(uia_node.is_enabled);
+    n.is_focused = uia_node.is_focused;
+    n.is_keyboard_focusable = uia_node.is_keyboard_focusable;
+    n.help_text = uia_node.help_text.clone();
+    n.is_password = uia_node.is_password;
+    n.is_selected = uia_node.is_selected;
+    n.is_expanded = uia_node.is_expanded;
+    n.accelerator_key = uia_node.accelerator_key.clone();
+    n.access_key = uia_node.access_key.clone();
+    n.role_description = uia_node.localized_control_type.clone();
+    n
+}
+
 /// Recursively extract text from the accessibility tree.
 /// Mirrors the macOS walker's text extraction strategy.
+#[allow(clippy::too_many_arguments)]
 fn extract_text_from_tree(
     node: &AccessibilityNode,
     depth: usize,
@@ -368,6 +500,9 @@ fn extract_text_from_tree(
     nodes: &mut Vec<AccessibilityTreeNode>,
     browser_url: &mut Option<String>,
     monitor_rect: &Option<MonitorRect>,
+    window_rect: &Option<WindowRect>,
+    ignored_windows_lower: &[String],
+    hit_ignored_extension: &mut bool,
 ) {
     if depth > max_depth {
         return;
@@ -384,6 +519,13 @@ fn extract_text_from_tree(
     let norm_bounds = monitor_rect
         .as_ref()
         .and_then(|mr| node.bounds.as_ref().and_then(|b| normalize_bounds(b, mr)));
+    // On-screen check (issue #2436): does the element's screen-absolute
+    // bounds intersect the focused window's rect? `None` when window
+    // bounds aren't available — caller's filter logic must treat that
+    // as "unknown" rather than implicitly true/false.
+    let on_screen = window_rect
+        .as_ref()
+        .and_then(|wr| node.bounds.as_ref().map(|b| is_on_screen(b, wr)));
 
     // Extract text from text-bearing elements
     if TEXT_TYPES.iter().any(|&t| ct.eq_ignore_ascii_case(t)) {
@@ -391,15 +533,21 @@ fn extract_text_from_tree(
         // Note: Document is handled separately below — its children are the
         // actual web content tree in Electron/browser apps, so we must recurse.
         if matches!(ct, "Edit" | "ComboBox") {
+            // Never extract the value of password fields
+            if node.is_password == Some(true) {
+                return;
+            }
             if let Some(ref val) = node.value {
                 if !val.trim().is_empty() {
                     append_text(buffer, val);
-                    nodes.push(AccessibilityTreeNode {
-                        role: ct.to_string(),
-                        text: val.trim().to_string(),
-                        depth: depth.min(255) as u8,
-                        bounds: norm_bounds.clone(),
-                    });
+                    nodes.push(make_tree_node(
+                        node,
+                        ct,
+                        val.trim(),
+                        depth,
+                        norm_bounds.clone(),
+                        on_screen,
+                    ));
                     // Don't recurse into text controls — their children are sub-elements of the same text
                     return;
                 }
@@ -411,6 +559,40 @@ fn extract_text_from_tree(
         // node is the root of the entire web content tree — its children are the
         // actual UI elements (buttons, text, links, etc.).
         if ct.eq_ignore_ascii_case("Document") {
+            // Browser extension popup detection: Document nodes for Chrome extensions
+            // carry the extension name in `name` and a chrome-extension:// URL in `value`.
+            // If either matches an ignored-window pattern, skip the entire subtree.
+            if !ignored_windows_lower.is_empty() {
+                let matches = |val: &str| {
+                    let lower = val.to_lowercase();
+                    ignored_windows_lower
+                        .iter()
+                        .any(|ig| lower.contains(ig.as_str()))
+                };
+                if node.name.as_deref().is_some_and(|n| matches(n))
+                    || node.value.as_deref().is_some_and(|v| matches(v))
+                {
+                    *hit_ignored_extension = true;
+                    return;
+                }
+
+                // Fallback for sub-views where the page title doesn't include the
+                // extension brand name (e.g. Bitwarden shows "New Login" for the
+                // add-login route).  Scan 2 levels of children for any text that
+                // matches an ignored pattern — extension UIs always render their
+                // brand name visibly somewhere near the top of the tree.
+                let is_extension_popup = node.value.as_deref().map_or(false, |v| {
+                    v.starts_with("chrome-extension://")
+                        || v.starts_with("moz-extension://")
+                        || v.starts_with("ms-browser-extension://")
+                });
+                if is_extension_popup
+                    && extension_subtree_matches_ignored(node, ignored_windows_lower)
+                {
+                    *hit_ignored_extension = true;
+                    return;
+                }
+            }
             if let Some(ref val) = node.value {
                 let trimmed = val.trim();
                 if !trimmed.is_empty() {
@@ -422,12 +604,14 @@ fn extract_text_from_tree(
                     } else {
                         // Non-URL value — treat as text content
                         append_text(buffer, trimmed);
-                        nodes.push(AccessibilityTreeNode {
-                            role: ct.to_string(),
-                            text: trimmed.to_string(),
-                            depth: depth.min(255) as u8,
-                            bounds: norm_bounds.clone(),
-                        });
+                        nodes.push(make_tree_node(
+                            node,
+                            ct,
+                            trimmed,
+                            depth,
+                            norm_bounds.clone(),
+                            on_screen,
+                        ));
                     }
                 }
             }
@@ -437,12 +621,14 @@ fn extract_text_from_tree(
             if let Some(ref name) = node.name {
                 if !name.trim().is_empty() {
                     append_text(buffer, name);
-                    nodes.push(AccessibilityTreeNode {
-                        role: ct.to_string(),
-                        text: name.trim().to_string(),
-                        depth: depth.min(255) as u8,
-                        bounds: norm_bounds.clone(),
-                    });
+                    nodes.push(make_tree_node(
+                        node,
+                        ct,
+                        name.trim(),
+                        depth,
+                        norm_bounds.clone(),
+                        on_screen,
+                    ));
                 }
             }
         }
@@ -455,24 +641,28 @@ fn extract_text_from_tree(
         if let Some(ref val) = node.value {
             if !val.trim().is_empty() {
                 append_text(buffer, val);
-                nodes.push(AccessibilityTreeNode {
-                    role: ct.to_string(),
-                    text: val.trim().to_string(),
-                    depth: depth.min(255) as u8,
-                    bounds: norm_bounds.clone(),
-                });
+                nodes.push(make_tree_node(
+                    node,
+                    ct,
+                    val.trim(),
+                    depth,
+                    norm_bounds.clone(),
+                    on_screen,
+                ));
             }
         } else if ct.eq_ignore_ascii_case("Custom") {
             // Custom elements in Electron apps often have names
             if let Some(ref name) = node.name {
                 if !name.trim().is_empty() {
                     append_text(buffer, name);
-                    nodes.push(AccessibilityTreeNode {
-                        role: ct.to_string(),
-                        text: name.trim().to_string(),
-                        depth: depth.min(255) as u8,
-                        bounds: norm_bounds,
-                    });
+                    nodes.push(make_tree_node(
+                        node,
+                        ct,
+                        name.trim(),
+                        depth,
+                        norm_bounds,
+                        on_screen,
+                    ));
                 }
             }
         }
@@ -488,8 +678,43 @@ fn extract_text_from_tree(
             nodes,
             browser_url,
             monitor_rect,
+            window_rect,
+            ignored_windows_lower,
+            hit_ignored_extension,
         );
     }
+}
+
+/// Scan a chrome-extension:// Document node's subtree (up to 2 levels deep) for
+/// any text matching an ignored pattern.
+///
+/// Chrome extension popups sometimes have page titles that don't include the
+/// extension brand name (e.g. Bitwarden shows "New Login" for the add-login
+/// route).  In that case the top-level Document name check misses it, but the
+/// extension's own UI text always contains the brand name ("Bitwarden",
+/// "1Password", etc.) a few levels in.
+fn extension_subtree_matches_ignored(node: &AccessibilityNode, ignored_lower: &[String]) -> bool {
+    let matches = |val: &str| {
+        let lower = val.to_lowercase();
+        ignored_lower.iter().any(|ig| lower.contains(ig.as_str()))
+    };
+
+    for child in &node.children {
+        if child.name.as_deref().is_some_and(|n| matches(n))
+            || child.value.as_deref().is_some_and(|v| matches(v))
+        {
+            return true;
+        }
+        // One level deeper
+        for grandchild in &child.children {
+            if grandchild.name.as_deref().is_some_and(|n| matches(n))
+                || grandchild.value.as_deref().is_some_and(|v| matches(v))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Append trimmed text to buffer with newline separator.
@@ -545,57 +770,42 @@ mod tests {
         let tree = AccessibilityNode {
             control_type: "Window".to_string(),
             name: Some("Test App".to_string()),
-            automation_id: None,
-            class_name: None,
-            value: None,
-            bounds: None,
-            is_enabled: true,
-            is_focused: None,
-            is_keyboard_focusable: None,
             children: vec![
                 AccessibilityNode {
                     control_type: "Text".to_string(),
                     name: Some("Hello World".to_string()),
-                    automation_id: None,
-                    class_name: None,
-                    value: None,
-                    bounds: None,
-                    is_enabled: true,
-                    is_focused: None,
-                    is_keyboard_focusable: None,
-                    children: vec![],
+                    ..Default::default()
                 },
                 AccessibilityNode {
                     control_type: "Edit".to_string(),
                     name: Some("Search".to_string()),
-                    automation_id: None,
-                    class_name: None,
                     value: Some("typed text".to_string()),
-                    bounds: None,
-                    is_enabled: true,
-                    is_focused: None,
-                    is_keyboard_focusable: None,
-                    children: vec![],
+                    ..Default::default()
                 },
                 AccessibilityNode {
                     control_type: "Image".to_string(),
                     name: Some("icon.png".to_string()),
-                    automation_id: None,
-                    class_name: None,
-                    value: None,
-                    bounds: None,
-                    is_enabled: true,
-                    is_focused: None,
-                    is_keyboard_focusable: None,
-                    children: vec![],
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
 
         let mut buf = String::new();
         let mut nodes = Vec::new();
         let mut url = None;
-        extract_text_from_tree(&tree, 0, 10, &mut buf, &mut nodes, &mut url, &None);
+        extract_text_from_tree(
+            &tree,
+            0,
+            10,
+            &mut buf,
+            &mut nodes,
+            &mut url,
+            &None, // monitor_rect
+            &None, // window_rect
+            &[],
+            &mut false,
+        );
 
         // Text node's name should be captured
         assert!(
@@ -626,68 +836,46 @@ mod tests {
         let tree = AccessibilityNode {
             control_type: "Pane".to_string(),
             name: Some("Discord".to_string()),
-            automation_id: None,
-            class_name: None,
-            value: None,
-            bounds: None,
-            is_enabled: true,
-            is_focused: None,
-            is_keyboard_focusable: None,
             children: vec![AccessibilityNode {
                 control_type: "Document".to_string(),
-                name: None,
-                automation_id: None,
-                class_name: None,
                 value: Some("https://discordapp.com/channels/123/456".to_string()),
-                bounds: None,
-                is_enabled: true,
-                is_focused: None,
-                is_keyboard_focusable: None,
                 children: vec![
                     AccessibilityNode {
                         control_type: "Text".to_string(),
                         name: Some("Welcome to the server".to_string()),
-                        automation_id: None,
-                        class_name: None,
-                        value: None,
-                        bounds: None,
-                        is_enabled: true,
-                        is_focused: None,
-                        is_keyboard_focusable: None,
-                        children: vec![],
+                        ..Default::default()
                     },
                     AccessibilityNode {
                         control_type: "Button".to_string(),
                         name: Some("Send Message".to_string()),
-                        automation_id: None,
-                        class_name: None,
-                        value: None,
-                        bounds: None,
-                        is_enabled: true,
-                        is_focused: None,
-                        is_keyboard_focusable: None,
-                        children: vec![],
+                        ..Default::default()
                     },
                     AccessibilityNode {
                         control_type: "Custom".to_string(),
                         name: Some("User: john_doe".to_string()),
-                        automation_id: None,
-                        class_name: None,
-                        value: None,
-                        bounds: None,
-                        is_enabled: true,
-                        is_focused: None,
-                        is_keyboard_focusable: None,
-                        children: vec![],
+                        ..Default::default()
                     },
                 ],
+                ..Default::default()
             }],
+            ..Default::default()
         };
 
         let mut buf = String::new();
         let mut nodes = Vec::new();
         let mut url = None;
-        extract_text_from_tree(&tree, 0, 30, &mut buf, &mut nodes, &mut url, &None);
+        extract_text_from_tree(
+            &tree,
+            0,
+            30,
+            &mut buf,
+            &mut nodes,
+            &mut url,
+            &None, // monitor_rect
+            &None, // window_rect
+            &[],
+            &mut false,
+        );
 
         // URL should be captured as browser_url, NOT as text
         assert_eq!(
@@ -727,19 +915,82 @@ mod tests {
     }
 
     #[test]
+    fn test_extension_popup_ignored_via_child_text() {
+        use crate::events::AccessibilityNode;
+
+        // Simulates Bitwarden's "New Login" sub-view where the Document node's
+        // name is the route title "New Login" (no brand name), but the brand
+        // "Bitwarden" appears in a child text element.
+        let bitwarden_popup = AccessibilityNode {
+            control_type: "Window".to_string(),
+            name: Some("".to_string()), // Chrome extension popups have empty window title
+            children: vec![AccessibilityNode {
+                control_type: "Document".to_string(),
+                name: Some("New Login".to_string()), // page title without brand name
+                value: Some(
+                    "chrome-extension://nngceckbapebfimnlniiiahkandclblb/popup.html#/add-login"
+                        .to_string(),
+                ),
+                children: vec![
+                    AccessibilityNode {
+                        control_type: "Text".to_string(),
+                        name: Some("Bitwarden".to_string()), // brand name in child
+                        ..Default::default()
+                    },
+                    AccessibilityNode {
+                        control_type: "Edit".to_string(),
+                        name: Some("Password".to_string()),
+                        value: Some("hunter2".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let ignored = vec!["bit".to_string()];
+        let mut buf = String::new();
+        let mut nodes = Vec::new();
+        let mut url = None;
+        let mut hit = false;
+
+        extract_text_from_tree(
+            &bitwarden_popup,
+            0,
+            10,
+            &mut buf,
+            &mut nodes,
+            &mut url,
+            &None, // monitor_rect
+            &None, // window_rect
+            &ignored,
+            &mut hit,
+        );
+
+        assert!(
+            hit,
+            "should detect Bitwarden extension popup via child text even when page title is 'New Login'"
+        );
+        // Password value must not be in the buffer
+        assert!(
+            !buf.contains("hunter2"),
+            "password content must not be extracted, got: {buf}"
+        );
+    }
+
+    #[test]
     fn test_excluded_apps() {
         assert!(EXCLUDED_APPS.iter().any(|ex| "1password".contains(ex)));
         assert!(!EXCLUDED_APPS.iter().any(|ex| "notepad".contains(ex)));
     }
 
     #[test]
-    fn test_sensitive_titles() {
-        assert!(SENSITIVE_TITLES
-            .iter()
-            .any(|s| "enter password".contains(s)));
-        assert!(SENSITIVE_TITLES
-            .iter()
-            .any(|s| "private browsing".contains(s)));
-        assert!(!SENSITIVE_TITLES.iter().any(|s| "calculator".contains(s)));
+    fn test_incognito_detection() {
+        use crate::incognito::is_title_private;
+        assert!(is_title_private("Enter Password - Chrome"));
+        assert!(is_title_private("Private Browsing - Firefox"));
+        assert!(is_title_private("New Tab - Google Chrome (Incognito)"));
+        assert!(!is_title_private("Calculator"));
     }
 }

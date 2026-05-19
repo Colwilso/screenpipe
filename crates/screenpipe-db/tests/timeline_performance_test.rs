@@ -14,7 +14,9 @@ mod timeline_performance_tests {
             .with_max_level(tracing::Level::INFO)
             .try_init();
 
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         sqlx::migrate!("./src/migrations")
             .run(&db.pool)
@@ -403,7 +405,9 @@ mod timeline_performance_tests {
 
         let db_url = format!("sqlite:{}", path);
 
-        let db = DatabaseManager::new(&db_url).await.unwrap();
+        let db = DatabaseManager::new(&db_url, Default::default())
+            .await
+            .unwrap();
 
         sqlx::migrate!("./src/migrations")
             .run(&db.pool)
@@ -643,7 +647,7 @@ mod timeline_performance_tests {
         println!("Frames with audio: {}", frames_with_audio.len());
 
         for frame in &result.frames {
-            let has_audio = !frame.audio_entries.is_empty();
+            let _has_audio = !frame.audio_entries.is_empty();
             println!(
                 "Frame at {:?}: {} audio entries",
                 frame.timestamp,
@@ -659,12 +663,15 @@ mod timeline_performance_tests {
             frames_with_audio.len()
         );
 
-        // Verify the audio is on the correct frames (frames 2, 3, 4 based on timestamps)
-        let frame_timestamps_with_audio: Vec<_> =
+        // Verify the audio is on the correct frames.
+        // The query uses a 15-second padding on each side of the audio range
+        // to ensure nearby frames also get the audio indicator. So the effective
+        // range is [audio_start - 15s, audio_end + 15s].
+        let _frame_timestamps_with_audio: Vec<_> =
             frames_with_audio.iter().map(|f| f.timestamp).collect();
 
-        let expected_start = audio_start_time;
-        let expected_end = audio_start_time + Duration::seconds(6);
+        let expected_start = audio_start_time - Duration::seconds(15);
+        let expected_end = audio_start_time + Duration::seconds(6) + Duration::seconds(15);
 
         for frame in &frames_with_audio {
             assert!(

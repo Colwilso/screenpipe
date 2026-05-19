@@ -10,7 +10,11 @@ import { useKeywordSearchStore } from "@/lib/hooks/use-keyword-search-store";
 import posthog from "posthog-js";
 import type { StreamTimeSeriesResponse } from "@/components/rewind/timeline";
 
-const MAX_DATE_RETRIES = 7; // Don't walk back more than 7 days
+// How far the arrow keys walk past empty days. The underlying SQL uses
+// the timestamp index (O(log n)) so a wider window costs nothing. 7 was
+// too tight — users with >7 day recording gaps would dead-end on the
+// arrow and have to use the calendar instead.
+const MAX_DATE_RETRIES = 365;
 
 export function useDateNavigation(opts: {
 	frames: StreamTimeSeriesResponse[];
@@ -66,6 +70,9 @@ export function useDateNavigation(opts: {
 	// Seeking state for UX feedback when navigating from search
 	const [seekingTimestamp, setSeekingTimestamp] = useState<string | null>(null);
 
+	// Frame ID to match when pending navigation resolves (exact match > timestamp)
+	const pendingFrameIdRef = useRef<number | undefined>(undefined);
+
 	// Navigation in progress — disables day arrows to prevent double-clicks
 	const [isNavigating, setIsNavigating] = useState(false);
 
@@ -75,13 +82,31 @@ export function useDateNavigation(opts: {
 	// Ref to hold navigateToSearchResult so arrow-key effect doesn't depend on it directly
 	const navigateToSearchResultRef = useRef<(index: number) => void>(() => {});
 
-	const jumpToTime = useCallback((targetDate: Date) => {
+	const jumpToTime = useCallback((targetDate: Date, frameId?: number) => {
 		// Find the closest frame to the target date
 		if (frames.length === 0) {
 			console.warn("[jumpToTime] No frames loaded, cannot jump");
 			return;
 		}
 
+		// If we have a frame_id, try exact match first — this avoids
+		// off-by-one errors when multiple frames share similar timestamps
+		if (frameId != null) {
+			const exactIdx = frames.findIndex((f) =>
+				f.devices.some((d) => String(d.frame_id) === String(frameId))
+			);
+			if (exactIdx >= 0) {
+				// Use exact match directly — don't snapToDevice() which would
+				// override with a nearby frame from the filtered device
+				setCurrentIndex(exactIdx);
+				if (frames[exactIdx]) {
+					setCurrentFrame(frames[exactIdx]);
+				}
+				return;
+			}
+		}
+
+		// Fallback: find closest by timestamp
 		const targetTime = targetDate.getTime();
 		let closestIndex = -1;
 		let closestDiff = Infinity;
@@ -110,7 +135,8 @@ export function useDateNavigation(opts: {
 
 	// Fast navigation to a date we already know has frames (e.g. from search results).
 	// Skips the hasFramesForDate() HTTP round-trip and adjacent-date probing.
-	const navigateDirectToDate = useCallback((targetDate: Date) => {
+	const navigateDirectToDate = useCallback((targetDate: Date, frameId?: number) => {
+		pendingFrameIdRef.current = frameId;
 		isNavigatingRef.current = true;
 		setIsNavigating(true);
 
@@ -165,16 +191,18 @@ export function useDateNavigation(opts: {
 		setSeekingTimestamp(result.timestamp);
 
 		if (!isSameDay(targetDate, currentDate)) {
-			navigateDirectToDate(targetDate);
+			navigateDirectToDate(targetDate, result.frame_id);
 		} else {
 			pendingNavigationRef.current = targetDate;
+			pendingFrameIdRef.current = result.frame_id;
 			const hasTargetDayFrames = frames.some((f) =>
 				isSameDay(new Date(f.timestamp), targetDate)
 			);
 			if (hasTargetDayFrames) {
 				setSearchNavFrame(true);
-				jumpToTime(targetDate);
+				jumpToTime(targetDate, result.frame_id);
 				pendingNavigationRef.current = null;
+				pendingFrameIdRef.current = undefined;
 				setSeekingTimestamp(null);
 			}
 		}
@@ -325,33 +353,49 @@ export function useDateNavigation(opts: {
 				isSameDay(new Date(frame.timestamp), targetDate)
 			);
 			if (isSameDay(targetDate, currentDate) && hasFramesForTargetDate) {
+				const pendingFrameId = pendingFrameIdRef.current;
 
-				// Find the closest frame to the target timestamp — only consider
-				// frames from the target date (old-date frames may still be in
-				// the array during pendingDateSwap transitions)
-				const targetTime = targetDate.getTime();
-				let closestIndex = 0;
-				let closestDiff = Infinity;
+				// Try exact frame_id match first (avoids off-by-one from timestamp rounding)
+				let closestIndex = -1;
+				if (pendingFrameId != null) {
+					closestIndex = frames.findIndex((f) =>
+						isSameDay(new Date(f.timestamp), targetDate) &&
+						f.devices.some((d) => String(d.frame_id) === String(pendingFrameId))
+					);
+				}
 
-				frames.forEach((frame, index) => {
-					if (!isSameDay(new Date(frame.timestamp), targetDate)) return;
-					const frameTime = new Date(frame.timestamp).getTime();
-					const diff = Math.abs(frameTime - targetTime);
-					if (diff < closestDiff) {
-						closestDiff = diff;
-						closestIndex = index;
-					}
-				});
+				// Fallback: find the closest frame by timestamp
+				if (closestIndex < 0) {
+					const targetTime = targetDate.getTime();
+					let closestDiff = Infinity;
+					closestIndex = 0;
+
+					frames.forEach((frame, index) => {
+						if (!isSameDay(new Date(frame.timestamp), targetDate)) return;
+						const frameTime = new Date(frame.timestamp).getTime();
+						const diff = Math.abs(frameTime - targetTime);
+						if (diff < closestDiff) {
+							closestDiff = diff;
+							closestIndex = index;
+						}
+					});
+				}
 
 				resetFilters();
-				const snapped = snapToDevice(closestIndex);
-				setCurrentIndex(snapped);
-				setCurrentFrame(frames[snapped]);
+				// If we matched by exact frame_id, use that index directly
+				// (don't snapToDevice which overrides with a nearby frame)
+				const finalIndex = (pendingFrameId != null && closestIndex >= 0 &&
+					frames[closestIndex]?.devices.some((d) => String(d.frame_id) === String(pendingFrameId)))
+					? closestIndex
+					: snapToDevice(closestIndex);
+				setCurrentIndex(finalIndex);
+				setCurrentFrame(frames[finalIndex]);
 				// Use HTTP JPEG fallback for this first frame (skip slow video seek)
 				setSearchNavFrame(true);
 
 				// Clear pending navigation and UI state
 				pendingNavigationRef.current = null;
+				pendingFrameIdRef.current = undefined;
 				setSeekingTimestamp(null);
 				setPendingNavigation(null);
 				setIsNavigating(false);

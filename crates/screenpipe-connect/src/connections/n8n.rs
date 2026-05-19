@@ -5,6 +5,7 @@
 use super::{require_str, Category, FieldDef, Integration, IntegrationDef};
 use anyhow::Result;
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde_json::{json, Map, Value};
 
 static DEF: IntegrationDef = IntegrationDef {
@@ -12,7 +13,8 @@ static DEF: IntegrationDef = IntegrationDef {
     name: "n8n",
     icon: "n8n",
     category: Category::Productivity,
-    description: "Send data to n8n workflows via webhook. POST JSON to the webhook URL with any payload.",
+    description:
+        "Send data to n8n workflows via webhook. POST JSON to the webhook URL with any payload.",
     fields: &[FieldDef {
         key: "webhook_url",
         label: "Webhook URL",
@@ -30,7 +32,12 @@ impl Integration for N8n {
         &DEF
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let url = require_str(creds, "webhook_url")?;
         client
             .post(url)

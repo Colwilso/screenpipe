@@ -39,8 +39,17 @@ pub struct CalendarEventItem {
     pub end_display: String,
     pub attendees: Vec<String>,
     pub location: Option<String>,
+    pub meeting_url: Option<String>,
     pub calendar_name: String,
     pub is_all_day: bool,
+    /// Source identifier: "native" for OS calendar, "ics" for ICS feeds.
+    /// Used by meeting detector to merge events from multiple publishers.
+    #[serde(default = "default_native_source")]
+    pub source: String,
+}
+
+fn default_native_source() -> String {
+    "native".to_string()
 }
 
 // ─── Commands ───────────────────────────────────────────────────────────────
@@ -127,6 +136,54 @@ pub async fn calendar_status() -> Result<CalendarStatus, String> {
             authorization_status: "not_supported".into(),
             calendar_count: 0,
         })
+    }
+}
+
+/// Reset TCC (privacy) permission for Calendars on this app's bundle ID.
+///
+/// Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+/// "Fix Calendar Permission" → macOS opened the Calendars privacy pane
+/// with an EMPTY app list, so they had no way to grant access. Root cause
+/// is a stale TCC record (dev-build → prod-build reinstall, OS update,
+/// user previously revoked etc.) where macOS silently refuses to re-add
+/// the app on subsequent requestFullAccessToEventsWithCompletion calls.
+///
+/// `tccutil reset Calendars <bundle_id>` clears that stale record. Next
+/// call to requestFullAccessToEventsWithCompletion then shows the native
+/// consent popup again and registers the app in Privacy → Calendars.
+///
+/// Bundle ID is read at runtime from the running app (not hard-coded), so
+/// this works for both `screenpi.pe` (prod) and `screenpi.pe.dev` (dev).
+/// No sudo required — tccutil's per-app user scope is user-writable.
+#[tauri::command]
+#[specta::specta]
+pub async fn calendar_reset_permission(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::Manager;
+        let bundle_id = app.config().identifier.clone();
+        if bundle_id.is_empty() {
+            return Err("no bundle identifier in app config".to_string());
+        }
+        info!(
+            "calendar: resetting TCC Calendars permission for bundle {}",
+            bundle_id
+        );
+        let output = tokio::process::Command::new("tccutil")
+            .args(["reset", "Calendars", &bundle_id])
+            .output()
+            .await
+            .map_err(|e| format!("failed to run tccutil: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("tccutil failed: {}", stderr.trim()));
+        }
+        Ok(format!("reset ok for {}", bundle_id))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("only available on macOS".into())
     }
 }
 
@@ -328,9 +385,7 @@ pub async fn start_calendar_events_publisher() {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-fn calendar_event_to_item(
-    event: screenpipe_connect::calendar::CalendarEvent,
-) -> CalendarEventItem {
+fn calendar_event_to_item(event: screenpipe_connect::calendar::CalendarEvent) -> CalendarEventItem {
     let start_display = event.start_local.format("%-I:%M %p").to_string();
     let end_display = event.end_local.format("%-I:%M %p").to_string();
 
@@ -343,8 +398,10 @@ fn calendar_event_to_item(
         end_display,
         attendees: event.attendees,
         location: event.location,
+        meeting_url: event.meeting_url,
         calendar_name: event.calendar_name,
         is_all_day: event.is_all_day,
+        source: "native".to_string(),
     }
 }
 
@@ -364,7 +421,9 @@ fn calendar_event_to_item_win(
         end_display,
         attendees: event.attendees,
         location: event.location,
+        meeting_url: event.meeting_url,
         calendar_name: event.calendar_name,
         is_all_day: event.is_all_day,
+        source: "native".to_string(),
     }
 }

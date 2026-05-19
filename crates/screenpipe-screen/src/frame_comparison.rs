@@ -78,7 +78,7 @@ impl Default for FrameComparisonConfig {
         Self {
             hash_early_exit: true,
             downscale_comparison: true,
-            downscale_factor: 6,
+            downscale_factor: 4,
             single_metric: true,
             comparison_width: 640,
             comparison_height: 360,
@@ -101,11 +101,14 @@ impl FrameComparisonConfig {
     }
 
     /// Create a config optimized for maximum CPU savings.
+    /// Uses factor=4 (1920→480px) to balance performance with text-change
+    /// sensitivity. Factor 6 (320px) caused hash collisions on dense text
+    /// pages, making scrolling through log files invisible to the comparer.
     pub fn max_performance() -> Self {
         Self {
             hash_early_exit: true,
             downscale_comparison: true,
-            downscale_factor: 6,
+            downscale_factor: 4,
             single_metric: true,
             comparison_width: 480,
             comparison_height: 270,
@@ -378,7 +381,7 @@ mod tests {
             let is_text_line = (y / line_height) % 2 == 0;
             if is_text_line {
                 let char_width = 10;
-                let is_char = ((x + seed as u32) / char_width) % 3 != 0;
+                let is_char = !((x + seed as u32) / char_width).is_multiple_of(3);
                 if is_char {
                     Rgb([30, 30, 30])
                 } else {
@@ -411,8 +414,10 @@ mod tests {
 
     #[test]
     fn test_hash_early_exit_disabled() {
-        let mut config = FrameComparisonConfig::default();
-        config.hash_early_exit = false;
+        let config = FrameComparisonConfig {
+            hash_early_exit: false,
+            ..Default::default()
+        };
 
         let mut comparer = FrameComparer::new(config);
         let image = create_solid_image(1920, 1080, 100, 100, 100);
@@ -442,13 +447,13 @@ mod tests {
     }
 
     #[test]
-    fn test_proportional_downscale_factor6() {
-        let config = FrameComparisonConfig::default(); // factor=6
+    fn test_proportional_downscale_default_factor4() {
+        let config = FrameComparisonConfig::default(); // factor=4
         let comparer = FrameComparer::new(config);
 
-        assert_eq!(comparer.downscale_dims(1920, 1080), (320, 180));
-        assert_eq!(comparer.downscale_dims(5120, 1440), (853, 240));
-        assert_eq!(comparer.downscale_dims(3840, 2160), (640, 360));
+        assert_eq!(comparer.downscale_dims(1920, 1080), (480, 270));
+        assert_eq!(comparer.downscale_dims(5120, 1440), (1280, 360));
+        assert_eq!(comparer.downscale_dims(3840, 2160), (960, 540));
     }
 
     #[test]
@@ -515,8 +520,10 @@ mod tests {
     fn test_subtle_changes_detected_without_hash() {
         // Subtle changes that may hash-collide at downscaled resolution
         // should still be detected when hash early exit is disabled
-        let mut config = FrameComparisonConfig::default();
-        config.hash_early_exit = false;
+        let config = FrameComparisonConfig {
+            hash_early_exit: false,
+            ..Default::default()
+        };
 
         let mut comparer = FrameComparer::new(config);
 
@@ -591,13 +598,13 @@ mod tests {
         let default = FrameComparisonConfig::default();
         assert!(default.hash_early_exit);
         assert!(default.downscale_comparison);
-        assert_eq!(default.downscale_factor, 6);
+        assert_eq!(default.downscale_factor, 4);
 
         let no_opt = FrameComparisonConfig::no_optimizations();
         assert!(!no_opt.hash_early_exit);
         assert!(!no_opt.downscale_comparison);
 
         let max_perf = FrameComparisonConfig::max_performance();
-        assert_eq!(max_perf.downscale_factor, 6);
+        assert_eq!(max_perf.downscale_factor, 4);
     }
 }

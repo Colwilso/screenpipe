@@ -4,7 +4,7 @@
 import { StreamTimeSeriesResponse } from "@/components/rewind/timeline";
 import React, { FC, useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useFrameContext } from "@/lib/hooks/use-frame-context";
-import { useFrameOcrData } from "@/lib/hooks/use-frame-ocr-data";
+import { useFrameTextData } from "@/lib/hooks/use-frame-text-data";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { formatShortcutDisplay } from "@/lib/chat-utils";
 import { TextOverlay, extractUrlsFromText, isUrl, normalizeUrl } from "@/components/text-overlay";
@@ -46,6 +46,10 @@ interface CurrentFrameTimelineProps {
 	isSearchModalOpen?: boolean;
 	/** Whether the timeline is embedded in the settings window */
 	embedded?: boolean;
+	/** Ref to the nav bar element — used by Live Text to place a click guard */
+	navBarRef?: React.RefObject<HTMLDivElement | null>;
+	/** Named guard refs for Live Text click guards (e.g. filters, scrubber) */
+	guardRefs?: Record<string, React.RefObject<HTMLDivElement | null>>;
 }
 
 
@@ -80,6 +84,8 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 	adjacentFrames,
 	isSearchModalOpen,
 	embedded,
+	navBarRef,
+	guardRefs,
 }) => {
 	const { isMac } = usePlatform();
 	const { settings } = useSettings();
@@ -136,7 +142,7 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 	);
 
 	// OCR data for TextOverlay — always fetch so clickable text works on all frames
-	const { textPositions: ocrTextPositions, isLoading: ocrLoading } = useFrameOcrData(
+	const { textPositions: ocrTextPositions, isLoading: ocrLoading } = useFrameTextData(
 		debouncedFrame ? parseInt(debouncedFrame.frameId, 10) : null
 	);
 
@@ -250,11 +256,11 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 
 	// --- Live Text hook (native macOS VisionKit overlay) ---
 	// Determine which window/panel to attach VisionKit overlay to.
-	// In embedded mode, use the "settings" window (regular WebviewWindow).
+	// In embedded mode, use the "home" window (regular WebviewWindow).
 	// The overlay is positioned precisely over the frame using absolute
 	// coordinates from containerRef + renderedImageInfo.
 	const liveTextWindowLabel = embedded
-		? "settings"
+		? "home"
 		: settings?.overlayMode === "window" ? "main-window" : "main";
 
 	const { nativeLiveTextActive } = useLiveText({
@@ -269,6 +275,9 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 		useVideoMode,
 		videoRef,
 		windowLabel: liveTextWindowLabel,
+		navBarRef,
+		guardRefs,
+		adjacentFrames,
 	});
 
 	if (!frameId) {
@@ -310,6 +319,7 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 	}
 
 	// eslint-disable-next-line react-hooks/rules-of-hooks
+	// biome-ignore lint/correctness/useHookAtTopLevel: hook called after a stable conditional return guarded by render-stable refs; matches the eslint suppression above
 	const handleContextMenu = useCallback(
 		(e: React.MouseEvent) => {
 			e.preventDefault();

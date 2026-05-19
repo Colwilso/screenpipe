@@ -5,26 +5,11 @@
    </a>
 </p>
 
-<h1 align="center">[ screenpipe ]</h1>
+<h1 align="center">[ screenpipe | YC S26 ]</h1>
 
 
-<p align="center">AI memory for your screen</p>
-<p align="center">AI finally knows what you're doing</p>
-
-
-
-<p align="center">
-   <a href ="https://screenpi.pe">
-      <img src="https://github.com/user-attachments/assets/c88d218e-40a7-405d-b419-eec1553ea287">
-   </a>
-</p>
-
-
-<p align="center">
-   <a href ="https://screenpi.pe">
-      <img src="https://github.com/user-attachments/assets/b482f71d-cccc-4b42-a9b9-bf06a67d401b" alt="logo" width="800">
-   </a>
-</p>
+<p align="center">Give AI the ability to live your experience.</p>
+<p align="center">Records everything you do, say, hear 24/7, local, private, secure</p>
 
 
 <p align="center">
@@ -37,14 +22,15 @@
   <a href="https://discord.gg/screenpipe">
     <img src="https://img.shields.io/discord/823813159592001537?style=for-the-badge&logo=discord&logoColor=white" alt="discord">
   </a>
-  <a href="https://twitter.com/screen_pipe">
-    <img src="https://img.shields.io/twitter/follow/screen_pipe?style=for-the-badge&logo=x&logoColor=white&label=follow" alt="twitter">
+  <a href="https://twitter.com/screenpipe">
+    <img src="https://img.shields.io/twitter/follow/screenpipe?style=for-the-badge&logo=x&logoColor=white&label=follow" alt="twitter">
   </a>
   <a href="https://www.youtube.com/@screen_pipe">
     <img src="https://img.shields.io/youtube/channel/subscribers/UCwjkpAsb70_mENKvy7hT5bw?style=for-the-badge&logo=youtube&logoColor=white&label=subscribers" alt="youtube">
   </a>
 </p>
 
+![image](https://github.com/user-attachments/assets/5b977f48-0355-498f-a3ba-37e5de3b6c62)
 ![image](https://github.com/user-attachments/assets/dec2e07c-b3d5-46dd-9f36-c0c26a82c9fb)
 
 
@@ -61,6 +47,10 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 ```
 
 - **remember everything** - never forget what you saw, heard, or did
+- **run agents that work based on what you do** - pipes are agents triggered by your work activity
+
+<img width="360" height="311" alt="image" src="https://github.com/user-attachments/assets/cfbf0fd3-84ef-4feb-8c6d-2779d67058a7" />
+
 - **search with ai** - find anything using natural language
 - **100% local** - your data never leaves your machine
 - **open source** - inspect, modify, own
@@ -82,11 +72,23 @@ or run the CLI:
 npx screenpipe@latest record
 ```
 
+then 
+
+```bash
+claude mcp add screenpipe -- npx -y screenpipe-mcp
+```
+
+then ask claude `what did i see in the last 5 mins?` or `summarize today conversations` or `create a pipe that updates linear every time i work on task X`
+
+
 ## specs
 
+- captures full accessibility tree, OCR as fallback, transcription, speakers, keyboard inputs, app switches
 - 5-10% cpu usage
 - 0.5-3gb ram
 - ~20gb storage/month
+- filters (window, app, chrome extensions, passwords, PII)
+- optional encryption at rest
 - works offline
 
 ---
@@ -94,7 +96,7 @@ npx screenpipe@latest record
 <p align="center">
     <a href="https://docs.screenpi.pe">docs</a> ·
     <a href="https://discord.gg/screenpipe">discord</a> ·
-    <a href="https://twitter.com/screen_pipe">x</a> ·
+    <a href="https://twitter.com/screenpipe">x</a> ·
     <a href="https://www.youtube.com/@screen_pipe">youtube</a> ·
     <a href="https://www.reddit.com/r/screen_pipe">reddit</a>
 </p>
@@ -151,7 +153,7 @@ Instead of recording every second, screenpipe listens for meaningful events — 
 Captures system audio (what you hear) and microphone input (what you say). Real-time speech-to-text using OpenAI Whisper running locally on your device. Speaker identification and diarization. Works with any audio source — Zoom, Google Meet, Teams, or any other application.
 
 ### AI-powered search
-Natural language search across all OCR text and audio transcriptions. Filter by application name, window title, browser URL, date range. Semantic search using embeddings. Returns screenshots and audio clips alongside text results.
+Natural language search across accessibility-first screen text, OCR fallback text, and audio transcriptions. Filter by application name, window title, browser URL, date range. Semantic search using embeddings. Returns screenshots and audio clips alongside text results.
 
 ### Timeline view
 Visual timeline of your entire screen history. Scroll through your day like a DVR. Click any moment to see the full screenshot and extracted text. Play back audio from any time period.
@@ -250,7 +252,7 @@ screenpipe Teams lets organizations deploy AI agents across their team with full
 
 Search screen content:
 ```
-GET http://localhost:3030/search?q=meeting+notes&content_type=ocr&limit=10
+GET http://localhost:3030/search?q=meeting+notes&content_type=all&limit=10
 ```
 
 Search audio transcriptions:
@@ -269,6 +271,12 @@ const results = await pipe.queryScreenpipe({
   startTime: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
 });
 ```
+
+## Building from source 
+
+Check CONTRIBUTING.
+
+Make sure to understand the main branch is moving fast and breaking things, if you're looking for a stable version check app releases https://github.com/screenpipe/screenpipe/releases and use the git commit accordingly (production app is behind paywall).
 
 ## Frequently asked questions
 
@@ -301,10 +309,10 @@ Each pipe supports YAML frontmatter fields (allow-apps, deny-apps, deny-windows,
 
 ## Company
 
-Built by screenpipe (formerly Mediar). Founded 2024. Based in San Francisco, CA.
+Built by screenpipe (Mediar, Inc.). Founded 2024. Based in San Francisco, CA.
 
 - Founder: Louis Beaumont (@louis030195)
-- Twitter: @screen_pipe
+- Twitter: @screenpipe
 - Email: louis@screenpi.pe
 
 </details>

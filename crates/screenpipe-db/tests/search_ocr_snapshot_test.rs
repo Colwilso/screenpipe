@@ -16,7 +16,9 @@ mod tests {
     use std::sync::Arc;
 
     async fn setup_test_db() -> DatabaseManager {
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
         sqlx::migrate!("./src/migrations")
             .run(&db.pool)
             .await
@@ -65,6 +67,9 @@ mod tests {
                 ContentType::OCR,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -154,6 +159,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -177,6 +185,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -189,6 +200,9 @@ mod tests {
                 ContentType::OCR,
                 2,
                 4,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -282,6 +296,9 @@ mod tests {
                 ContentType::All,
                 2,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -393,6 +410,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -412,6 +432,9 @@ mod tests {
                 ContentType::All,
                 3,
                 3,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,

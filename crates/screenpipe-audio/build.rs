@@ -81,30 +81,54 @@ fn find_unzip() -> Option<std::path::PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn install_onnxruntime() {
-    use reqwest::blocking::Client;
-    use std::time::Duration;
     use std::{path::Path, process::Command};
 
-    // Use CPU-only onnxruntime — GPU (DirectML) causes issues on Intel integrated GPUs
-    let target_dir =
-        Path::new("../../apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2");
+    // Use CPU-only onnxruntime — GPU (DirectML) causes issues on Intel integrated GPUs.
+    // Windows ARM64 (aarch64-pc-windows-msvc) uses onnxruntime-win-arm64-*.
+    let arch_var = env::var("CARGO_CFG_TARGET_ARCH");
+    let arch = arch_var.as_deref().unwrap_or("x86_64");
+    let (pkg_name, zip_name) = if arch == "aarch64" {
+        (
+            "onnxruntime-win-arm64-1.22.0",
+            "onnxruntime-win-arm64-1.22.0.zip",
+        )
+    } else {
+        (
+            "onnxruntime-win-x64-1.22.0",
+            "onnxruntime-win-x64-1.22.0.zip",
+        )
+    };
+    let target_dir = Path::new("../../apps/screenpipe-app-tauri/src-tauri").join(pkg_name);
 
-    // Skip download if already present (CI pre-downloads via workflow step)
+    // Skip download if already present (CI pre-downloads via release-app.yml /
+    // release-cli.yml workflow steps; local Windows devs hit the curl path).
+    //
+    // Why not reqwest: reqwest 0.13's `rustls` feature pulls aws-lc-sys, whose
+    // C objects reference `__builtin_bswap{16,32,64}` — GCC intrinsics MSVC
+    // doesn't understand. Linking *this* build script binary therefore fails
+    // with LNK2001 unresolved external. The screenpipe-app crate works around
+    // it with a bswap_shim.c, but that shim is only linked into the final
+    // binary, not into per-crate build scripts. Curl is universally present
+    // on every CI runner image and on Win10+ by default, so calling it from
+    // Command keeps the build script free of any TLS dep.
     if !target_dir.join("lib").join("onnxruntime.lib").exists() {
-        let url = "https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-win-x64-1.19.2.zip";
-        let client = Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("failed to build client");
-        let resp = client.get(url).send().expect("request failed");
-        let body = resp.bytes().expect("body invalid");
-        fs::write("./onnxruntime-win-x64-1.19.2.zip", &body).expect("failed to write");
+        let url = format!(
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/{}",
+            zip_name
+        );
+        let status = Command::new("curl")
+            .args(["-fsSL", "--retry", "3", "-o", zip_name, &url])
+            .status()
+            .expect("failed to execute curl");
+        if !status.success() {
+            panic!("failed to download onnx binary via curl");
+        }
         let unzip_path = find_unzip().expect(
             "could not find unzip executable - please install it via GnuWin32 or add it to PATH",
         );
 
         let status = Command::new(unzip_path)
-            .args(["-o", "onnxruntime-win-x64-1.19.2.zip"])
+            .args(["-o", zip_name])
             .status()
             .expect("failed to execute unzip");
 
@@ -112,9 +136,17 @@ fn install_onnxruntime() {
             panic!("failed to install onnx binary");
         }
         if target_dir.exists() {
-            fs::remove_dir_all(target_dir).expect("failed to remove existing directory");
+            fs::remove_dir_all(&target_dir).expect("failed to remove existing directory");
         }
-        fs::rename("onnxruntime-win-x64-1.19.2", target_dir).expect("failed to rename");
+        fs::rename(pkg_name, &target_dir).expect("failed to rename");
     }
-    println!("cargo:rustc-link-search=native=../../apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2/lib");
+    // Windows x86_64: emit link so we link against our extracted ONNX Runtime.
+    // Windows aarch64: we use load-dynamic; ort loads our DLL at runtime via init_ort_from_dll(), no link here.
+    if arch != "aarch64" {
+        println!(
+            "cargo:rustc-link-search=native=../../apps/screenpipe-app-tauri/src-tauri/{}/lib",
+            pkg_name
+        );
+        println!("cargo:rustc-link-lib=dylib=onnxruntime");
+    }
 }

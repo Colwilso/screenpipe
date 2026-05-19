@@ -59,24 +59,15 @@ export function CliCommandDialog({ settings }: CliCommandDialogProps) {
         envVars.push(
           `SET DEEPGRAM_API_URL=https://api.screenpi.pe/v1/listen`
         );
-        envVars.push(
-          `SET DEEPGRAM_WEBSOCKET_URL=wss://api.screenpi.pe`
-        );
         envVars.push(`SET CUSTOM_DEEPGRAM_API_TOKEN=${settings.userId}`);
       } else if (shell === "powershell") {
         envVars.push(
           `$env:DEEPGRAM_API_URL="https://api.screenpi.pe/v1/listen"`
         );
-        envVars.push(
-          `$env:DEEPGRAM_WEBSOCKET_URL="wss://api.screenpi.pe"`
-        );
         envVars.push(`$env:CUSTOM_DEEPGRAM_API_TOKEN="${settings.userId}"`);
       } else {
         envVars.push(
           `DEEPGRAM_API_URL="https://api.screenpi.pe/v1/listen"`
-        );
-        envVars.push(
-          `DEEPGRAM_WEBSOCKET_URL="wss://api.screenpi.pe"`
         );
         envVars.push(`CUSTOM_DEEPGRAM_API_TOKEN="${settings.userId}"`);
       }
@@ -119,6 +110,12 @@ export function CliCommandDialog({ settings }: CliCommandDialogProps) {
     if (settings.disableAudio) {
       args.push("--disable-audio");
     }
+    if (settings.windowsInputAecEnabled) {
+      args.push("--windows-input-aec-enabled");
+    }
+    if (settings.disableClipboardCapture) {
+      args.push("--disable-clipboard-capture");
+    }
     settings.ignoredWindows.forEach((window) =>
       args.push(`--ignored-windows "${window}"`)
     );
@@ -128,23 +125,12 @@ export function CliCommandDialog({ settings }: CliCommandDialogProps) {
     if (settings.deepgramApiKey && settings.deepgramApiKey !== "default") {
       args.push(`--deepgram-api-key "${settings.deepgramApiKey}"`);
     }
-    if (settings.fps !== 0.2) {
-      args.push(`--fps ${settings.fps}`);
-    }
     if (!settings.analyticsEnabled) {
       args.push("--disable-telemetry");
     }
 
     if (settings.languages.length > 0) {
       settings.languages.forEach((id) => args.push(`--language ${id}`));
-    }
-
-    if (settings.enableInputCapture) {
-      args.push("--enable-input-capture");
-    }
-
-    if (settings.enableAccessibility) {
-      args.push("--enable-accessibility");
     }
 
     const envVarsStr =

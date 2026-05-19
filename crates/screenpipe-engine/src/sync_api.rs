@@ -9,7 +9,12 @@
 //! - Trigger sync and check status
 //! - Download and import data from other devices
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Json, State},
+    http::StatusCode,
+    response::Json as JsonResponse,
+};
+use oasgen::{oasgen, OaSchema};
 use screenpipe_core::sync::{
     BlobType, SyncClientConfig, SyncManager, SyncService, SyncServiceConfig, SyncServiceHandle,
 };
@@ -58,7 +63,7 @@ pub fn new_sync_state() -> SyncState {
 // ============================================================================
 
 /// Request to initialize sync at runtime.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, OaSchema)]
 pub struct SyncInitRequest {
     /// API token for cloud authentication
     pub token: String,
@@ -71,7 +76,7 @@ pub struct SyncInitRequest {
 }
 
 /// Response from sync initialization.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, OaSchema)]
 pub struct SyncInitResponse {
     pub success: bool,
     pub is_new_user: bool,
@@ -79,17 +84,18 @@ pub struct SyncInitResponse {
 }
 
 /// Initialize sync at runtime with credentials.
+#[oasgen]
 pub async fn sync_init(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SyncInitRequest>,
-) -> Result<Json<SyncInitResponse>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<SyncInitResponse>, (StatusCode, JsonResponse<Value>)> {
     // Check if already initialized
     {
         let sync_state = state.sync_state.read().await;
         if sync_state.is_some() {
             return Err((
                 StatusCode::CONFLICT,
-                Json(json!({"error": "sync already initialized"})),
+                JsonResponse(json!({"error": "sync already initialized"})),
             ));
         }
     }
@@ -97,7 +103,7 @@ pub async fn sync_init(
     // Generate or use provided machine ID
     let machine_id = request
         .machine_id
-        .unwrap_or_else(|| screenpipe_core::sync::get_or_create_machine_id());
+        .unwrap_or_else(screenpipe_core::sync::get_or_create_machine_id);
 
     // Get device info
     let device_name = hostname::get()
@@ -117,7 +123,7 @@ pub async fn sync_init(
         error!("failed to create sync manager: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("failed to create sync manager: {}", e)})),
+            JsonResponse(json!({"error": format!("failed to create sync manager: {}", e)})),
         )
     })?;
 
@@ -126,7 +132,7 @@ pub async fn sync_init(
         error!("failed to initialize sync: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("failed to initialize sync: {}", e)})),
+            JsonResponse(json!({"error": format!("failed to initialize sync: {}", e)})),
         )
     })?;
 
@@ -142,7 +148,11 @@ pub async fn sync_init(
     let service_config = SyncServiceConfig {
         enabled: true,
         sync_interval_secs: request.sync_interval_secs.unwrap_or(300),
-        sync_types: vec![BlobType::Ocr, BlobType::Transcripts],
+        sync_types: vec![
+            BlobType::Ocr,
+            BlobType::Transcripts,
+            BlobType::Accessibility,
+        ],
         max_blobs_per_cycle: 10,
         sync_on_startup: true,
     };
@@ -224,6 +234,10 @@ pub async fn sync_init(
     let pipe_sync_dir = state.screenpipe_dir.clone();
     let pipe_sync_manager = runtime_state.manager.clone();
     let pipe_sync_pipe_manager = state.pipe_manager.clone();
+    // Memories sync shares the same SyncManager (same encrypted upload pipe)
+    // and the same screenpipe_dir for the toggle file, but it talks to the
+    // db directly rather than the disk-backed pipe manager.
+    let pipe_sync_db = state.db.clone();
 
     tokio::spawn(async move {
         use crate::sync_provider::SCHEMA_VERSION;
@@ -338,6 +352,19 @@ pub async fn sync_init(
                 .await;
             }
 
+            // -- Memories sync (independent toggle from pipe sync — a user
+            //    might want their memories on every device but keep pipes
+            //    device-local, or vice versa) --
+            if is_memories_sync_enabled(&pipe_sync_dir) {
+                run_background_memories_sync(
+                    &pipe_sync_manager,
+                    &pipe_sync_dir,
+                    &download_machine_id,
+                    &pipe_sync_db,
+                )
+                .await;
+            }
+
             // Exponential backoff after 3+ consecutive failures (capped at 30 min)
             let sleep_dur = if consecutive_failures >= 3 {
                 let exp = (consecutive_failures - 2).min(3); // 1,2,3 → 2x,4x,8x
@@ -358,7 +385,7 @@ pub async fn sync_init(
     // Store in app state
     *state.sync_state.write().await = Some(runtime_state);
 
-    Ok(Json(SyncInitResponse {
+    Ok(JsonResponse(SyncInitResponse {
         success: true,
         is_new_user,
         machine_id,
@@ -366,7 +393,7 @@ pub async fn sync_init(
 }
 
 /// Response for sync status.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, OaSchema)]
 pub struct SyncStatusResponse {
     pub enabled: bool,
     pub is_syncing: bool,
@@ -377,9 +404,10 @@ pub struct SyncStatusResponse {
 }
 
 /// Get current sync status.
+#[oasgen]
 pub async fn sync_status(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<SyncStatusResponse>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<SyncStatusResponse>, (StatusCode, JsonResponse<Value>)> {
     let sync_state = state.sync_state.read().await;
 
     match sync_state.as_ref() {
@@ -389,7 +417,7 @@ pub async fn sync_status(
             let last_error = runtime.last_error.read().await.clone();
             let last_download_at = runtime.last_download_at.read().await.clone();
 
-            Ok(Json(SyncStatusResponse {
+            Ok(JsonResponse(SyncStatusResponse {
                 enabled: true,
                 is_syncing,
                 last_sync,
@@ -398,7 +426,7 @@ pub async fn sync_status(
                 last_download_at,
             }))
         }
-        None => Ok(Json(SyncStatusResponse {
+        None => Ok(JsonResponse(SyncStatusResponse {
             enabled: false,
             is_syncing: false,
             last_sync: None,
@@ -410,9 +438,10 @@ pub async fn sync_status(
 }
 
 /// Trigger an immediate sync.
+#[oasgen]
 pub async fn sync_trigger(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
     let sync_state = state.sync_state.read().await;
 
     match sync_state.as_ref() {
@@ -421,22 +450,25 @@ pub async fn sync_trigger(
                 error!("failed to trigger sync: {}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("failed to trigger sync: {}", e)})),
+                    JsonResponse(json!({"error": format!("failed to trigger sync: {}", e)})),
                 )
             })?;
-            Ok(Json(json!({"success": true, "message": "sync triggered"})))
+            Ok(JsonResponse(
+                json!({"success": true, "message": "sync triggered"}),
+            ))
         }
         None => Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "sync not initialized"})),
+            JsonResponse(json!({"error": "sync not initialized"})),
         )),
     }
 }
 
 /// Lock sync (stop service and clear state).
+#[oasgen]
 pub async fn sync_lock(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
     let mut sync_state = state.sync_state.write().await;
 
     match sync_state.take() {
@@ -448,16 +480,18 @@ pub async fn sync_lock(
             // Lock the manager (clear keys from memory)
             runtime.manager.lock().await;
             info!("sync locked and service stopped");
-            Ok(Json(json!({"success": true, "message": "sync locked"})))
+            Ok(JsonResponse(
+                json!({"success": true, "message": "sync locked"}),
+            ))
         }
-        None => Ok(Json(
+        None => Ok(JsonResponse(
             json!({"success": true, "message": "sync was not initialized"}),
         )),
     }
 }
 
 /// Request to download data from other devices.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, OaSchema)]
 pub struct SyncDownloadRequest {
     /// Time range in hours to download (default: 24)
     #[serde(default = "default_hours")]
@@ -469,7 +503,7 @@ fn default_hours() -> u32 {
 }
 
 /// Response from download operation.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, OaSchema)]
 pub struct SyncDownloadResponse {
     pub success: bool,
     pub blobs_downloaded: usize,
@@ -477,16 +511,17 @@ pub struct SyncDownloadResponse {
 }
 
 /// Download and import data from other devices.
+#[oasgen]
 pub async fn sync_download(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SyncDownloadRequest>,
-) -> Result<Json<SyncDownloadResponse>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<SyncDownloadResponse>, (StatusCode, JsonResponse<Value>)> {
     let sync_state = state.sync_state.read().await;
 
     let runtime = sync_state.as_ref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "sync not initialized"})),
+            JsonResponse(json!({"error": "sync not initialized"})),
         )
     })?;
 
@@ -508,7 +543,7 @@ pub async fn sync_download(
             error!("failed to download blobs: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("failed to download: {}", e)})),
+                JsonResponse(json!({"error": format!("failed to download: {}", e)})),
             )
         })?;
 
@@ -559,7 +594,7 @@ pub async fn sync_download(
         blobs_downloaded, records_imported
     );
 
-    Ok(Json(SyncDownloadResponse {
+    Ok(JsonResponse(SyncDownloadResponse {
         success: true,
         blobs_downloaded,
         records_imported,
@@ -571,7 +606,7 @@ pub async fn sync_download(
 // ============================================================================
 
 /// Response from pipe sync operations.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, OaSchema)]
 pub struct PipeSyncResponse {
     pub success: bool,
     pub actions: Vec<String>,
@@ -580,16 +615,17 @@ pub struct PipeSyncResponse {
 }
 
 /// Push local pipe manifest to cloud (merge with remote first).
+#[oasgen]
 pub async fn sync_pipes_push(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<PipeSyncResponse>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<PipeSyncResponse>, (StatusCode, JsonResponse<Value>)> {
     use screenpipe_core::pipes::sync::*;
 
     let sync_state = state.sync_state.read().await;
     let runtime = sync_state.as_ref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "sync not initialized"})),
+            JsonResponse(json!({"error": "sync not initialized"})),
         )
     })?;
 
@@ -628,7 +664,7 @@ pub async fn sync_pipes_push(
         merged.tombstones.len()
     );
 
-    Ok(Json(PipeSyncResponse {
+    Ok(JsonResponse(PipeSyncResponse {
         success: errors.is_empty(),
         actions: action_strs,
         errors,
@@ -636,16 +672,17 @@ pub async fn sync_pipes_push(
 }
 
 /// Pull pipe manifest from cloud, merge with local, apply to disk.
+#[oasgen]
 pub async fn sync_pipes_pull(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<PipeSyncResponse>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<PipeSyncResponse>, (StatusCode, JsonResponse<Value>)> {
     use screenpipe_core::pipes::sync::*;
 
     let sync_state = state.sync_state.read().await;
     let runtime = sync_state.as_ref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "sync not initialized"})),
+            JsonResponse(json!({"error": "sync not initialized"})),
         )
     })?;
 
@@ -707,7 +744,7 @@ pub async fn sync_pipes_pull(
         all_errors.len()
     );
 
-    Ok(Json(PipeSyncResponse {
+    Ok(JsonResponse(PipeSyncResponse {
         success: all_errors.is_empty(),
         actions: action_strs,
         errors: all_errors,
@@ -788,6 +825,18 @@ async fn upload_pipe_manifest(
 
 /// Check if pipe sync is enabled by reading store.bin → settings.pipeSyncEnabled.
 fn is_pipe_sync_enabled(screenpipe_dir: &std::path::Path) -> bool {
+    is_settings_bool_enabled(screenpipe_dir, "pipeSyncEnabled")
+}
+
+/// Check if memories sync is enabled by reading store.bin → settings.memoriesSyncEnabled.
+fn is_memories_sync_enabled(screenpipe_dir: &std::path::Path) -> bool {
+    is_settings_bool_enabled(screenpipe_dir, "memoriesSyncEnabled")
+}
+
+/// Read `settings.<key>` as a bool from `<screenpipe_dir>/store.bin`.
+/// Returns false on any failure (missing file, corrupt JSON, missing key).
+/// Shared with pipe sync to keep both feature toggles consistent.
+fn is_settings_bool_enabled(screenpipe_dir: &std::path::Path, key: &str) -> bool {
     let store_path = screenpipe_dir.join("store.bin");
     let content = match std::fs::read_to_string(&store_path) {
         Ok(c) => c,
@@ -799,7 +848,7 @@ fn is_pipe_sync_enabled(screenpipe_dir: &std::path::Path) -> bool {
     };
     store
         .get("settings")
-        .and_then(|s| s.get("pipeSyncEnabled"))
+        .and_then(|s| s.get(key))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
@@ -862,6 +911,405 @@ async fn run_background_pipe_sync(
             changed_count,
             merged.pipes.len()
         );
+    }
+}
+
+// ============================================================================
+// Memories Sync — handlers, manifest IO, background loop
+// ============================================================================
+//
+// Shape mirrors pipe sync above so the two are easy to read side-by-side:
+//
+//   * download_memories_manifest / upload_memories_manifest
+//       — same shape as the pipe equivalents; just swap BlobType::PipeConfig
+//         for BlobType::Memories and the manifest type for MemoriesSyncManifest.
+//
+//   * build_memories_local_manifest / apply_memories_manifest_to_db
+//       — equivalent of build_local_manifest / apply_manifest_to_disk for
+//         pipes, but driven off the SQLite memories table instead of pipe.md
+//         files. Side-effects on the DB (UUID minting, INSERT/UPDATE/DELETE)
+//         are confined to these two functions.
+//
+//   * sync_memories_pull / sync_memories_push  — HTTP routes (parity with
+//     /sync/pipes/{pull,push}).
+//
+//   * run_background_memories_sync             — called inside the existing
+//     download loop guarded by `is_memories_sync_enabled`.
+//
+// Frame ids are NEVER synced. They reference local frames that don't exist on
+// the receiving device, so `apply_memories_manifest_to_db` writes NULL for
+// frame_id on every imported row. The local `frame_id` column is preserved
+// when we update an already-known sync_uuid (so locally-attributed memories
+// keep their provenance for that user's own browsing).
+
+use screenpipe_db::DatabaseManager;
+
+const MEMORY_TOMBSTONES_FILE: &str = ".memory_sync_tombstones.json";
+
+/// Read the local tombstone log. Returns an empty map on any error.
+fn read_memory_tombstones(
+    screenpipe_dir: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    let path = screenpipe_dir.join(MEMORY_TOMBSTONES_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+            warn!("memories sync: tombstones file corrupt, ignoring: {}", e);
+            std::collections::HashMap::new()
+        }),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// Atomic write of the tombstone log (write to .tmp, rename).
+fn write_memory_tombstones(
+    screenpipe_dir: &std::path::Path,
+    tombstones: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let path = screenpipe_dir.join(MEMORY_TOMBSTONES_FILE);
+    let tmp_path = screenpipe_dir.join(format!("{}.tmp", MEMORY_TOMBSTONES_FILE));
+    let json = serde_json::to_string_pretty(tombstones).map_err(|e| format!("serialize: {}", e))?;
+    std::fs::write(&tmp_path, &json).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+/// Public entrypoint for the DELETE /memories/:id route to call after
+/// committing the row deletion. No-op when the memory was never synced
+/// (sync_uuid is None) — there's nothing on any other device to delete.
+pub fn record_memory_tombstone(screenpipe_dir: &std::path::Path, sync_uuid: Option<&str>) {
+    let Some(uuid) = sync_uuid else { return };
+    let mut t = read_memory_tombstones(screenpipe_dir);
+    t.insert(uuid.to_string(), chrono::Utc::now().to_rfc3339());
+    if let Err(e) = write_memory_tombstones(screenpipe_dir, &t) {
+        warn!(
+            "memories sync: failed to record tombstone for {}: {}",
+            uuid, e
+        );
+    }
+}
+
+/// Build the manifest of local memories. Mints sync_uuid for any rows
+/// born locally that haven't been published yet, persisting back to the
+/// DB so a follow-up push won't mint a different uuid for the same row.
+async fn build_memories_local_manifest(
+    db: &Arc<DatabaseManager>,
+    screenpipe_dir: &std::path::Path,
+    machine_id: &str,
+) -> screenpipe_core::memories::sync::MemoriesSyncManifest {
+    use screenpipe_core::memories::sync::{MemoriesSyncManifest, SyncedMemory};
+
+    let mut manifest = MemoriesSyncManifest::empty(machine_id);
+
+    let rows = match db.list_memories_for_sync().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("memories sync: failed to read local memories: {}", e);
+            return manifest;
+        }
+    };
+
+    for row in rows {
+        let (uuid, modified_by) = match row.sync_uuid.as_deref() {
+            Some(u) => (
+                u.to_string(),
+                row.sync_modified_by
+                    .clone()
+                    .unwrap_or_else(|| machine_id.to_string()),
+            ),
+            None => {
+                // First publish — mint uuid, stamp current machine as author.
+                let new_uuid = uuid::Uuid::new_v4().to_string();
+                if let Err(e) = db
+                    .set_memory_sync_identity(row.id, &new_uuid, machine_id)
+                    .await
+                {
+                    warn!(
+                        "memories sync: failed to mint sync_uuid for memory {}: {}",
+                        row.id, e
+                    );
+                    continue;
+                }
+                (new_uuid, machine_id.to_string())
+            }
+        };
+
+        manifest.memories.insert(
+            uuid.clone(),
+            SyncedMemory {
+                sync_uuid: uuid,
+                content: row.content,
+                source: row.source,
+                source_context: row.source_context,
+                tags: row.tags.unwrap_or_else(|| "[]".to_string()),
+                importance: row.importance,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                last_modified_by: modified_by,
+            },
+        );
+    }
+
+    // Carry forward our own outstanding tombstones (deletions that haven't
+    // been confirmed by an upload yet). The merge function GCs anything
+    // older than 30 days.
+    for (uuid, ts) in read_memory_tombstones(screenpipe_dir) {
+        manifest.tombstones.entry(uuid).or_insert(ts);
+    }
+
+    manifest
+}
+
+/// Apply the merged manifest to the local DB. Each action is independent;
+/// a failure on one row is logged but doesn't abort the rest.
+async fn apply_memories_manifest_to_db(
+    db: &Arc<DatabaseManager>,
+    manifest: &screenpipe_core::memories::sync::MemoriesSyncManifest,
+    actions: &[screenpipe_core::memories::sync::MemorySyncAction],
+) -> Vec<String> {
+    use screenpipe_core::memories::sync::MemorySyncAction;
+    let mut errors = Vec::new();
+
+    for action in actions {
+        match action {
+            MemorySyncAction::Imported(uuid) | MemorySyncAction::Updated(uuid) => {
+                if let Some(m) = manifest.memories.get(uuid) {
+                    if let Err(e) = db
+                        .upsert_synced_memory(
+                            &m.sync_uuid,
+                            &m.content,
+                            &m.source,
+                            m.source_context.as_deref(),
+                            &m.tags,
+                            m.importance,
+                            &m.created_at,
+                            &m.updated_at,
+                            &m.last_modified_by,
+                        )
+                        .await
+                    {
+                        errors.push(format!("upsert {}: {}", uuid, e));
+                    }
+                }
+            }
+            MemorySyncAction::Deleted(uuid) => {
+                if let Err(e) = db.delete_memory_by_sync_uuid(uuid).await {
+                    errors.push(format!("delete {}: {}", uuid, e));
+                }
+            }
+            MemorySyncAction::Skipped(_) => {}
+        }
+    }
+
+    errors
+}
+
+/// Download the latest memories manifest from the cloud. Returns an
+/// empty manifest on any failure (first-run user, network blip).
+async fn download_memories_manifest(
+    manager: &Arc<screenpipe_core::sync::SyncManager>,
+) -> screenpipe_core::memories::sync::MemoriesSyncManifest {
+    use screenpipe_core::memories::sync::MemoriesSyncManifest;
+    use screenpipe_core::sync::BlobType;
+
+    let end = chrono::Utc::now();
+    let start = end - chrono::Duration::days(365);
+
+    match manager
+        .download_by_time_range(
+            Some(start.to_rfc3339()),
+            Some(end.to_rfc3339()),
+            Some(vec![BlobType::Memories]),
+            Some(1),
+        )
+        .await
+    {
+        Ok(blobs) if !blobs.is_empty() => {
+            match serde_json::from_slice::<MemoriesSyncManifest>(&blobs[0].data) {
+                Ok(m) => {
+                    info!(
+                        "memories sync: downloaded manifest with {} memories, {} tombstones",
+                        m.memories.len(),
+                        m.tombstones.len()
+                    );
+                    m
+                }
+                Err(e) => {
+                    warn!("memories sync: failed to deserialize manifest: {}", e);
+                    MemoriesSyncManifest::empty("unknown")
+                }
+            }
+        }
+        Ok(_) => MemoriesSyncManifest::empty("unknown"),
+        Err(e) => {
+            warn!("memories sync: failed to download manifest: {}", e);
+            MemoriesSyncManifest::empty("unknown")
+        }
+    }
+}
+
+async fn upload_memories_manifest(
+    manager: &Arc<screenpipe_core::sync::SyncManager>,
+    manifest: &screenpipe_core::memories::sync::MemoriesSyncManifest,
+) -> Vec<String> {
+    use screenpipe_core::sync::BlobType;
+    let data = match serde_json::to_vec(manifest) {
+        Ok(d) => d,
+        Err(e) => return vec![format!("serialize manifest: {}", e)],
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    match manager
+        .upload(&data, BlobType::Memories, &now, &now, None)
+        .await
+    {
+        Ok(_) => vec![],
+        Err(e) => vec![format!("upload manifest: {}", e)],
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, OaSchema)]
+pub struct MemoriesSyncResponse {
+    pub success: bool,
+    pub actions: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// POST /sync/memories/push — build local manifest, merge with cloud,
+/// upload merged. Mirror of `sync_pipes_push`.
+#[oasgen]
+pub async fn sync_memories_push(
+    State(state): State<Arc<AppState>>,
+) -> Result<JsonResponse<MemoriesSyncResponse>, (StatusCode, JsonResponse<Value>)> {
+    use screenpipe_core::memories::sync::*;
+
+    let sync_state = state.sync_state.read().await;
+    let runtime = sync_state.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({"error": "sync not initialized"})),
+        )
+    })?;
+
+    let machine_id = &runtime.machine_id;
+    let local = build_memories_local_manifest(&state.db, &state.screenpipe_dir, machine_id).await;
+    let remote = download_memories_manifest(&runtime.manager).await;
+    let (merged, actions) = merge_manifests(&local, &remote, machine_id);
+
+    let action_strs: Vec<String> = actions.iter().map(action_str).collect();
+    let errors = upload_memories_manifest(&runtime.manager, &merged).await;
+
+    info!(
+        "memories sync push: uploaded {} memories, {} tombstones",
+        merged.memories.len(),
+        merged.tombstones.len()
+    );
+
+    Ok(JsonResponse(MemoriesSyncResponse {
+        success: errors.is_empty(),
+        actions: action_strs,
+        errors,
+    }))
+}
+
+/// POST /sync/memories/pull — download cloud manifest, merge with local,
+/// apply to DB, push merged back. Mirror of `sync_pipes_pull`.
+#[oasgen]
+pub async fn sync_memories_pull(
+    State(state): State<Arc<AppState>>,
+) -> Result<JsonResponse<MemoriesSyncResponse>, (StatusCode, JsonResponse<Value>)> {
+    use screenpipe_core::memories::sync::*;
+
+    let sync_state = state.sync_state.read().await;
+    let runtime = sync_state.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({"error": "sync not initialized"})),
+        )
+    })?;
+
+    let machine_id = &runtime.machine_id;
+    let remote = download_memories_manifest(&runtime.manager).await;
+    let local = build_memories_local_manifest(&state.db, &state.screenpipe_dir, machine_id).await;
+    let (merged, actions) = merge_manifests(&local, &remote, machine_id);
+
+    let action_strs: Vec<String> = actions.iter().map(action_str).collect();
+    let mut errors = apply_memories_manifest_to_db(&state.db, &merged, &actions).await;
+
+    // Confirmed deletes — drop from the local tombstone log so we don't
+    // re-publish them forever. (The merged manifest now carries them, so
+    // every other device will see the tombstone via the cloud copy.)
+    if actions
+        .iter()
+        .any(|a| matches!(a, MemorySyncAction::Deleted(_)))
+    {
+        let mut t = read_memory_tombstones(&state.screenpipe_dir);
+        for a in &actions {
+            if let MemorySyncAction::Deleted(uuid) = a {
+                t.remove(uuid);
+            }
+        }
+        if let Err(e) = write_memory_tombstones(&state.screenpipe_dir, &t) {
+            errors.push(format!("clear tombstones: {}", e));
+        }
+    }
+
+    errors.extend(upload_memories_manifest(&runtime.manager, &merged).await);
+
+    info!(
+        "memories sync pull: applied {} actions, {} errors",
+        action_strs.len(),
+        errors.len()
+    );
+
+    Ok(JsonResponse(MemoriesSyncResponse {
+        success: errors.is_empty(),
+        actions: action_strs,
+        errors,
+    }))
+}
+
+/// Run a full pull-merge-push cycle from the background loop.
+async fn run_background_memories_sync(
+    manager: &Arc<screenpipe_core::sync::SyncManager>,
+    screenpipe_dir: &std::path::Path,
+    machine_id: &str,
+    db: &Arc<DatabaseManager>,
+) {
+    use screenpipe_core::memories::sync::*;
+
+    let remote = download_memories_manifest(manager).await;
+    let local = build_memories_local_manifest(db, screenpipe_dir, machine_id).await;
+    let (merged, actions) = merge_manifests(&local, &remote, machine_id);
+
+    let errors = apply_memories_manifest_to_db(db, &merged, &actions).await;
+    for err in &errors {
+        warn!("memories sync background: {}", err);
+    }
+
+    let upload_errors = upload_memories_manifest(manager, &merged).await;
+    for err in &upload_errors {
+        warn!("memories sync background: {}", err);
+    }
+
+    let changed = actions
+        .iter()
+        .filter(|a| !matches!(a, MemorySyncAction::Skipped(_)))
+        .count();
+    if changed > 0 {
+        info!(
+            "memories sync background: {} changes applied ({} memories total)",
+            changed,
+            merged.memories.len()
+        );
+    }
+}
+
+fn action_str(a: &screenpipe_core::memories::sync::MemorySyncAction) -> String {
+    use screenpipe_core::memories::sync::MemorySyncAction;
+    match a {
+        MemorySyncAction::Imported(u) => format!("imported: {}", u),
+        MemorySyncAction::Updated(u) => format!("updated: {}", u),
+        MemorySyncAction::Deleted(u) => format!("deleted: {}", u),
+        MemorySyncAction::Skipped(u) => format!("skipped: {}", u),
     }
 }
 

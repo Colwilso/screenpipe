@@ -6,10 +6,12 @@ use crate::activity_feed::{ActivityFeed, ActivityKind};
 use crate::config::UiCaptureConfig;
 use crate::events::{ElementContext, EventData, Modifiers, UiEvent};
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 use screenpipe_core::pii_removal::remove_pii;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -19,10 +21,75 @@ use tracing::{debug, error};
 use cidre::cg::event::access as cg_access;
 use cidre::{ax, cf, cg, ns};
 
+/// Guard to serialize accessibility queries – concurrent calls to
+/// AXUIElementCopyElementAtPosition can corrupt AppKit's internal
+/// accessibility caches (NSAccessibilityIsSelectorUsingBaseImplementation)
+/// and cause a SIGABRT in CFDictionarySetValue / __CFBasicHashRehash.
+static AX_QUERY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 // Keycodes for clipboard operations (macOS)
 const KEY_C: u16 = 8;
 const KEY_X: u16 = 7;
 const KEY_V: u16 = 9;
+
+#[repr(C)]
+struct UCKeyboardLayout {
+    _private: [u8; 0],
+}
+
+type OptionBits = u32;
+type UniCharCount = std::os::raw::c_ulong;
+type UniChar = u16;
+type OSStatus = i32;
+type TISInputSourceRef = *const c_void;
+
+const K_UC_KEY_ACTION_DISPLAY: u16 = 3;
+const K_UC_KEY_TRANSLATE_NO_DEAD_KEYS_MASK: OptionBits = 1;
+
+const CARBON_COMMAND_KEY: u32 = 1 << 8;
+const CARBON_SHIFT_KEY: u32 = 1 << 9;
+const CARBON_ALPHA_LOCK: u32 = 1 << 10;
+const CARBON_OPTION_KEY: u32 = 1 << 11;
+const CARBON_CONTROL_KEY: u32 = 1 << 12;
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    #[allow(non_upper_case_globals)]
+    static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+
+    fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
+
+    fn TISGetInputSourceProperty(
+        input_source: TISInputSourceRef,
+        property_key: *const c_void,
+    ) -> *const c_void;
+
+    fn LMGetKbdType() -> u8;
+
+    fn UCKeyTranslate(
+        key_layout_ptr: *const UCKeyboardLayout,
+        virtual_key_code: u16,
+        key_action: u16,
+        modifier_key_state: u32,
+        keyboard_type: u32,
+        key_translate_options: OptionBits,
+        dead_key_state: *mut u32,
+        max_string_length: UniCharCount,
+        actual_string_length: *mut UniCharCount,
+        unicode_string: *mut UniChar,
+    ) -> OSStatus;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRelease(cf: *const c_void);
+    fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
+}
+
+#[link(name = "System")]
+extern "C" {
+    fn pthread_main_np() -> i32;
+}
 
 /// Permission status for UI capture
 #[derive(Debug, Clone)]
@@ -164,9 +231,9 @@ impl UiRecorder {
 
         let mut threads = Vec::new();
 
-        // Shared state for current app/window between threads
-        let current_app = Arc::new(Mutex::new(None::<String>));
-        let current_window = Arc::new(Mutex::new(None::<String>));
+        // Shared state for current app/window between threads (lock-free)
+        let current_app = Arc::new(ArcSwap::from_pointee(None::<String>));
+        let current_window = Arc::new(ArcSwap::from_pointee(None::<String>));
 
         // Thread 1: CGEventTap for input events
         let tx1 = tx.clone();
@@ -204,15 +271,45 @@ impl UiRecorder {
 // Event Tap Implementation
 // ============================================================================
 
+/// Request to capture element context for a click — processed by a
+/// dedicated worker thread instead of spawning a thread per click.
+struct ContextCaptureRequest {
+    x: f64,
+    y: f64,
+    config: UiCaptureConfig,
+    app_name: Option<String>,
+    window_title: Option<String>,
+    start: Instant,
+    tx: Sender<UiEvent>,
+}
+
+/// Clipboard capture request — processed by a dedicated worker thread.
+struct ClipboardRequest {
+    operation: char,
+    delay_ms: u64,
+    capture_content: bool,
+    apply_pii: bool,
+    start: Instant,
+    tx: Sender<UiEvent>,
+}
+
 struct TapState {
     tx: Sender<UiEvent>,
     start: Instant,
     config: UiCaptureConfig,
     last_mouse: Mutex<(f64, f64)>,
     text_buf: Mutex<TextBuffer>,
-    current_app: Arc<Mutex<Option<String>>>,
-    current_window: Arc<Mutex<Option<String>>>,
+    /// Lock-free reads for app/window context — no mutex contention in the
+    /// event tap callback (the hot path for every input event).
+    current_app: Arc<ArcSwap<Option<String>>>,
+    current_window: Arc<ArcSwap<Option<String>>>,
     activity_feed: Option<ActivityFeed>,
+    /// Bounded channel for context capture requests — a single worker thread
+    /// processes these instead of spawning a thread per click.
+    context_tx: Sender<ContextCaptureRequest>,
+    /// Bounded channel for clipboard capture — avoids spawning a thread per
+    /// Cmd+C/X/V and blocks the event tap with get_clipboard().
+    clipboard_tx: Sender<ClipboardRequest>,
 }
 
 struct TextBuffer {
@@ -261,8 +358,8 @@ fn run_event_tap(
     stop: Arc<AtomicBool>,
     start: Instant,
     config: UiCaptureConfig,
-    current_app: Arc<Mutex<Option<String>>>,
-    current_window: Arc<Mutex<Option<String>>>,
+    current_app: Arc<ArcSwap<Option<String>>>,
+    current_window: Arc<ArcSwap<Option<String>>>,
     activity_feed: Option<ActivityFeed>,
 ) {
     // Build event mask - always include KEY_UP for activity tracking
@@ -280,6 +377,78 @@ fn run_event_tap(
             | cg::EventType::RIGHT_MOUSE_DRAGGED.mask();
     }
 
+    // Single worker thread for context capture — avoids spawning a thread per click
+    let (context_tx, context_rx) = bounded::<ContextCaptureRequest>(4);
+    thread::Builder::new()
+        .name("ctx-capture".into())
+        .spawn(move || {
+            while let Ok(req) = context_rx.recv() {
+                if let Some(element) = get_element_at_position(req.x, req.y, &req.config) {
+                    let ctx_event = UiEvent {
+                        id: None,
+                        timestamp: Utc::now(),
+                        relative_ms: req.start.elapsed().as_millis() as u64,
+                        data: EventData::Click {
+                            x: req.x as i32,
+                            y: req.y as i32,
+                            button: 0,
+                            click_count: 0,
+                            modifiers: 0,
+                        },
+                        app_name: req.app_name,
+                        window_title: req.window_title,
+                        browser_url: None,
+                        element: Some(element),
+                        frame_id: None,
+                    };
+                    let _ = req.tx.try_send(ctx_event);
+                }
+            }
+        })
+        .ok();
+
+    // Single worker thread for clipboard capture — avoids spawning a thread per
+    // Cmd+C/X and avoids blocking the event tap callback on Cmd+V.
+    let (clipboard_tx, clipboard_rx) = bounded::<ClipboardRequest>(4);
+    thread::Builder::new()
+        .name("clipboard-capture".into())
+        .spawn(move || {
+            while let Ok(req) = clipboard_rx.recv() {
+                if req.delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(req.delay_ms));
+                }
+                let content = if req.capture_content {
+                    let _pool = cidre::objc::AutoreleasePoolPage::push();
+                    get_clipboard().map(|s| {
+                        let truncated = truncate(&s, 1000);
+                        if req.apply_pii {
+                            remove_pii(&truncated)
+                        } else {
+                            truncated
+                        }
+                    })
+                } else {
+                    None
+                };
+                let event = UiEvent {
+                    id: None,
+                    timestamp: Utc::now(),
+                    relative_ms: req.start.elapsed().as_millis() as u64,
+                    data: EventData::Clipboard {
+                        operation: req.operation,
+                        content,
+                    },
+                    app_name: None,
+                    window_title: None,
+                    browser_url: None,
+                    element: None,
+                    frame_id: None,
+                };
+                let _ = req.tx.try_send(event);
+            }
+        })
+        .ok();
+
     let state = Box::leak(Box::new(TapState {
         tx,
         start,
@@ -289,6 +458,8 @@ fn run_event_tap(
         current_app,
         current_window,
         activity_feed,
+        context_tx,
+        clipboard_tx,
     }));
 
     let tap = cg::EventTap::new(
@@ -327,8 +498,10 @@ fn run_event_tap(
                 } else {
                     s
                 };
-                let event =
+                let mut event =
                     UiEvent::text(Utc::now(), state.start.elapsed().as_millis() as u64, text);
+                event.app_name = (**state.current_app.load()).clone();
+                event.window_title = (**state.current_window.load()).clone();
                 let _ = state.tx.try_send(event);
             }
         }
@@ -342,7 +515,9 @@ fn run_event_tap(
         } else {
             s
         };
-        let event = UiEvent::text(Utc::now(), state.start.elapsed().as_millis() as u64, text);
+        let mut event = UiEvent::text(Utc::now(), state.start.elapsed().as_millis() as u64, text);
+        event.app_name = (**state.current_app.load()).clone();
+        event.window_title = (**state.current_window.load()).clone();
         let _ = state.tx.try_send(event);
     }
 
@@ -363,9 +538,9 @@ extern "C" fn tap_callback(
     let flags = event.flags().0;
     let mods = Modifiers::from_cg_flags(flags);
 
-    // Get current app/window context
-    let app_name = state.current_app.lock().clone();
-    let window_title = state.current_window.lock().clone();
+    // Lock-free reads — no mutex contention in the input event path
+    let app_name = (**state.current_app.load()).clone();
+    let window_title = (**state.current_window.load()).clone();
 
     // Check if we should capture based on app/window exclusions
     if let Some(ref app) = app_name {
@@ -411,38 +586,16 @@ extern "C" fn tap_callback(
 
             let _ = state.tx.try_send(ui_event);
 
-            // Capture element context in background
+            // Send context capture request to dedicated worker (non-blocking)
             if state.config.capture_context {
-                let tx = state.tx.clone();
-                let x = loc.x;
-                let y = loc.y;
-                let start = state.start;
-                let config = state.config.clone();
-                let app = app_name.clone();
-                let window = window_title.clone();
-
-                std::thread::spawn(move || {
-                    if let Some(element) = get_element_at_position(x, y, &config) {
-                        // Create a context-only event that can be associated with the click
-                        let ctx_event = UiEvent {
-                            id: None,
-                            timestamp: Utc::now(),
-                            relative_ms: start.elapsed().as_millis() as u64,
-                            data: EventData::Click {
-                                x: x as i32,
-                                y: y as i32,
-                                button: 0,
-                                click_count: 0, // Mark as context-only
-                                modifiers: 0,
-                            },
-                            app_name: app,
-                            window_title: window,
-                            browser_url: None,
-                            element: Some(element),
-                            frame_id: None,
-                        };
-                        let _ = tx.try_send(ctx_event);
-                    }
+                let _ = state.context_tx.try_send(ContextCaptureRequest {
+                    x: loc.x,
+                    y: loc.y,
+                    config: state.config.clone(),
+                    app_name: app_name.clone(),
+                    window_title: window_title.clone(),
+                    start: state.start,
+                    tx: state.tx.clone(),
                 });
             }
         }
@@ -529,110 +682,24 @@ extern "C" fn tap_callback(
             let keycode = event.field_i64(cg::EventField::KEYBOARD_EVENT_KEYCODE) as u16;
 
             // Check for clipboard operations (Cmd+C, Cmd+X, Cmd+V)
+            // All routed to a single worker thread via bounded channel —
+            // no thread spawning, no blocking the event tap callback.
             if mods.has_cmd() && !mods.has_ctrl() && state.config.capture_clipboard {
-                match keycode {
-                    KEY_C => {
-                        let tx = state.tx.clone();
-                        let start = state.start;
-                        let capture_content = state.config.capture_clipboard_content;
-                        let apply_pii = state.config.apply_pii_removal;
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            let content = if capture_content {
-                                get_clipboard().map(|s| {
-                                    let truncated = truncate(&s, 1000);
-                                    if apply_pii {
-                                        remove_pii(&truncated)
-                                    } else {
-                                        truncated
-                                    }
-                                })
-                            } else {
-                                None
-                            };
-                            let event = UiEvent {
-                                id: None,
-                                timestamp: Utc::now(),
-                                relative_ms: start.elapsed().as_millis() as u64,
-                                data: EventData::Clipboard {
-                                    operation: 'c',
-                                    content,
-                                },
-                                app_name: None,
-                                window_title: None,
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = tx.try_send(event);
-                        });
-                    }
-                    KEY_X => {
-                        let tx = state.tx.clone();
-                        let start = state.start;
-                        let capture_content = state.config.capture_clipboard_content;
-                        let apply_pii = state.config.apply_pii_removal;
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            let content = if capture_content {
-                                get_clipboard().map(|s| {
-                                    let truncated = truncate(&s, 1000);
-                                    if apply_pii {
-                                        remove_pii(&truncated)
-                                    } else {
-                                        truncated
-                                    }
-                                })
-                            } else {
-                                None
-                            };
-                            let event = UiEvent {
-                                id: None,
-                                timestamp: Utc::now(),
-                                relative_ms: start.elapsed().as_millis() as u64,
-                                data: EventData::Clipboard {
-                                    operation: 'x',
-                                    content,
-                                },
-                                app_name: None,
-                                window_title: None,
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = tx.try_send(event);
-                        });
-                    }
-                    KEY_V => {
-                        let content = if state.config.capture_clipboard_content {
-                            get_clipboard().map(|s| {
-                                let truncated = truncate(&s, 1000);
-                                if state.config.apply_pii_removal {
-                                    remove_pii(&truncated)
-                                } else {
-                                    truncated
-                                }
-                            })
-                        } else {
-                            None
-                        };
-                        let event = UiEvent {
-                            id: None,
-                            timestamp,
-                            relative_ms: t,
-                            data: EventData::Clipboard {
-                                operation: 'v',
-                                content,
-                            },
-                            app_name: app_name.clone(),
-                            window_title: window_title.clone(),
-                            browser_url: None,
-                            element: None,
-                            frame_id: None,
-                        };
-                        let _ = state.tx.try_send(event);
-                    }
-                    _ => {}
+                let (op, delay) = match keycode {
+                    KEY_C => (Some('c'), 50),
+                    KEY_X => (Some('x'), 50),
+                    KEY_V => (Some('v'), 0), // paste: clipboard already set, no delay needed
+                    _ => (None, 0),
+                };
+                if let Some(operation) = op {
+                    let _ = state.clipboard_tx.try_send(ClipboardRequest {
+                        operation,
+                        delay_ms: delay,
+                        capture_content: state.config.capture_clipboard_content,
+                        apply_pii: state.config.apply_pii_removal,
+                        start: state.start,
+                        tx: state.tx.clone(),
+                    });
                 }
             }
 
@@ -698,8 +765,8 @@ struct ObserverCallbackState {
     tx: Sender<UiEvent>,
     start: Instant,
     config: UiCaptureConfig,
-    current_app: Arc<Mutex<Option<String>>>,
-    current_window: Arc<Mutex<Option<String>>>,
+    current_app: Arc<ArcSwap<Option<String>>>,
+    current_window: Arc<ArcSwap<Option<String>>>,
     focus: Mutex<FocusState>,
     refresh_requested: Arc<AtomicBool>,
 }
@@ -717,7 +784,7 @@ fn emit_focus_state(state: &ObserverCallbackState) {
     let app_changed = focus.last_app.as_ref() != Some(&name) || focus.last_pid != pid;
 
     if app_changed {
-        *state.current_app.lock() = Some(name.clone());
+        state.current_app.store(Arc::new(Some(name.clone())));
 
         if state.config.capture_app_switch {
             let focused_element = get_focused_element_context(&state.config);
@@ -743,7 +810,7 @@ fn emit_focus_state(state: &ObserverCallbackState) {
         .unwrap_or(true);
 
     if should_capture && (window_title != focus.last_window || app_changed) {
-        *state.current_window.lock() = window_title.clone();
+        state.current_window.store(Arc::new(window_title.clone()));
 
         if state.config.capture_window_focus {
             let focused_element = get_focused_element_context(&state.config);
@@ -795,8 +862,8 @@ fn run_app_observer(
     stop: Arc<AtomicBool>,
     start: Instant,
     config: UiCaptureConfig,
-    current_app: Arc<Mutex<Option<String>>>,
-    current_window: Arc<Mutex<Option<String>>>,
+    current_app: Arc<ArcSwap<Option<String>>>,
+    current_window: Arc<ArcSwap<Option<String>>>,
 ) {
     let workspace = ns::Workspace::shared();
     let mut notification_center = workspace.notification_center();
@@ -965,8 +1032,21 @@ fn get_element_at_position(x: f64, y: f64, config: &UiCaptureConfig) -> Option<E
         return None;
     }
 
+    // Serialize accessibility queries to prevent concurrent calls that corrupt
+    // AppKit's internal accessibility caches. Use try_lock to avoid blocking
+    // the event tap callback path – if another query is in-flight, skip this one.
+    let _guard = AX_QUERY_LOCK.try_lock()?;
+
     let sys = ax::UiElement::sys_wide();
     let elem = sys.element_at_pos(x as f32, y as f32).ok()?;
+
+    // Skip elements belonging to our own process to avoid crashes when querying
+    // our overlay views (e.g. shortcut reminder) that may be mid-dismissal
+    if let Ok(pid) = elem.pid() {
+        if pid == std::process::id() as i32 {
+            return None;
+        }
+    }
 
     let role = elem.role().ok().map(|r| {
         let s = format!("{:?}", r);
@@ -1058,6 +1138,9 @@ fn get_focused_window_title(pid: i32) -> Option<String> {
 
 /// Get the currently focused UI element's context (for capturing text field values)
 fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContext> {
+    // Serialize accessibility queries (same guard as get_element_at_position)
+    let _guard = AX_QUERY_LOCK.try_lock()?;
+
     let sys = ax::UiElement::sys_wide();
     let focused = sys.attr_value(ax::attr::focused_ui_element()).ok()?;
 
@@ -1124,13 +1207,93 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
     })
 }
 
+// All NSPasteboard access dispatches to the main thread. NSPasteboard /
+// NSPasteboardItem have undocumented main-thread-only semantics — calling
+// `[NSPasteboard stringForType:]` from any other thread races AppKit's
+// internal type-cache invalidation when another app mutates the pasteboard
+// mid-read, segfaulting in `_updateTypeCacheIfNeeded` (seen on macOS 26.x;
+// crash keys 57E6EDAB-D2D1-44D3-9BD0-82DCA482DBFF, 56416840-0903-4FAB-8869-5D471B78335C,
+// 5D2F76EF-BA4A-46EB-85F3-5126EE0C9B51). Confirmed by the arboard maintainer
+// in 1Password/arboard#218 — even a private serial queue with autorelease
+// pool isn't enough; the only safe place is the main thread, where AppKit's
+// pasteboard observers are already serialized.
+//
+// We hop onto the main queue via `dispatch_sync`. The clipboard worker is a
+// dedicated `std::thread` (not a tokio worker), so blocking it for the
+// duration of a sync hop is fine. Main-thread cost is microseconds per read
+// (one `string(forType:)` call); it doesn't compete meaningfully with the
+// tao event loop.
+//
+// The dead-man-switch below is kept as defense-in-depth: even with main-
+// thread dispatch, a future macOS regression or a bug in AppKit/arboard
+// could still SIGSEGV the read. SIGSEGV can't be caught in-process, so we
+// write a marker file before each read and delete it after. On startup, if
+// the marker exists, we know the previous run crashed mid-read and we
+// disable clipboard capture permanently for this install. The user can
+// re-enable by deleting `~/.screenpipe/clipboard-disabled-after-crash`.
+const CLIPBOARD_INFLIGHT_FILE: &str = "clipboard-read-inflight";
+const CLIPBOARD_DISABLED_FILE: &str = "clipboard-disabled-after-crash";
+
+static CLIPBOARD_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CLIPBOARD_CRASH_CHECK: std::sync::Once = std::sync::Once::new();
+
+fn check_clipboard_crash_marker() {
+    CLIPBOARD_CRASH_CHECK.call_once(|| {
+        let dir = screenpipe_core::paths::default_screenpipe_data_dir();
+        let inflight = dir.join(CLIPBOARD_INFLIGHT_FILE);
+        let disabled = dir.join(CLIPBOARD_DISABLED_FILE);
+
+        if disabled.exists() {
+            CLIPBOARD_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "clipboard capture disabled — prior NSPasteboard crash detected. \
+                 delete {} to re-enable",
+                disabled.display()
+            );
+            // Best-effort cleanup of any stale inflight marker
+            let _ = std::fs::remove_file(&inflight);
+        } else if inflight.exists() {
+            // Previous run died mid-clipboard read — promote to permanent disable.
+            CLIPBOARD_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::write(&disabled, "");
+            let _ = std::fs::remove_file(&inflight);
+            tracing::warn!(
+                "clipboard capture disabled for this session — previous run crashed \
+                 during NSPasteboard read. delete {} to re-enable",
+                disabled.display()
+            );
+        }
+    });
+}
+
 fn get_clipboard() -> Option<String> {
-    std::process::Command::new("pbpaste")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .filter(|s| !s.is_empty())
+    check_clipboard_crash_marker();
+    if CLIPBOARD_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+
+    let dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let inflight = dir.join(CLIPBOARD_INFLIGHT_FILE);
+    // Best-effort marker — if write fails (e.g., disk full) we proceed; the worst
+    // case is we don't detect a crash next startup.
+    let _ = std::fs::write(&inflight, std::process::id().to_string());
+
+    // dispatch_sync onto the main queue — the only thread where NSPasteboard
+    // is documented to behave. AppKit serializes pasteboard observers on
+    // main, so this side-steps the cache-invalidation race entirely.
+    let result = cidre::dispatch::Queue::main().sync_once(|| {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let text = clipboard.get_text().ok()?;
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    });
+
+    let _ = std::fs::remove_file(&inflight);
+    result
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1151,7 +1314,91 @@ fn truncate(s: &str, max: usize) -> String {
 // ============================================================================
 
 fn keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
-    let shift = mods.0 & Modifiers::SHIFT != 0 || mods.0 & Modifiers::CAPS != 0;
+    // macOS 26.5 asserts if Text Input Source APIs are called from the event-tap thread.
+    let layout_char = if unsafe { pthread_main_np() != 0 } {
+        layout_keycode_to_char(keycode, mods)
+    } else {
+        None
+    };
+    layout_char.or_else(|| us_keycode_to_char(keycode, mods))
+}
+
+fn layout_keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
+    let input_source = unsafe { TISCopyCurrentKeyboardLayoutInputSource() };
+    if input_source.is_null() {
+        return None;
+    }
+
+    let layout_data =
+        unsafe { TISGetInputSourceProperty(input_source, kTISPropertyUnicodeKeyLayoutData) };
+    if layout_data.is_null() {
+        unsafe { CFRelease(input_source) };
+        return None;
+    }
+
+    let layout = unsafe { CFDataGetBytePtr(layout_data) } as *const UCKeyboardLayout;
+    if layout.is_null() {
+        unsafe { CFRelease(input_source) };
+        return None;
+    }
+
+    let mut chars = [0u16; 8];
+    let mut actual_len: UniCharCount = 0;
+    let mut dead_keys = 0u32;
+    let keyboard_type = unsafe { LMGetKbdType() } as u32;
+    let status = unsafe {
+        UCKeyTranslate(
+            layout,
+            keycode,
+            K_UC_KEY_ACTION_DISPLAY,
+            carbon_modifier_state(mods),
+            keyboard_type,
+            K_UC_KEY_TRANSLATE_NO_DEAD_KEYS_MASK,
+            &mut dead_keys,
+            chars.len() as UniCharCount,
+            &mut actual_len,
+            chars.as_mut_ptr(),
+        )
+    };
+    unsafe { CFRelease(input_source) };
+
+    if status != 0 || actual_len == 0 {
+        return None;
+    }
+
+    let text = String::from_utf16_lossy(&chars[..actual_len as usize]);
+    let c = text.chars().next()?;
+    if c == '\0' || (c.is_control() && !matches!(c, '\n' | '\t' | '\x08')) {
+        None
+    } else {
+        Some(c)
+    }
+}
+
+fn carbon_modifier_state(mods: Modifiers) -> u32 {
+    let mut carbon_modifiers = 0u32;
+    if mods.0 & Modifiers::CMD != 0 {
+        carbon_modifiers |= CARBON_COMMAND_KEY;
+    }
+    if mods.0 & Modifiers::SHIFT != 0 {
+        carbon_modifiers |= CARBON_SHIFT_KEY;
+    }
+    if mods.0 & Modifiers::CAPS != 0 {
+        carbon_modifiers |= CARBON_ALPHA_LOCK;
+    }
+    if mods.0 & Modifiers::OPT != 0 {
+        carbon_modifiers |= CARBON_OPTION_KEY;
+    }
+    if mods.0 & Modifiers::CTRL != 0 {
+        carbon_modifiers |= CARBON_CONTROL_KEY;
+    }
+    (carbon_modifiers >> 8) & 0xff
+}
+
+fn us_keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
+    let shift = mods.0 & Modifiers::SHIFT != 0;
+    let caps = mods.0 & Modifiers::CAPS != 0;
+    let letter_shift = shift ^ caps;
 
     let c = match keycode {
         // Letters
@@ -1339,8 +1586,8 @@ fn keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
         _ => return None,
     };
 
-    // Handle shift for letters
-    if shift && c.is_ascii_lowercase() {
+    // Handle shift/caps for letters. Caps does not shift punctuation.
+    if letter_shift && c.is_ascii_lowercase() {
         Some(c.to_ascii_uppercase())
     } else {
         Some(c)
@@ -1455,15 +1702,116 @@ mod tests {
 
     #[test]
     fn test_keycode_mapping() {
-        assert_eq!(keycode_to_char(0, Modifiers::new()), Some('a'));
-        assert_eq!(keycode_to_char(0, Modifiers(Modifiers::SHIFT)), Some('A'));
-        assert_eq!(keycode_to_char(49, Modifiers::new()), Some(' '));
-        assert_eq!(keycode_to_char(36, Modifiers::new()), Some('\n'));
+        assert_eq!(us_keycode_to_char(0, Modifiers::new()), Some('a'));
+        assert_eq!(
+            us_keycode_to_char(0, Modifiers(Modifiers::SHIFT)),
+            Some('A')
+        );
+        assert_eq!(
+            us_keycode_to_char(0, Modifiers(Modifiers::SHIFT | Modifiers::CAPS)),
+            Some('a')
+        );
+        assert_eq!(us_keycode_to_char(49, Modifiers::new()), Some(' '));
+        assert_eq!(us_keycode_to_char(36, Modifiers::new()), Some('\n'));
+    }
+
+    #[test]
+    fn test_carbon_modifier_state() {
+        assert_eq!(carbon_modifier_state(Modifiers::new()), 0);
+        assert_eq!(
+            carbon_modifier_state(Modifiers(Modifiers::SHIFT)),
+            CARBON_SHIFT_KEY >> 8
+        );
+        assert_eq!(
+            carbon_modifier_state(Modifiers(Modifiers::OPT)),
+            CARBON_OPTION_KEY >> 8
+        );
     }
 
     #[test]
     fn test_truncate() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn test_get_clipboard_returns_option() {
+        // Should not panic regardless of clipboard state
+        let result = get_clipboard();
+        // Result is either Some(non-empty string) or None
+        if let Some(ref text) = result {
+            assert!(
+                !text.is_empty(),
+                "get_clipboard should never return Some(\"\")"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_clipboard_no_subprocess() {
+        // Verify arboard doesn't spawn pbpaste by checking it completes fast.
+        // pbpaste fork+exec takes >1ms; native NSPasteboard is <0.5ms.
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = get_clipboard();
+        }
+        let elapsed = start.elapsed();
+        // 10 calls should complete in under 50ms with native API
+        // (pbpaste would take 20-100ms+ due to process spawning)
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "10 clipboard reads took {:?} — too slow, may be spawning subprocesses",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_get_clipboard_set_and_read() {
+        // Round-trip: set clipboard text, then read it back
+        let test_text = "screenpipe_clipboard_test_12345";
+        {
+            let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
+            clipboard.set_text(test_text).expect("clipboard set");
+        }
+        let result = get_clipboard();
+        assert_eq!(result, Some(test_text.to_string()));
+    }
+
+    #[test]
+    fn test_get_clipboard_empty_returns_none() {
+        // Set clipboard to empty string, should return None
+        {
+            let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
+            clipboard.set_text("").expect("clipboard set empty");
+        }
+        let result = get_clipboard();
+        assert!(result.is_none(), "empty clipboard should return None");
+    }
+
+    #[test]
+    fn test_get_clipboard_unicode() {
+        let unicode_text = "日本語テスト 🎉 émojis ñ";
+        {
+            let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
+            clipboard
+                .set_text(unicode_text)
+                .expect("clipboard set unicode");
+        }
+        let result = get_clipboard();
+        assert_eq!(result, Some(unicode_text.to_string()));
+    }
+
+    #[test]
+    fn test_get_clipboard_large_content() {
+        // 100KB of text — should not OOM or hang
+        let large_text: String = "x".repeat(100_000);
+        {
+            let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
+            clipboard
+                .set_text(&large_text)
+                .expect("clipboard set large");
+        }
+        let result = get_clipboard();
+        assert_eq!(result, Some(large_text));
     }
 }

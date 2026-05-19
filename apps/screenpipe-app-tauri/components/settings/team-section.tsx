@@ -51,8 +51,9 @@ export function TeamSection() {
   const [joining, setJoining] = useState(false);
   const [showJoinInput, setShowJoinInput] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [inviteEmail, setInviteEmail] = useState("");
-  const [sendingInvite, setSendingInvite] = useState(false);
+  const [refreshingInvite, setRefreshingInvite] = useState(false);
+  const [initializingTeamKey, setInitializingTeamKey] = useState(false);
+  const [togglingAutoJoin, setTogglingAutoJoin] = useState(false);
   const [passphraseInput, setPassphraseInput] = useState("");
   const [pendingJoin, setPendingJoin] = useState<{
     teamId: string;
@@ -98,10 +99,22 @@ export function TeamSection() {
               const teamId = parsed.searchParams.get("team_id");
               const inviteToken = parsed.searchParams.get("invite_token");
               const claimToken = parsed.searchParams.get("claim");
-              const legacyKey = parsed.searchParams.get("key");
+              const base64Key = parsed.searchParams.get("key");
 
-              if (teamId && claimToken) {
-                // new secure flow: need passphrase from user
+              if (teamId && base64Key && !claimToken) {
+                // new direct key flow (from web invite link)
+                setJoining(true);
+                await team.joinTeam(teamId, {
+                  base64Key: decodeURIComponent(base64Key),
+                  inviteToken: inviteToken ? decodeURIComponent(inviteToken) : undefined,
+                });
+                posthog.capture("team_joined", { source: "web_invite" });
+                toast({
+                  title: "joined team!",
+                  description: "you are now a team member",
+                });
+              } else if (teamId && claimToken) {
+                // passphrase flow (backwards compat)
                 setPendingJoin({
                   teamId,
                   claimToken: decodeURIComponent(claimToken),
@@ -111,11 +124,11 @@ export function TeamSection() {
                   title: "enter passphrase to join team",
                   description: "ask the admin for the passphrase they received when creating the invite",
                 });
-              } else if (teamId && legacyKey) {
+              } else if (teamId && base64Key) {
                 // legacy flow: raw key in URL (old invite links)
                 setJoining(true);
                 await team.joinTeam(teamId, {
-                  legacyBase64Key: decodeURIComponent(legacyKey),
+                  legacyBase64Key: decodeURIComponent(base64Key),
                   inviteToken: inviteToken ? decodeURIComponent(inviteToken) : undefined,
                 });
                 posthog.capture("team_joined", { source: "deep_link_legacy" });
@@ -167,16 +180,52 @@ export function TeamSection() {
   const handleJoinFromLink = async () => {
     if (!inviteInput.trim()) return;
     try {
-      const parsed = new URL(inviteInput.trim());
-      const teamId = parsed.searchParams.get("team_id");
-      const inviteToken = parsed.searchParams.get("invite_token");
-      const claimToken = parsed.searchParams.get("claim");
-      const legacyKey = parsed.searchParams.get("key");
+      const input = inviteInput.trim();
+      let teamId: string | null = null;
+      let inviteToken: string | null = null;
+      let claimToken: string | null = null;
+      let base64Key: string | null = null;
+
+      // Handle web URL format: https://screenpi.pe/join/TOKEN#key=BASE64
+      const webMatch = input.match(/screenpi\.pe\/join\/([^#?]+)/);
+      if (webMatch) {
+        inviteToken = webMatch[1];
+        const hash = input.split("#")[1] || "";
+        const hashParams = new URLSearchParams(hash);
+        base64Key = hashParams.get("key");
+        claimToken = hashParams.get("claim");
+
+        // Fetch team_id from server
+        const infoRes = await fetch(`https://screenpi.pe/api/team/join/info?token=${encodeURIComponent(inviteToken)}`);
+        if (!infoRes.ok) throw new Error("invalid or expired invite link");
+        const info = await infoRes.json();
+        if (info.expired) throw new Error("invite link expired");
+        if (info.used) throw new Error("invite link already used");
+        teamId = info.team_id;
+      } else {
+        // Legacy format: screenpipe://join-team?team_id=X&invite_token=Y&key=Z
+        const parsed = new URL(input);
+        teamId = parsed.searchParams.get("team_id");
+        inviteToken = parsed.searchParams.get("invite_token");
+        claimToken = parsed.searchParams.get("claim");
+        base64Key = parsed.searchParams.get("key");
+      }
 
       if (!teamId) throw new Error("invalid invite link — missing team_id");
 
-      if (claimToken) {
-        // new secure flow: prompt for passphrase
+      if (base64Key && !claimToken) {
+        // new direct key flow
+        setJoining(true);
+        await team.joinTeam(teamId, {
+          base64Key: decodeURIComponent(base64Key),
+          inviteToken: inviteToken ? decodeURIComponent(inviteToken) : undefined,
+        });
+        posthog.capture("team_joined", { source: "web_invite_pasted" });
+        setInviteInput("");
+        setShowJoinInput(false);
+        toast({ title: "joined team!" });
+      } else if (claimToken) {
+        // passphrase flow (backwards compat)
         setPendingJoin({
           teamId,
           claimToken: decodeURIComponent(claimToken),
@@ -184,19 +233,8 @@ export function TeamSection() {
         });
         setInviteInput("");
         setShowJoinInput(false);
-      } else if (legacyKey) {
-        // legacy flow: raw key in URL
-        setJoining(true);
-        await team.joinTeam(teamId, {
-          legacyBase64Key: decodeURIComponent(legacyKey),
-          inviteToken: inviteToken ? decodeURIComponent(inviteToken) : undefined,
-        });
-        posthog.capture("team_joined", { source: "invite_link_legacy" });
-        setInviteInput("");
-        setShowJoinInput(false);
-        toast({ title: "joined team!" });
       } else {
-        throw new Error("invalid invite link — missing claim or key parameter");
+        throw new Error("this invite link is missing the encryption key. ask your admin to copy the secure invite link from screenpipe desktop settings and send it directly.");
       }
     } catch (err: any) {
       toast({
@@ -242,6 +280,26 @@ export function TeamSection() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleInitializeTeamKey = async () => {
+    setInitializingTeamKey(true);
+    try {
+      await team.initializeTeamKey();
+      posthog.capture("team_secure_sharing_initialized");
+      toast({
+        title: "secure sharing initialized",
+        description: "you can now copy a secure invite link for teammates",
+      });
+    } catch (err: any) {
+      toast({
+        title: "failed to initialize secure sharing",
+        description: err.message,
+        variant: "destructive",
+      });
+    } finally {
+      setInitializingTeamKey(false);
+    }
+  };
+
   const handleRemoveMember = async (userId: string) => {
     try {
       await team.removeMember(userId);
@@ -271,25 +329,20 @@ export function TeamSection() {
     }
   };
 
-  const handleSendInvite = async () => {
-    if (!inviteEmail.trim()) return;
-    setSendingInvite(true);
+  const handleRefreshInvite = async () => {
+    setRefreshingInvite(true);
     try {
-      await team.sendInviteEmail(inviteEmail.trim());
-      posthog.capture("team_invite_email_sent");
-      setInviteEmail("");
-      toast({
-        title: "invite sent",
-        description: `email sent to ${inviteEmail.trim()} — share the invite link (with key) via a secure channel`,
-      });
+      await team.refreshInviteLink();
+      posthog.capture("team_invite_regenerated");
+      toast({ title: "new invite link generated" });
     } catch (err: any) {
       toast({
-        title: "failed to send invite",
+        title: "failed to generate invite link",
         description: err.message,
         variant: "destructive",
       });
     } finally {
-      setSendingInvite(false);
+      setRefreshingInvite(false);
     }
   };
 
@@ -312,10 +365,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             manage your team and share pipe configurations and content filters
           </p>
         </div>
@@ -344,10 +394,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">loading...</p>
+          <p className="text-sm text-muted-foreground">loading...</p>
         </div>
         <Skeleton className="h-32 w-full" />
         <Skeleton className="h-24 w-full" />
@@ -360,10 +407,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Join Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             enter the passphrase from your team admin to complete joining
           </p>
         </div>
@@ -419,10 +463,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             share pipe configurations and content filters with your team using end-to-end encryption
           </p>
         </div>
@@ -464,7 +505,7 @@ export function TeamSection() {
           {showJoinInput ? (
             <div className="flex gap-2">
               <Input
-                placeholder="screenpipe://join-team?team_id=...&claim=..."
+                placeholder="paste invite link (https://screenpi.pe/join/... or screenpipe://...)"
                 value={inviteInput}
                 onChange={(e) => setInviteInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleJoinFromLink()}
@@ -513,16 +554,15 @@ export function TeamSection() {
   const windowFilterConfigs = team.configs.filter((c) => c.config_type === "window_filter" && c.scope === "team");
   const urlFilterConfigs = team.configs.filter((c) => c.config_type === "url_filter" && c.scope === "team");
   const totalSharedConfigs = pipeConfigs.length + windowFilterConfigs.length + urlFilterConfigs.length;
+  const canInitializeSecureSharing =
+    isAdmin && team.missingKey && team.configs.length === 0;
 
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             {team.team.name}
           </p>
         </div>
@@ -531,12 +571,65 @@ export function TeamSection() {
             <Shield className="h-3 w-3 mr-1" />
             {team.role}
           </Badge>
-          <Badge variant="outline" className="text-xs">
-            <Lock className="h-3 w-3 mr-1" />
-            e2e encrypted
-          </Badge>
+          {team.missingKey ? (
+            <Badge variant="outline" className="text-xs text-yellow-700 border-yellow-500/50">
+              <AlertTriangle className="h-3 w-3 mr-1" />
+              secure sharing pending
+            </Badge>
+          ) : (
+            <Badge variant="outline" className="text-xs">
+              <Lock className="h-3 w-3 mr-1" />
+              e2e encrypted
+            </Badge>
+          )}
         </div>
       </div>
+
+      {/* Missing encryption key — need invite link to sync */}
+      {team.missingKey && (
+        <Card className="p-4 border-yellow-500/50 bg-yellow-500/5">
+          <div className="flex items-center gap-2 mb-2">
+            <Lock className="h-4 w-4 text-yellow-600" />
+            <h3 className="text-sm font-medium text-yellow-600">
+              secure team sharing is not ready on this device
+            </h3>
+          </div>
+          <p className="text-xs text-muted-foreground mb-3">
+            {canInitializeSecureSharing
+              ? "the team exists, but this desktop app has not initialized the secure sharing key yet."
+              : isAdmin
+                ? "this team may already have a secure sharing key on another admin device. paste that secure invite link to sync it here."
+                : "your seat is active, but this desktop app still needs the secure invite link from an admin."}
+          </p>
+          {canInitializeSecureSharing && (
+            <Button
+              size="sm"
+              onClick={handleInitializeTeamKey}
+              disabled={initializingTeamKey}
+              className="mb-3"
+            >
+              {initializingTeamKey ? (
+                <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
+              ) : (
+                <Lock className="h-3 w-3 mr-1.5" />
+              )}
+              initialize secure sharing
+            </Button>
+          )}
+          <div className="flex items-center gap-2">
+            <Input
+              placeholder="paste secure invite link"
+              value={inviteInput}
+              onChange={(e) => setInviteInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleJoinFromLink()}
+              className="h-8 text-xs font-mono"
+            />
+            <Button size="sm" onClick={handleJoinFromLink} disabled={joining || !inviteInput.trim()}>
+              {joining ? <Loader2 className="h-3 w-3 animate-spin" /> : "sync key"}
+            </Button>
+          </div>
+        </Card>
+      )}
 
       {/* Invite link (admin only) */}
       {isAdmin && team.inviteLink && (
@@ -544,11 +637,23 @@ export function TeamSection() {
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-sm font-medium flex items-center gap-1.5">
               <UserPlus className="h-4 w-4" />
-              invite link
+              secure invite link
             </h3>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={handleRefreshInvite}
+              disabled={refreshingInvite}
+            >
+              {refreshingInvite ? (
+                <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
+              ) : null}
+              new link
+            </Button>
           </div>
           <p className="text-xs text-muted-foreground mb-2">
-            share this link with your teammate — it does not contain the encryption key
+            share this one-use link directly with a teammate. it includes the encrypted team key in the URL fragment, which never reaches the server.
           </p>
           <div className="flex gap-2 items-stretch">
             <Input
@@ -564,65 +669,96 @@ export function TeamSection() {
               )}
             </Button>
           </div>
-          {team.invitePassphrase && (
-            <div className="mt-3 p-3 rounded-md bg-muted/50 border">
-              <p className="text-xs font-medium mb-1 flex items-center gap-1">
-                <Lock className="h-3 w-3" />
-                passphrase (share separately — verbally or via secure channel)
-              </p>
-              <div className="flex items-center gap-2">
-                <code className="text-lg font-bold tracking-widest select-all">
-                  {team.invitePassphrase}
-                </code>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7"
-                  onClick={async () => {
-                    await navigator.clipboard.writeText(team.invitePassphrase!);
-                    toast({ title: "passphrase copied" });
-                  }}
-                >
-                  <Copy className="h-3 w-3" />
-                </Button>
-              </div>
-              <p className="text-[10px] text-muted-foreground mt-1">
-                your teammate will need this to decrypt the team encryption key
-              </p>
-            </div>
-          )}
         </Card>
       )}
 
-      {/* Email invite (admin only) */}
+      {/* Email invite note (admin only) */}
       {isAdmin && team.inviteLink && (
+        <Card className="p-4 border-amber-500/40 bg-amber-500/5">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="h-4 w-4 text-amber-600 mt-0.5" />
+            <div>
+              <h3 className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                email invites are disabled for encrypted teams
+              </h3>
+              <p className="text-xs text-muted-foreground mt-1">
+                a server-sent email cannot include the encryption key because that key only exists in your desktop app. copy the secure invite link above and send it directly.
+              </p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Auto-join by domain (admin only) */}
+      {isAdmin && (
         <Card className="p-4">
-          <h3 className="text-sm font-medium mb-2 flex items-center gap-1.5">
-            <UserPlus className="h-4 w-4" />
-            invite by email
-          </h3>
-          <div className="flex gap-2 items-stretch">
-            <Input
-              type="email"
-              placeholder="colleague@company.com"
-              value={inviteEmail}
-              onChange={(e) => setInviteEmail(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSendInvite()}
-              className="text-xs"
-            />
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-medium flex items-center gap-1.5">
+                <Globe className="h-4 w-4" />
+                auto-join by email domain
+              </h3>
+              <p className="text-xs text-muted-foreground mt-1">
+                {team.team?.auto_join_domain
+                  ? `anyone signing up with @${team.team.auto_join_domain} auto-joins this team`
+                  : "new users with your company email domain will auto-join this team"}
+              </p>
+            </div>
             <Button
-              variant="outline"
-              className="h-auto px-4 whitespace-nowrap"
-              onClick={handleSendInvite}
-              disabled={sendingInvite || !inviteEmail.trim()}
+              variant={team.team?.auto_join_domain ? "destructive" : "outline"}
+              size="sm"
+              className="text-xs whitespace-nowrap"
+              disabled={togglingAutoJoin}
+              onClick={async () => {
+                setTogglingAutoJoin(true);
+                try {
+                  const userEmail = settings.user?.email || "";
+                  const userDomain = userEmail.split("@")[1]?.toLowerCase();
+                  const isEnabled = !!team.team?.auto_join_domain;
+                  const newDomain = isEnabled ? null : userDomain;
+
+                  if (!isEnabled && !userDomain) {
+                    toast({ title: "could not detect your email domain", variant: "destructive" });
+                    return;
+                  }
+
+                  const token = settings.user?.token;
+                  const res = await fetch("https://screenpi.pe/api/team", {
+                    method: "PATCH",
+                    headers: {
+                      "Content-Type": "application/json",
+                      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                    },
+                    body: JSON.stringify({ auto_join_domain: newDomain }),
+                  });
+
+                  const data = await res.json();
+                  if (!res.ok) {
+                    toast({ title: data.error || "failed to update", variant: "destructive" });
+                    return;
+                  }
+
+                  if (data.retro_added > 0) {
+                    toast({ title: `auto-join enabled — ${data.retro_added} existing user(s) added to team` });
+                  } else {
+                    toast({ title: isEnabled ? "auto-join disabled" : "auto-join enabled" });
+                  }
+
+                  // Refresh team data
+                  team.fetchTeam();
+                } catch (e: any) {
+                  toast({ title: "failed to update", description: e.message, variant: "destructive" });
+                } finally {
+                  setTogglingAutoJoin(false);
+                }
+              }}
             >
-              {sendingInvite ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-                  sending...
-                </>
+              {togglingAutoJoin ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : team.team?.auto_join_domain ? (
+                "disable"
               ) : (
-                "send invite"
+                "enable"
               )}
             </Button>
           </div>
@@ -642,8 +778,10 @@ export function TeamSection() {
               className="flex items-center justify-between py-1.5 px-2 rounded-md hover:bg-muted/50"
             >
               <div className="flex items-center gap-2">
-                <span className="text-sm font-mono truncate max-w-[180px]">
-                  {m.user_id === settings.user?.id ? "you" : m.user_id}
+                <span className="text-sm truncate max-w-[180px]">
+                  {m.user_id === settings.user?.id
+                    ? (settings.user?.name || "you")
+                    : (m.name || m.email?.split("@")[0] || m.user_id.slice(0, 8) + "…")}
                 </span>
                 <Badge variant="outline" className="text-[10px]">
                   {m.role}

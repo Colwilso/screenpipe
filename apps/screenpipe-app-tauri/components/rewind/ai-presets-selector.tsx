@@ -4,7 +4,6 @@
 
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useMemo, useState, useEffect, useCallback } from "react";
-import { open as openUrl } from "@tauri-apps/plugin-shell";
 import {
   Command,
   CommandEmpty,
@@ -52,12 +51,21 @@ import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { AIPreset, commands } from "@/lib/utils/tauri";
+import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
+import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
+import {
+  DEFAULT_ENTERPRISE_AI_PRESET_POLICY,
+  filterPresetsForEnterprisePolicy,
+  isEnterpriseManagedPreset,
+} from "@/lib/enterprise-ai-preset-policy";
 
 // Helper to detect UUID-like strings and format preset names nicely
 const formatPresetName = (name: string): string => {
@@ -103,6 +111,159 @@ type RecommendedPreset = BaseRecommendedPreset &
       }
   );
 
+interface BedrockModelItem { id: string; name: string }
+
+const MODELS_PER_PROVIDER = 5;
+
+const PROVIDER_ORDER = ["anthropic", "amazon", "meta", "mistral", "deepseek", "cohere", "openai", "google", "writer"];
+
+function groupBedrockModels(models: BedrockModelItem[], filter: string): Map<string, BedrockModelItem[]> {
+  const raw = new Map<string, BedrockModelItem[]>();
+  const lowerFilter = filter.toLowerCase().trim();
+
+  const filtered = lowerFilter
+    ? models.filter((m) => m.name.toLowerCase().includes(lowerFilter) || m.id.toLowerCase().includes(lowerFilter))
+    : models;
+
+  for (const m of filtered) {
+    const parts = m.id.replace(/^(us|global)\./, "").split(".");
+    const provider = parts[0] || "other";
+    if (!raw.has(provider)) raw.set(provider, []);
+    raw.get(provider)!.push(m);
+  }
+
+  if (!lowerFilter) {
+    for (const [key, items] of raw) {
+      raw.set(key, items.slice(0, MODELS_PER_PROVIDER));
+    }
+  }
+
+  const ordered = new Map<string, BedrockModelItem[]>();
+  for (const p of PROVIDER_ORDER) {
+    if (raw.has(p)) {
+      ordered.set(p, raw.get(p)!);
+      raw.delete(p);
+    }
+  }
+  for (const [p, items] of raw) {
+    ordered.set(p, items);
+  }
+
+  return ordered;
+}
+
+function BedrockFields({ formData, setFormData }: { formData: any; setFormData: (fn: any) => void }) {
+  const [bedrockModels, setBedrockModels] = useState<BedrockModelItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [modelSearch, setModelSearch] = useState("");
+
+  const fetchBedrockModels = useCallback(async () => {
+    if (!formData.awsRegion?.trim()) return;
+    setLoading(true);
+    setFetchError(null);
+    try {
+      const result = await commands.bedrockListModels(
+        formData.awsProfile || null,
+        formData.awsRegion || null,
+      );
+      if (result.status === "ok" && result.data.length > 0) {
+        setBedrockModels(result.data.map((m) => ({ id: m.id, name: m.name })));
+      } else {
+        setBedrockModels([]);
+        setFetchError(result.status === "error" ? String(result.error) : "No models found. Check your AWS profile and region.");
+      }
+    } catch (e) {
+      setBedrockModels([]);
+      setFetchError(String(e));
+    }
+    setLoading(false);
+  }, [formData.awsProfile, formData.awsRegion]);
+
+  const groupedModels = useMemo(() => groupBedrockModels(bedrockModels, modelSearch), [bedrockModels, modelSearch]);
+
+  return (
+    <div className="space-y-1">
+      <div className="space-y-1">
+        <Label htmlFor="awsProfile" className="text-xs">aws profile</Label>
+        <Input
+          id="awsProfile"
+          type="text"
+          placeholder="default"
+          value={formData.awsProfile || ""}
+          onChange={(e) => setFormData((prev: any) => ({ ...prev, awsProfile: e.target.value }))}
+          className="h-8 text-sm"
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
+        />
+      </div>
+      <div className="space-y-1">
+        <Label htmlFor="awsRegion" className="text-xs">aws region</Label>
+        <Input
+          id="awsRegion"
+          type="text"
+          placeholder="us-east-1"
+          value={formData.awsRegion || ""}
+          onChange={(e) => setFormData((prev: any) => ({ ...prev, awsRegion: e.target.value }))}
+          onBlur={() => fetchBedrockModels()}
+          className="h-8 text-sm"
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
+        />
+      </div>
+      <div className="space-y-1">
+        <div className="flex items-center justify-between">
+          <Label htmlFor="model" className="text-xs">model</Label>
+          <button
+            type="button"
+            className="text-xs text-muted-foreground hover:text-foreground underline"
+            onClick={() => fetchBedrockModels()}
+            disabled={loading}
+          >
+            {loading ? "loading..." : "fetch models"}
+          </button>
+        </div>
+        {fetchError && !loading && (
+          <p className="text-xs text-destructive">{fetchError}</p>
+        )}
+        {bedrockModels.length > 0 && (
+          <Input
+            type="text"
+            placeholder="search models..."
+            value={modelSearch}
+            onChange={(e) => setModelSearch(e.target.value)}
+            className="h-7 text-xs"
+            spellCheck={false}
+          />
+        )}
+        <Select
+          value={formData.model}
+          onValueChange={(value) => setFormData((prev: any) => ({ ...prev, model: value }))}
+          disabled={bedrockModels.length === 0 && !loading}
+        >
+          <SelectTrigger className="h-8 text-sm">
+            <SelectValue placeholder={loading ? "loading models..." : bedrockModels.length === 0 ? "enter profile + region, then fetch models" : "select model"} />
+          </SelectTrigger>
+          <SelectContent>
+            {Array.from(groupedModels.entries()).map(([provider, models]) => (
+              <SelectGroup key={provider}>
+                <SelectLabel className="text-xs font-semibold capitalize bg-muted/50 sticky top-0 py-1.5 pl-3 pr-2 -mx-1 rounded-sm">{provider}</SelectLabel>
+                {models.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    {m.name}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
+}
+
 interface AIProviderConfigProps {
   onSubmit: (data: AIPreset) => void;
   defaultPreset?: AIPreset;
@@ -115,15 +276,15 @@ interface OpenAIModel {
 }
 
 export const DEFAULT_PROMPT = `Rules:
-- You can analyze/view/show/access videos to the user by putting .mp4 files in a code block (we'll render it) like this: \`/users/video.mp4\`, use the exact, absolute, file path from file_path property
-- Do not try to embed video in links (e.g. [](.mp4) or https://.mp4) instead put the file_path in a code block using backticks
-- Do not put video in multiline code block it will not render the video (e.g. \`\`\`bash\n.mp4\`\`\` IS WRONG) instead using inline code block with single backtick
+- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
+- Use the exact absolute file_path from search results, do not modify it
 - Always answer my question/intent, do not make up things
 `;
 
 function ChatGptSignInButton() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [loading, setLoading] = useState(false);
+  const { settings, updateSettings } = useSettings();
 
   useEffect(() => {
     commands.chatgptOauthStatus().then((res) => {
@@ -147,7 +308,14 @@ function ChatGptSignInButton() {
           setLoading(true);
           try {
             const res = await commands.chatgptOauthLogin();
-            if (res.status === "ok" && res.data) setLoggedIn(true);
+            if (res.status === "ok" && res.data) {
+              setLoggedIn(true);
+              // auto-create a ChatGPT preset on first connection
+              await ensureChatGptPreset(
+                settings.aiPresets || [],
+                (presets) => updateSettings({ aiPresets: presets })
+              );
+            }
           } catch (e) {
             console.error("chatgpt oauth failed:", e);
           }
@@ -181,7 +349,39 @@ export function AIProviderConfig({
   const [isLoadingModels, setIsLoadingModels] = useState(false);
   const [idError, setIdError] = useState<string | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
+  const { isEnterprise, policy: enterprisePolicy } = useEnterprisePolicy();
+  const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
   const [piAvailable, setPiAvailable] = useState(false);
+  const [piModels, setPiModels] = useState<{ id: string; name: string; free?: boolean; cost_tier?: string; recommended_for?: string[]; warning?: string; health?: { status: string; error_rate_5m: number } }[]>([]);
+
+  // Fetch PI models from gateway (single source of truth)
+  useEffect(() => {
+    if (selectedProvider !== "screenpipe-cloud") return;
+    const fetchPiModels = async () => {
+      try {
+        const token = settings?.user?.token || "";
+        const resp = await fetch("https://api.screenpi.pe/v1/models", {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          const models = (data.data || []).map((m: any) => ({
+            id: m.id,
+            name: m.name || m.id,
+            free: m.free,
+            cost_tier: m.cost_tier,
+            recommended_for: m.recommended_for,
+            warning: m.warning,
+            health: m.health,
+          }));
+          setPiModels(models);
+        }
+      } catch {
+        // gateway down — model list stays empty, user sees empty dropdown
+      }
+    };
+    fetchPiModels();
+  }, [selectedProvider, settings?.user?.token]);
 
   // Check Pi availability (installed at app startup by Rust background thread)
   useEffect(() => {
@@ -195,11 +395,17 @@ export function AIProviderConfig({
         console.error("Failed to check pi:", e);
       }
     };
-    checkPi();
+    if (isEnterprise) {
+      setPiAvailable(aiPresetPolicy.allow_screenpipe_cloud);
+      return;
+    }
+    if (!isEnterprise) {
+      checkPi();
+    }
     // Re-check periodically in case background install finishes
-    const interval = setInterval(checkPi, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    const interval = isEnterprise ? null : setInterval(checkPi, 5000);
+    return () => { if (interval) clearInterval(interval); };
+  }, [isEnterprise, aiPresetPolicy.allow_screenpipe_cloud]);
   const [formData, setFormData] = useState<AIPreset>({
     provider: defaultPreset?.provider || "openai",
     apiKey: defaultPreset?.apiKey || "",
@@ -209,7 +415,11 @@ export function AIProviderConfig({
     prompt: defaultPreset?.prompt || DEFAULT_PROMPT,
     id: defaultPreset?.id || "",
     defaultPreset: defaultPreset?.defaultPreset || false,
-  });
+    ...(defaultPreset?.provider === "bedrock" ? {
+      awsProfile: (defaultPreset as any).awsProfile || null,
+      awsRegion: (defaultPreset as any).awsRegion || null,
+    } : {}),
+  } as any);
 
   const validateId = (id: string | undefined): boolean => {
     if (!id?.trim()) {
@@ -292,12 +502,46 @@ export function AIProviderConfig({
   useEffect(() => {
     setOpenAIModels([]);
     if (selectedProvider === "openai" && formData.apiKey) {
-      setOpenAIModels([
-        { id: "gpt-4" },
-        {
-          id: "gpt-3.5-turbo",
-        },
-      ]);
+      // Fetch the live model catalog from the user's OpenAI account so the
+      // dropdown reflects whatever they actually have access to (gpt-5*,
+      // gpt-4.1, o-series, etc). Fall back to a curated list when the
+      // request fails (offline / bad key) so the dropdown still has
+      // something usable instead of an empty menu.
+      (async () => {
+        setIsLoadingModels(true);
+        try {
+          const resp = await fetch("https://api.openai.com/v1/models", {
+            headers: {
+              Authorization: `Bearer ${formData.apiKey}`,
+              "Content-Type": "application/json",
+            },
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            if (data?.data?.length > 0) {
+              setOpenAIModels(data.data);
+              setIsLoadingModels(false);
+              return;
+            }
+          }
+        } catch {
+          /* fall through to fallback */
+        }
+        setOpenAIModels([
+          { id: "gpt-5" },
+          { id: "gpt-5-mini" },
+          { id: "gpt-5-nano" },
+          { id: "gpt-4.1" },
+          { id: "gpt-4.1-mini" },
+          { id: "gpt-4o" },
+          { id: "gpt-4o-mini" },
+          { id: "o3-mini" },
+          { id: "o1-mini" },
+          { id: "gpt-4" },
+          { id: "gpt-3.5-turbo" },
+        ]);
+        setIsLoadingModels(false);
+      })();
     } else if (selectedProvider === "native-ollama") {
       const baseUrl = "http://localhost:11434/v1";
       fetchOllamaModels(baseUrl);
@@ -361,19 +605,19 @@ export function AIProviderConfig({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   return (
-    <div className="w-full space-y-2 rounded-lg bg-card p-2.5">
+    <div className="w-full space-y-3 rounded-lg bg-card p-4">
       <div>
-        <h2 className="text-sm font-semibold">
+        <h2 className="text-base font-semibold">
           {defaultPreset?.id ? "edit ai provider" : "ai provider"}
         </h2>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-1.5">
-        <div className="space-y-0.5">
+      <form onSubmit={handleSubmit} className="space-y-3">
+        <div className="space-y-1">
           <Label htmlFor="name" className="flex items-center gap-2 text-xs">
             name
             {idError && (
-              <span className="text-[10px] text-destructive font-normal">
+              <span className="text-xs text-destructive font-normal">
                 {idError}
               </span>
             )}
@@ -385,34 +629,61 @@ export function AIProviderConfig({
             value={formData.id || undefined}
             onChange={(e) => handleIdChange(e.target.value)}
             className={cn(
-              "font-mono h-7 text-xs",
+              "font-mono h-8 text-sm",
               idError && "border-destructive focus-visible:ring-destructive",
             )}
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
+            spellCheck={false}
             disabled={
               Boolean(defaultPreset?.id) &&
-              !defaultPreset?.id?.endsWith("-copy")
+              settings.aiPresets.some((p) => p.id === defaultPreset?.id)
             }
           />
         </div>
 
         <div className={cn(
-          "grid gap-1",
-          piAvailable ? "grid-cols-5" : "grid-cols-4"
+          "grid gap-2",
+          piAvailable ? "grid-cols-3" : "grid-cols-4"
         )}>
+          {piAvailable && (
+            <Button
+              type="button"
+              disabled={!settings?.user?.token}
+              variant={selectedProvider === "screenpipe-cloud" ? "default" : "outline"}
+              className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+              onClick={() => {
+                setSelectedProvider("screenpipe-cloud");
+                setFormData({
+                  ...formData,
+                  provider: "screenpipe-cloud",
+                  url: "",
+                  model: "auto",
+                });
+              }}
+            >
+              <Icons.terminal className="h-3.5 w-3.5" />
+              <span>screenpipe cloud</span>
+            </Button>
+          )}
+
           <Button
             type="button"
-            variant={selectedProvider === "openai" ? "default" : "outline"}
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
-              setSelectedProvider("openai");
-              setFormData({ ...formData, provider: "openai" });
+              setSelectedProvider("openai-chatgpt");
+              setFormData({
+                ...formData,
+                provider: "openai-chatgpt",
+                url: "https://api.openai.com/v1",
+                model: "gpt-5.5",
+              });
             }}
           >
-            <Icons.openai className="h-3 w-3" />
-            <span>openai</span>
+            <Icons.openai className="h-3.5 w-3.5" />
+            <span>chatgpt</span>
           </Button>
 
           <Button
@@ -420,7 +691,7 @@ export function AIProviderConfig({
             variant={
               selectedProvider === "native-ollama" ? "default" : "outline"
             }
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
               setSelectedProvider("native-ollama");
               setFormData({
@@ -430,14 +701,14 @@ export function AIProviderConfig({
               });
             }}
           >
-            <Icons.terminal className="h-3 w-3" />
+            <Icons.terminal className="h-3.5 w-3.5" />
             <span>ollama</span>
           </Button>
 
           <Button
             type="button"
             variant={selectedProvider === "custom" ? "default" : "outline"}
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
               setSelectedProvider("custom");
               setFormData({
@@ -447,53 +718,54 @@ export function AIProviderConfig({
               });
             }}
           >
-            <Icons.settings className="h-3 w-3" />
+            <Icons.settings className="h-3.5 w-3.5" />
             <span>custom</span>
           </Button>
 
           <Button
             type="button"
-            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            variant={selectedProvider === "bedrock" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
-              setSelectedProvider("openai-chatgpt");
+              setSelectedProvider("bedrock");
               setFormData({
                 ...formData,
-                provider: "openai-chatgpt",
-                url: "https://api.openai.com/v1",
-                model: "gpt-4o",
+                provider: "bedrock",
+                url: "",
+                model: "",
               });
             }}
           >
-            <Icons.openai className="h-3 w-3" />
-            <span>chatgpt</span>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/images/bedrock-logo.png" alt="AWS Bedrock" className="h-3.5 w-3.5 rounded-sm" />
+            <span>bedrock</span>
           </Button>
 
-          {piAvailable && (
-            <Button
-              type="button"
-              disabled={!settings?.user?.token}
-              variant={selectedProvider === "pi" ? "default" : "outline"}
-              className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
-              onClick={() => {
-                setSelectedProvider("pi");
+          <Button
+            type="button"
+            variant={(selectedProvider as string) === "anthropic" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+            onClick={() => {
+              if ((selectedProvider as string) !== "anthropic") {
+                setSelectedProvider("anthropic");
                 setFormData({
                   ...formData,
-                  provider: "pi",
-                  url: "", // Pi uses RPC mode
-                  model: "claude-haiku-4-5",
+                  provider: "anthropic",
+                  url: "",
+                  model: "claude-sonnet-4-6",
                 });
-              }}
-            >
-              <Icons.terminal className="h-3 w-3" />
-              <span>pi</span>
-            </Button>
-          )}
+              }
+            }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/images/claude-ai.svg" alt="Claude API" className="h-3.5 w-3.5 rounded-sm" />
+            <span>claude api</span>
+          </Button>
         </div>
 
         {selectedProvider === "openai" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="apiKey" className="text-xs">api key</Label>
               <div className="relative">
                 <Input
@@ -504,7 +776,7 @@ export function AIProviderConfig({
                   onChange={(e) =>
                     setFormData({ ...formData, apiKey: e.target.value })
                   }
-                  className="pr-10 h-7 text-xs"
+                  className="pr-10 h-8 text-sm"
                 />
                 <Button
                   type="button"
@@ -521,7 +793,7 @@ export function AIProviderConfig({
                 </Button>
               </div>
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <Select
                 value={formData.model}
@@ -529,7 +801,7 @@ export function AIProviderConfig({
                   setFormData({ ...formData, model: value })
                 }
               >
-                <SelectTrigger className="h-7 text-xs">
+                <SelectTrigger className="h-8 text-sm">
                   <SelectValue
                     placeholder={
                       isLoadingModels ? "loading models..." : "select model"
@@ -556,7 +828,7 @@ export function AIProviderConfig({
 
         {selectedProvider === "native-ollama" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="baseUrl" className="text-xs">base url</Label>
               <Input
                 id="baseUrl"
@@ -566,22 +838,22 @@ export function AIProviderConfig({
                 onChange={(e) =>
                   setFormData({ ...formData, url: e.target.value })
                 }
-                className="h-7 text-xs"
+                className="h-8 text-sm"
               />
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <div className="relative">
                 <Input
                   id="model"
                   type="text"
                   list="ollama-models"
-                  placeholder={isLoadingModels ? "loading..." : "e.g. ministral-3:latest"}
+                  placeholder={isLoadingModels ? "loading..." : "e.g. qwen3.5:9b"}
                   value={formData.model || ""}
                   onChange={(e) =>
                     setFormData({ ...formData, model: e.target.value })
                   }
-                  className="h-7 text-xs"
+                  className="h-8 text-sm"
                 />
                 {openaiModels.length > 0 && (
                   <datalist id="ollama-models">
@@ -596,13 +868,16 @@ export function AIProviderConfig({
                   ollama not detected — type model name manually
                 </p>
               )}
+              <p className="text-[10px] text-muted-foreground">
+                recommended: qwen3.5:9b, glm-4.7:9b, qwen3.5:4b (tool calling). GPU required.
+              </p>
             </div>
           </div>
         )}
 
         {selectedProvider === "custom" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="baseUrl" className="text-xs">base url</Label>
               <Input
                 id="baseUrl"
@@ -612,10 +887,10 @@ export function AIProviderConfig({
                 onChange={(e) =>
                   setFormData({ ...formData, url: e.target.value })
                 }
-                className="h-7 text-xs"
+                className="h-8 text-sm"
               />
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="apiKey" className="text-xs">api key</Label>
               <div className="relative">
                 <Input
@@ -626,7 +901,7 @@ export function AIProviderConfig({
                   onChange={(e) =>
                     setFormData({ ...formData, apiKey: e.target.value })
                   }
-                  className="pr-10 h-7 text-xs"
+                  className="pr-10 h-8 text-sm"
                 />
                 <Button
                   type="button"
@@ -636,14 +911,14 @@ export function AIProviderConfig({
                   onClick={() => setShowApiKey(!showApiKey)}
                 >
                   {showApiKey ? (
-                    <EyeOff className="h-3 w-3" />
+                    <EyeOff className="h-3.5 w-3.5" />
                   ) : (
-                    <Eye className="h-3 w-3" />
+                    <Eye className="h-3.5 w-3.5" />
                   )}
                 </Button>
               </div>
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <div className="relative">
                 <Input
@@ -655,7 +930,7 @@ export function AIProviderConfig({
                   onChange={(e) =>
                     setFormData({ ...formData, model: e.target.value })
                   }
-                  className="h-7 text-xs"
+                  className="h-8 text-sm"
                 />
                 {openaiModels.length > 0 && (
                   <datalist id="custom-models">
@@ -671,22 +946,22 @@ export function AIProviderConfig({
 
         {selectedProvider === "openai-chatgpt" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label className="text-xs">chatgpt account</Label>
               <ChatGptSignInButton />
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <Input
                 id="model"
                 type="text"
                 list="chatgpt-models"
-                placeholder="gpt-4o"
+                placeholder="gpt-5.5"
                 value={formData.model || ""}
                 onChange={(e) =>
                   setFormData({ ...formData, model: e.target.value })
                 }
-                className="h-7 text-xs"
+                className="h-8 text-sm"
               />
               {openaiModels.length > 0 && (
                 <datalist id="chatgpt-models">
@@ -699,50 +974,103 @@ export function AIProviderConfig({
           </div>
         )}
 
-        {selectedProvider === "pi" && (
-          <div className="space-y-0.5">
+        {selectedProvider === "anthropic" && (
+          <div className="space-y-1">
+            {selectedProvider === "anthropic" && (
+              <div className="space-y-1 pt-1">
+                <Label htmlFor="anthropicApiKey" className="text-xs">api key</Label>
+                <div className="relative">
+                  <Input
+                    id="anthropicApiKey"
+                    type={showApiKey ? "text" : "password"}
+                    placeholder="sk-ant-..."
+                    value={formData.apiKey || ""}
+                    onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
+                    className="pr-10 h-8 text-sm"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-0 top-0 h-full px-2 py-1 hover:bg-transparent"
+                    onClick={() => setShowApiKey(!showApiKey)}
+                  >
+                    {showApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-1">
+              <Label htmlFor="model" className="text-xs">model</Label>
+              <Select
+                value={formData.model}
+                onValueChange={(value) => setFormData({ ...formData, model: value })}
+              >
+                <SelectTrigger className="h-8 text-sm">
+                  <SelectValue placeholder="select model" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="claude-opus-4-6">claude opus 4.6</SelectItem>
+                  <SelectItem value="claude-sonnet-4-6">claude sonnet 4.5</SelectItem>
+                  <SelectItem value="claude-haiku-4-5-20251001">claude haiku 4.5</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        )}
+
+        {selectedProvider === "bedrock" && (
+          <BedrockFields formData={formData} setFormData={setFormData} />
+        )}
+
+        {selectedProvider === "screenpipe-cloud" && (
+          <div className="space-y-1">
             <Label htmlFor="model" className="text-xs">model</Label>
             <Select
               value={formData.model}
               onValueChange={async (value) => {
-                if (value === "claude-opus-4-6" && !settings.user?.cloud_subscribed) {
-                  if (!settings.user?.token) {
-                    await commands.openLoginWindow();
-                  } else {
-                    try {
-                      const res = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.user.token}` },
-                        body: JSON.stringify({ tier: "pro", billingPeriod: "monthly", userId: settings.user.id, email: settings.user.email }),
-                      });
-                      const data = await res.json();
-                      if (data.url) await openUrl(data.url);
-                    } catch (e) {
-                      console.error("checkout failed:", e);
-                    }
-                  }
-                  return;
-                }
                 setFormData({ ...formData, model: value });
               }}
             >
-              <SelectTrigger className="h-7 text-xs">
+              <SelectTrigger className="h-8 text-sm">
                 <SelectValue placeholder="select model" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="claude-haiku-4-5">Haiku 4.5 (fast)</SelectItem>
-                <SelectItem value="claude-sonnet-4-5">Sonnet 4.5 (balanced)</SelectItem>
-                <SelectItem value="claude-opus-4-6">
-                  Opus 4.6 {settings.user?.cloud_subscribed ? "(powerful)" : "(pro)"}
-                </SelectItem>
+                {piModels.map((m) => {
+                  const costLabel = m.cost_tier === 'low' ? '$' : m.cost_tier === 'medium' ? '$$' : m.cost_tier === 'high' ? '$$$' : m.cost_tier === 'very_high' ? '$$$$' : '';
+                  return (
+                  <SelectItem key={m.id} value={m.id}>
+                    <span className="flex items-center gap-1.5">
+                      {m.health?.status === 'down' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" title="overloaded" />}
+                      {m.health?.status === 'degraded' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500" title="degraded" />}
+                      {m.name}{m.free ? " (free)" : ""}
+                      {costLabel && <span className="text-[9px] font-medium text-muted-foreground">{costLabel}</span>}
+                      {m.recommended_for?.includes('pipes') && <span className="text-[9px] text-muted-foreground bg-muted rounded px-1">pipes</span>}
+                      {m.health?.status === 'down' && <span className="text-[9px] text-red-400 ml-1">overloaded</span>}
+                    </span>
+                  </SelectItem>
+                  );
+                })}
               </SelectContent>
             </Select>
+            {(() => {
+              const selectedModel = piModels.find((m) => m.id === formData.model);
+              if (selectedModel?.warning) {
+                return (
+                  <p className="text-[10px] text-muted-foreground mt-1">
+                    ! {selectedModel.warning}
+                  </p>
+                );
+              }
+              return null;
+            })()}
           </div>
         )}
 
         <button
           type="button"
-          className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+          className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
           onClick={() => setShowAdvanced(!showAdvanced)}
         >
           <span>{showAdvanced ? "▾" : "▸"}</span>
@@ -751,8 +1079,9 @@ export function AIProviderConfig({
 
         {showAdvanced && (
           <div className="space-y-1.5">
-            <div className="space-y-0.5">
-              <Label htmlFor="maxTokens" className="text-[10px]">max output tokens</Label>
+            {selectedProvider !== "screenpipe-cloud" && (
+            <div className="space-y-1">
+              <Label htmlFor="maxTokens" className="text-xs">max output tokens</Label>
               <Input
                 id="maxTokens"
                 type="number"
@@ -766,8 +1095,9 @@ export function AIProviderConfig({
                 className="h-6 text-[10px]"
               />
             </div>
-            <div className="space-y-0.5">
-              <Label htmlFor="prompt" className="text-[10px]">prompt</Label>
+            )}
+            <div className="space-y-1">
+              <Label htmlFor="prompt" className="text-xs">prompt</Label>
               <Textarea
                 id="prompt"
                 value={formData.prompt || DEFAULT_PROMPT}
@@ -775,7 +1105,7 @@ export function AIProviderConfig({
                   setFormData({ ...formData, prompt: e.target.value })
                 }
                 placeholder="enter your custom prompt here"
-                className="min-h-[40px] max-h-[60px] text-[10px] resize-none"
+                className="min-h-[60px] max-h-[100px] text-xs resize-none"
               />
             </div>
           </div>
@@ -811,6 +1141,8 @@ interface AIPresetsSelectorProps {
   recommendedPresets?: RecommendedPreset[];
   shortcutKey?: string;
   onPresetChange?: (preset: AIPreset) => void;
+  /** Called when user saves a preset (explicit action) — use to restart Pi deterministically */
+  onPresetSaved?: (preset: AIPreset) => void;
   showLoginCta?: boolean;
   /** Controlled mode: override which preset id is shown as selected */
   controlledPresetId?: string | null;
@@ -822,6 +1154,12 @@ interface AIPresetsSelectorProps {
   noneLabel?: string;
   /** Compact size variant for inline usage */
   compact?: boolean;
+  /** Class applied to the outer selector wrapper. */
+  containerClassName?: string;
+  /** Class applied to the trigger button. */
+  triggerClassName?: string;
+  /** For tight composer UIs, show the active model instead of preset details. */
+  showModelOnly?: boolean;
 }
 
 export const AIPresetDialog = ({
@@ -839,16 +1177,28 @@ export const AIPresetDialog = ({
       model: providerData.model,  // Fixed: was providerData.modelName
       id: providerData.id,
       maxContextChars: providerData.maxContextChars,
-      maxTokens: (providerData as any).maxTokens ?? 4096,
       prompt: providerData.prompt,
     };
 
-    // Only add apiKey if provider is openai or custom
+    // Screenpipe Cloud: max output is defined per model in the gateway catalog (see screenpipe_cloud_models in Rust).
+    // Do not persist or override maxTokens from this dialog — avoids defaulting to 4096 and matches Settings.
+    if (providerData.provider !== "screenpipe-cloud") {
+      (newPreset as any).maxTokens = (providerData as any).maxTokens ?? 4096;
+    }
+
+    // Add apiKey for providers that require it
     if (
       providerData.provider === "openai" ||
-      providerData.provider === "custom"
+      providerData.provider === "custom" ||
+      providerData.provider === "anthropic"
     ) {
       (newPreset as any).apiKey = providerData.apiKey;
+    }
+
+    // Add AWS fields for Bedrock provider
+    if (providerData.provider === "bedrock") {
+      (newPreset as any).awsProfile = providerData.awsProfile || null;
+      (newPreset as any).awsRegion = providerData.awsRegion || null;
     }
 
     onSave(newPreset);
@@ -861,10 +1211,15 @@ export const AIPresetDialog = ({
         url: preset.url,
         model: preset.model,
         maxContextChars: preset.maxContextChars,
-        maxTokens: (preset as any).maxTokens ?? 4096,
+        ...(preset.provider !== "screenpipe-cloud"
+          ? { maxTokens: (preset as any).maxTokens ?? 4096 }
+          : {}),
         prompt: preset.prompt,
         defaultPreset: preset.defaultPreset,
         apiKey: preset.apiKey || null,
+        ...(preset.provider === "bedrock"
+          ? { awsProfile: (preset as any).awsProfile || null, awsRegion: (preset as any).awsRegion || null }
+          : {}),
       }
     : undefined;
 
@@ -895,12 +1250,16 @@ export const AIPresetsSelector = ({
   recommendedPresets,
   shortcutKey = "/",
   onPresetChange,
+  onPresetSaved,
   showLoginCta = true,
   controlledPresetId,
   onControlledSelect,
   allowNone = false,
   noneLabel = "none (use pipe defaults)",
   compact = false,
+  containerClassName,
+  triggerClassName,
+  showModelOnly = false,
 }: AIPresetsSelectorProps) => {
   const { settings, updateSettings } = useSettings();
   const [open, setOpen] = useState(false);
@@ -910,24 +1269,35 @@ export const AIPresetsSelector = ({
   >();
 
   const isControlled = onControlledSelect !== undefined;
+  const { isEnterprise, policy: enterprisePolicy } = useEnterprisePolicy();
+  const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
+  const canManageEmployeePresets = !isEnterprise || aiPresetPolicy.allow_employee_custom_presets;
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const aiPresets = (settings?.aiPresets || []) as AIPreset[];
+  const aiPresets = useMemo(() => {
+    const presets = (settings?.aiPresets || []) as AIPreset[];
+    return isEnterprise ? filterPresetsForEnterprisePolicy(presets, aiPresetPolicy) : presets;
+  }, [settings?.aiPresets, isEnterprise, aiPresetPolicy]);
 
   const selectedPreset = useMemo(() => {
     if (isControlled) return controlledPresetId ?? undefined;
     // Use the first preset or default preset
-    const defaultPreset = settings?.aiPresets?.find(
+    const defaultPreset = aiPresets.find(
       (preset) => preset.defaultPreset,
     );
-    return defaultPreset?.id || settings?.aiPresets?.[0]?.id || undefined;
-  }, [settings?.aiPresets, isControlled, controlledPresetId]);
+    return defaultPreset?.id || aiPresets[0]?.id || undefined;
+  }, [aiPresets, isControlled, controlledPresetId]);
 
   // Check if selected preset requires login
   const selectedPresetRequiresLogin = useMemo(() => {
     const preset = aiPresets.find((p) => p.id === selectedPreset);
-    return preset?.provider === "pi" && !settings?.user?.token;
+    return preset?.provider === "screenpipe-cloud" && !settings?.user?.token;
   }, [aiPresets, selectedPreset, settings?.user?.token]);
+
+  const selectedPresetData = useMemo(
+    () => aiPresets.find((p) => p.id === selectedPreset),
+    [aiPresets, selectedPreset]
+  );
 
   useEffect(() => {
     if (onPresetChange) {
@@ -959,6 +1329,8 @@ export const AIPresetsSelector = ({
           aiPresets: updatedPresets,
         });
 
+        onPresetSaved?.(nextPreset);
+
         toast.success("Preset changed", {
           description: `Switched to ${nextPreset.id} (${nextPreset.model})`,
         });
@@ -967,9 +1339,16 @@ export const AIPresetsSelector = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [aiPresets, selectedPreset, updateSettings, shortcutKey]);
+  }, [aiPresets, selectedPreset, updateSettings, shortcutKey, onPresetSaved]);
 
   const handleSavePreset = (preset: Partial<AIPreset>) => {
+    if (!canManageEmployeePresets) {
+      toast.error("Managed by your organization", {
+        description: "Your admin controls which AI presets are available",
+      });
+      return;
+    }
+
     if (!preset.id) {
       toast.error("Please enter a name for this preset", {
         description: "Name is required",
@@ -986,10 +1365,10 @@ export const AIPresetsSelector = ({
 
     // If we're editing an existing preset
     if (selectedPresetToEdit) {
-      // If this is a copy operation, treat it as a new preset
+      // If this is a copy/duplicate operation, treat it as a new preset
       if (
         preset.id !== selectedPresetToEdit.id ||
-        preset.id.endsWith("-copy")
+        !settings.aiPresets.some((p) => p.id === preset.id)
       ) {
         // Check for duplicate ID
         const existingPreset = settings.aiPresets.find(
@@ -1083,20 +1462,51 @@ export const AIPresetsSelector = ({
       });
     }
 
+    // Notify parent to restart Pi if the saved preset is the active/default one
+    if (onPresetSaved) {
+      const savedFull = { ...preset } as AIPreset;
+      const isDefault = selectedPresetToEdit?.defaultPreset ||
+        (!selectedPresetToEdit && settings.aiPresets.length === 0);
+      if (isDefault) {
+        onPresetSaved(savedFull);
+      }
+    }
+
     setDialogOpen(false);
     setSelectedPresetToEdit(undefined);
   };
 
   const handleDuplicatePreset = (preset: AIPreset) => {
+    if (!canManageEmployeePresets || isEnterpriseManagedPreset(preset)) {
+      toast.error("Managed by your organization", {
+        description: "Your admin controls which AI presets are available",
+      });
+      return;
+    }
+
+    const baseName = preset.id.replace(/ \d+$/, "");
+    let counter = 2;
+    let newName = `${baseName} ${counter}`;
+    while (settings.aiPresets.some((p) => p.id.toLowerCase() === newName.toLowerCase())) {
+      counter++;
+      newName = `${baseName} ${counter}`;
+    }
     setSelectedPresetToEdit({
       ...preset,
-      id: `${preset.id}-copy`,
+      id: newName,
       defaultPreset: false,
     });
     setDialogOpen(true);
   };
 
   const handleEditPreset = (preset: AIPreset) => {
+    if (!canManageEmployeePresets || isEnterpriseManagedPreset(preset)) {
+      toast.error("Managed by your organization", {
+        description: "Your admin controls which AI presets are available",
+      });
+      return;
+    }
+
     setSelectedPresetToEdit(preset);
     setDialogOpen(true);
   };
@@ -1104,6 +1514,12 @@ export const AIPresetsSelector = ({
   const handleSetDefaultPreset = (preset: AIPreset) => {
     if (!settings?.aiPresets) return;
     if (preset.defaultPreset) return;
+    if (isEnterprise && aiPresetPolicy.lock_default_preset) {
+      toast.error("Default preset is locked", {
+        description: "Your admin controls the default AI preset",
+      });
+      return;
+    }
 
     const updatedPresets = settings.aiPresets.map((p) => ({
       ...p,
@@ -1114,6 +1530,11 @@ export const AIPresetsSelector = ({
       aiPresets: updatedPresets,
     });
 
+    // Restart Pi with the new default preset
+    if (onPresetSaved) {
+      onPresetSaved(preset);
+    }
+
     toast.success("Default preset updated", {
       description: `${preset.id} is now the default preset`,
     });
@@ -1121,8 +1542,15 @@ export const AIPresetsSelector = ({
 
   const handleRemovePreset = (preset: AIPreset) => {
     if (!settings?.aiPresets) return;
-    // Prevent deletion of pi-agent preset for Pro subscribers (pi = screenpipe cloud)
-    if (preset.provider === "pi" && settings.user?.cloud_subscribed) {
+    if (!canManageEmployeePresets || isEnterpriseManagedPreset(preset)) {
+      toast.error("Managed by your organization", {
+        description: "Your admin controls which AI presets are available",
+      });
+      return;
+    }
+
+    // Prevent deletion of screenpipe-cloud preset for Pro subscribers
+    if (preset.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
       toast.error("Cannot delete cloud preset", {
         description: "This preset is included with your Pro subscription",
       });
@@ -1147,20 +1575,20 @@ export const AIPresetsSelector = ({
 
   return (
     <>
-      <div className="flex flex-col w-full gap-2">
-        {!isControlled && selectedPresetRequiresLogin && (
-          <div className="flex items-center gap-2 p-2 text-sm bg-amber-500/10 border border-amber-500/20 rounded-lg">
-            <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
-            <span className="text-amber-600 dark:text-amber-400 flex-1">
+      <div className={cn("flex flex-col w-full gap-2", containerClassName)}>
+        {!isControlled && selectedPresetRequiresLogin && !showModelOnly && (
+          <div className="flex items-center gap-2 p-2 text-sm bg-muted border border-border rounded-lg">
+            <AlertTriangle className="h-4 w-4 text-muted-foreground shrink-0" />
+            <span className="text-foreground flex-1">
               Login required to use Screenpipe Cloud
             </span>
             {showLoginCta && (
               <Button
                 variant="outline"
                 size="sm"
-                className="shrink-0 h-7 text-xs border-amber-500/30 hover:bg-amber-500/10"
+                className="shrink-0 h-7 text-xs border-border hover:bg-muted"
                 onClick={async () => {
-                  await commands.showWindow({ Settings: { page: "account" } });
+                  await commands.showWindow({ Home: { page: "account" } });
                 }}
               >
                 <LogIn className="h-3 w-3 mr-1" />
@@ -1175,46 +1603,54 @@ export const AIPresetsSelector = ({
             <Tooltip>
               <PopoverTrigger asChild>
                 <Button
+                  type="button"
                   variant="outline"
                   role="combobox"
                   aria-expanded={open}
                   className={cn(
                     "w-full justify-between hover:bg-accent hover:text-accent-foreground",
                     compact && "h-8 text-xs",
-                    selectedPresetRequiresLogin && "border-amber-500/50"
+                    selectedPresetRequiresLogin && "border-amber-500/50",
+                    triggerClassName
                   )}
                 >
                   {selectedPreset ? (
-                    <div className="flex w-full items-center justify-between gap-2 overflow-hidden">
-                      <div className="flex items-center gap-2 min-w-[80px] max-w-[30%]">
+                    showModelOnly ? (
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
                         {selectedPresetRequiresLogin && (
                           <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
                         )}
-                        <span className="font-medium truncate text-left">
-                          {formatPresetName(
-                            aiPresets.find(
-                              (preset) => preset.id === selectedPreset,
-                            )?.id || ''
+                        <span
+                          className="truncate text-left font-medium"
+                          title={
+                            selectedPresetData
+                              ? `${selectedPresetData.id} (${selectedPresetData.model})`
+                              : undefined
+                          }
+                        >
+                          {selectedPresetData?.model || formatPresetName(selectedPreset)}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="flex w-full items-center justify-between gap-2 overflow-hidden min-w-0">
+                        <div className="flex items-center gap-2 min-w-0 flex-shrink overflow-hidden">
+                          {selectedPresetRequiresLogin && (
+                            <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
                           )}
-                        </span>
+                          <span className="font-medium truncate text-left">
+                            {formatPresetName(selectedPresetData?.id || '')}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0 flex-1 justify-end overflow-hidden">
+                          <span className="rounded bg-muted px-1.5 py-0.5 whitespace-nowrap shrink-0">
+                            {selectedPresetData?.provider}
+                          </span>
+                          <span className="hidden sm:block truncate min-w-0" title={selectedPresetData?.model}>
+                            {selectedPresetData?.model}
+                          </span>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground overflow-hidden">
-                        <span className="rounded bg-muted px-1.5 py-0.5 whitespace-nowrap">
-                          {
-                            aiPresets.find(
-                              (preset) => preset.id === selectedPreset,
-                            )?.provider
-                          }
-                        </span>
-                        <span className="hidden sm:block truncate max-w-[30%]">
-                          {
-                            aiPresets.find(
-                              (preset) => preset.id === selectedPreset,
-                            )?.model
-                          }
-                        </span>
-                      </div>
-                    </div>
+                    )
                   ) : allowNone && isControlled ? (
                     <span className="text-muted-foreground">{noneLabel}</span>
                   ) : (
@@ -1225,7 +1661,7 @@ export const AIPresetsSelector = ({
               </PopoverTrigger>
               <TooltipContent>
                 {selectedPresetRequiresLogin ? (
-                  <p className="text-amber-500">
+                  <p className="text-muted-foreground">
                     Login required to use this preset
                   </p>
                 ) : (
@@ -1240,7 +1676,13 @@ export const AIPresetsSelector = ({
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>
-          <PopoverContent className="min-w-[500px] w-[--radix-popover-trigger-width] p-0">
+          <PopoverContent
+            side="top"
+            sideOffset={6}
+            align={showModelOnly ? "end" : "center"}
+            alignOffset={showModelOnly ? -16 : 0}
+            className="min-w-[500px] w-[--radix-popover-trigger-width] p-0"
+          >
             <Command>
               <CommandInput placeholder="search presets..." />
               <CommandList>
@@ -1266,7 +1708,7 @@ export const AIPresetsSelector = ({
                     </CommandItem>
                   </CommandGroup>
                 )}
-                {recommendedPresets && recommendedPresets.length > 0 && (
+                {canManageEmployeePresets && recommendedPresets && recommendedPresets.length > 0 && (
                   <CommandGroup heading="Recommended Presets">
                     {recommendedPresets.map((preset) => (
                       <CommandItem
@@ -1323,7 +1765,7 @@ export const AIPresetsSelector = ({
                                   setDialogOpen(true);
                                 }}
                               >
-                                <Copy className="h-3 w-3" />
+                                <Copy className="h-3.5 w-3.5" />
                               </Button>
                             </div>
                           </div>
@@ -1342,8 +1784,8 @@ export const AIPresetsSelector = ({
                         // so string comparison against preset.id would fail
                         if (isControlled) {
                           onControlledSelect(preset.id);
-                        } else if (preset.id !== selectedPreset) {
-                          const updatedPresets = aiPresets.map((p) => ({
+                        } else if (preset.id !== selectedPreset && !aiPresetPolicy.lock_default_preset) {
+                          const updatedPresets = (settings.aiPresets || []).map((p) => ({
                             ...p,
                             defaultPreset: p.id === preset.id,
                           }));
@@ -1351,6 +1793,8 @@ export const AIPresetsSelector = ({
                           updateSettings({
                             aiPresets: updatedPresets,
                           });
+
+                          onPresetSaved?.(preset);
 
                           toast.success("Preset selected", {
                             description: `${preset.id} is now active`,
@@ -1389,29 +1833,7 @@ export const AIPresetsSelector = ({
                             </span>
                           </div>
                           <div className="flex items-center gap-1">
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-6 w-6 shrink-0"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleEditPreset(preset);
-                              }}
-                            >
-                              <Edit2 className="h-3 w-3" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-6 w-6 shrink-0"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleDuplicatePreset(preset);
-                              }}
-                            >
-                              <Copy className="h-3 w-3" />
-                            </Button>
-                            {!preset.defaultPreset && (
+                            {canManageEmployeePresets && !isEnterpriseManagedPreset(preset) && (
                               <>
                                 <Button
                                   variant="ghost"
@@ -1419,10 +1841,10 @@ export const AIPresetsSelector = ({
                                   className="h-6 w-6 shrink-0"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleSetDefaultPreset(preset);
+                                    handleEditPreset(preset);
                                   }}
                                 >
-                                  <Star className="h-3 w-3" />
+                                  <Edit2 className="h-3.5 w-3.5" />
                                 </Button>
                                 <Button
                                   variant="ghost"
@@ -1430,12 +1852,38 @@ export const AIPresetsSelector = ({
                                   className="h-6 w-6 shrink-0"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleRemovePreset(preset);
+                                    handleDuplicatePreset(preset);
                                   }}
                                 >
-                                  <Trash2 className="h-3 w-3" />
+                                  <Copy className="h-3.5 w-3.5" />
                                 </Button>
                               </>
+                            )}
+                            {!preset.defaultPreset && !aiPresetPolicy.lock_default_preset && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6 shrink-0"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSetDefaultPreset(preset);
+                                }}
+                              >
+                                <Star className="h-3.5 w-3.5" />
+                              </Button>
+                            )}
+                            {!preset.defaultPreset && canManageEmployeePresets && !isEnterpriseManagedPreset(preset) && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6 shrink-0"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRemovePreset(preset);
+                                }}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
                             )}
                           </div>
                         </div>
@@ -1443,18 +1891,20 @@ export const AIPresetsSelector = ({
                     </CommandItem>
                   ))}
                 </CommandGroup>
-                <CommandGroup>
-                  <CommandItem
-                    onSelect={() => {
-                      setOpen(false);
-                      setSelectedPresetToEdit(undefined);
-                      setDialogOpen(true);
-                    }}
-                  >
-                    <Plus className="mr-2 h-4 w-4" />
-                    create new preset
-                  </CommandItem>
-                </CommandGroup>
+                {canManageEmployeePresets && (
+                  <CommandGroup>
+                    <CommandItem
+                      onSelect={() => {
+                        setOpen(false);
+                        setSelectedPresetToEdit(undefined);
+                        setDialogOpen(true);
+                      }}
+                    >
+                      <Plus className="mr-2 h-4 w-4" />
+                      create new preset
+                    </CommandItem>
+                  </CommandGroup>
+                )}
               </CommandList>
             </Command>
           </PopoverContent>

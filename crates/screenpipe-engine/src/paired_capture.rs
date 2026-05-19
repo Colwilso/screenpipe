@@ -14,18 +14,39 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use image::DynamicImage;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use screenpipe_a11y::tree::{create_tree_walker, TreeSnapshot, TreeWalkerConfig};
 use screenpipe_core::pii_removal::remove_pii;
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_os = "windows"))]
+use std::sync::OnceLock;
 use std::time::Instant;
+#[cfg(not(target_os = "windows"))]
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
+/// Strip gutter-line-number runs from OCR output.
+///
+/// Obsidian and other code/markdown editors render a line-number gutter that
+/// Apple Vision extracts as long digit globs: "93154155156157158159…". These
+/// blob into the indexed text and dominate search results without adding
+/// information. A run of 30+ digits (optionally separated by whitespace) is
+/// almost certainly a gutter — real prose rarely has that density. Phone
+/// numbers, UUIDs, and timestamps are all shorter than the 30-digit threshold.
+fn strip_gutter_noise(text: &str) -> String {
+    static GUTTER: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?:\d[\s]*){30,}").expect("valid regex"));
+    GUTTER.replace_all(text, " ").into_owned()
+}
+
 /// Limits concurrent OCR tasks to avoid CPU spikes when multiple monitors
 /// trigger capture simultaneously.
+#[cfg(not(target_os = "windows"))]
 static OCR_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+#[cfg(not(target_os = "windows"))]
 fn ocr_semaphore() -> &'static Semaphore {
     OCR_SEMAPHORE.get_or_init(|| Semaphore::new(1))
 }
@@ -41,9 +62,17 @@ pub struct CaptureContext<'a> {
     pub app_name: Option<&'a str>,
     pub window_name: Option<&'a str>,
     pub browser_url: Option<&'a str>,
+    /// Absolute filesystem path of the document open in the focused window,
+    /// when the platform exposes one (macOS via AXDocument). None for
+    /// browsers (their URL goes in `browser_url`), terminals, OS chrome.
+    pub document_path: Option<&'a str>,
     pub focused: bool,
     pub capture_trigger: &'a str,
     pub use_pii_removal: bool,
+    /// Languages for OCR recognition.
+    pub languages: Vec<screenpipe_core::Language>,
+    /// When Some, this frame references another frame's elements (dedup).
+    pub elements_ref_frame_id: Option<i64>,
 }
 
 /// Result of a paired capture operation.
@@ -109,25 +138,34 @@ pub async fn paired_capture(
         let n = name.to_lowercase();
         // Terminal emulators whose AX text is raw buffer and not useful
         // for bounding-box overlay. OCR produces better results.
+        // Note: Ghostty, iTerm2, and Terminal.app were removed — they have
+        // full AX support and the thin-detection heuristic handles them
+        // correctly. See https://github.com/screenpipe/screenpipe/issues/2685
         n.contains("wezterm")
-            || n.contains("iterm")
-            || n.contains("terminal")
             || n.contains("alacritty")
             || n.contains("kitty")
             || n.contains("hyper")
             || n.contains("warp")
-            || n.contains("ghostty")
     });
     let has_accessibility_text = !app_prefers_ocr
         && tree_snapshot
             .map(|s| !s.text_content.is_empty())
             .unwrap_or(false);
 
-    // Only run OCR when accessibility tree returned no text or app prefers OCR
-    let (ocr_text, ocr_text_json) = if !has_accessibility_text {
+    // Check if accessibility text is "thin" — the tree returned SOME text
+    // (toolbar, sidebar, browser chrome) but likely missed the main content.
+    // This happens with canvas-rendered apps (Google Docs, Figma, etc.)
+    // where the document body is invisible to the accessibility tree.
+    let a11y_is_thin = has_accessibility_text
+        && tree_snapshot
+            .map(|s| a11y_content_is_thin(s, ctx.window_name, ctx.browser_url, ctx.app_name))
+            .unwrap_or(false);
+
+    // Run OCR when: no a11y text, app prefers OCR, OR a11y text is thin (hybrid)
+    let (ocr_text, ocr_text_json) = if !has_accessibility_text || a11y_is_thin {
         // Windows native OCR is async, so call it directly (not inside spawn_blocking)
         #[cfg(target_os = "windows")]
-        {
+        let raw = {
             match screenpipe_screen::perform_ocr_windows(&ctx.image).await {
                 Ok((text, json, _confidence)) => (text, json),
                 Err(e) => {
@@ -135,31 +173,36 @@ pub async fn paired_capture(
                     (String::new(), "[]".to_string())
                 }
             }
-        }
+        };
         // Apple and Tesseract OCR are sync, use spawn_blocking with semaphore
         // to limit concurrent OCR and avoid CPU spikes on multi-monitor setups.
         #[cfg(not(target_os = "windows"))]
-        {
+        let raw = {
             let _permit = ocr_semaphore().acquire().await.unwrap();
             let image_for_ocr = ctx.image.clone();
-            let ocr_result = tokio::task::spawn_blocking(move || {
+            let languages = ctx.languages.clone();
+            tokio::task::spawn_blocking(move || {
                 #[cfg(target_os = "macos")]
                 {
                     let (text, json, _confidence) =
-                        screenpipe_screen::perform_ocr_apple(&image_for_ocr, &[]);
+                        screenpipe_screen::perform_ocr_apple(&image_for_ocr, &languages);
                     (text, json)
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
                     let (text, json, _confidence) =
-                        screenpipe_screen::perform_ocr_tesseract(&image_for_ocr, vec![]);
+                        screenpipe_screen::perform_ocr_tesseract(&image_for_ocr, languages);
                     (text, json)
                 }
             })
             .await
-            .unwrap_or_else(|_| (String::new(), "[]".to_string()));
-            ocr_result
-        }
+            .unwrap_or_else(|_| (String::new(), "[]".to_string()))
+        };
+
+        // Strip editor gutter noise (see strip_gutter_noise doc). Applied to
+        // the flat text but NOT to text_json — the JSON carries per-box OCR
+        // coordinates which downstream overlay/highlight UIs need intact.
+        (strip_gutter_noise(&raw.0), raw.1)
     } else {
         (String::new(), "[]".to_string())
     };
@@ -173,7 +216,12 @@ pub async fn paired_capture(
         // only returns window chrome ("System, Minimize, Restore, Close") which
         // is noise. If OCR fails, store nothing rather than chrome.
         if !ocr_text.is_empty() {
-            (Some(ocr_text.clone()), None, None, None)
+            (
+                Some(ocr_text.clone()),
+                None,
+                Some(TreeSnapshot::compute_hash(&ocr_text) as i64),
+                None,
+            )
         } else {
             (None, None, None, None)
         }
@@ -193,16 +241,27 @@ pub async fn paired_capture(
                 if ocr_text.is_empty() {
                     (None, None, None, None)
                 } else {
-                    (Some(ocr_text.clone()), None, None, None)
+                    (
+                        Some(ocr_text.clone()),
+                        None,
+                        Some(TreeSnapshot::compute_hash(&ocr_text) as i64),
+                        None,
+                    )
                 }
             }
         }
     };
 
-    // Determine text source: "accessibility" when tree nodes were available, "ocr" for fallback
+    // Determine text source: "accessibility" when tree nodes were available,
+    // "ocr" for fallback, "hybrid" when both ran (thin a11y supplemented by OCR)
     let (final_text, text_source) = if let Some(ref text) = accessibility_text {
         if text.is_empty() {
             (None, None)
+        } else if tree_json.is_some() && a11y_is_thin && !ocr_text.is_empty() {
+            // Hybrid: a11y had chrome text, OCR captured the real content.
+            // Keep a11y text as accessibility_text (structured); OCR data is
+            // stored separately in the ocr_text table via ocr_data below.
+            (Some(text.as_str()), Some("hybrid"))
         } else if tree_json.is_some() {
             (Some(text.as_str()), Some("accessibility"))
         } else {
@@ -259,6 +318,7 @@ pub async fn paired_capture(
             ctx.app_name,
             ctx.window_name,
             ctx.browser_url,
+            ctx.document_path,
             ctx.focused,
             Some(ctx.capture_trigger),
             sanitized_text.as_deref(),
@@ -267,6 +327,7 @@ pub async fn paired_capture(
             content_hash,
             simhash,
             ocr_data,
+            ctx.elements_ref_frame_id,
         )
         .await?;
 
@@ -292,13 +353,14 @@ pub async fn paired_capture(
 }
 
 /// Walk the accessibility tree for the currently focused window.
-/// Returns the text content and app/window metadata.
+/// Returns a `TreeWalkResult` distinguishing found/skipped/not-found states.
 ///
 /// This is a blocking operation that should be spawned on a blocking thread.
-pub fn walk_accessibility_tree(config: &TreeWalkerConfig) -> Option<TreeSnapshot> {
+pub fn walk_accessibility_tree(config: &TreeWalkerConfig) -> screenpipe_a11y::tree::TreeWalkResult {
+    use screenpipe_a11y::tree::TreeWalkResult;
     let walker = create_tree_walker(config.clone());
     match walker.walk_focused_window() {
-        Ok(Some(snapshot)) => {
+        Ok(TreeWalkResult::Found(snapshot)) => {
             debug!(
                 "tree walk: app={}, window={}, text_len={}, nodes={}, structured_nodes={}, dur={:?}",
                 snapshot.app_name,
@@ -308,17 +370,208 @@ pub fn walk_accessibility_tree(config: &TreeWalkerConfig) -> Option<TreeSnapshot
                 snapshot.nodes.len(),
                 snapshot.walk_duration
             );
-            Some(snapshot)
+            TreeWalkResult::Found(snapshot)
         }
-        Ok(None) => {
+        Ok(TreeWalkResult::Skipped(reason)) => {
+            debug!("tree walk: window skipped ({})", reason);
+            TreeWalkResult::Skipped(reason)
+        }
+        Ok(TreeWalkResult::NotFound) => {
             debug!("tree walk: no focused window found");
-            None
+            TreeWalkResult::NotFound
         }
         Err(e) => {
             warn!("tree walk failed: {}", e);
-            None
+            TreeWalkResult::NotFound
         }
     }
+}
+
+/// Known canvas-rendered apps/sites where the accessibility tree returns only
+/// UI chrome (toolbar, sidebar) but the main content is drawn on a <canvas>
+/// or GPU surface and invisible to the a11y tree.
+/// Matched against window title.
+const CANVAS_APP_PATTERNS: &[&str] = &[
+    "google docs",
+    "google sheets",
+    "google slides",
+    "google drawings",
+    "figma",
+    "excalidraw",
+    "miro",
+    "canva",
+    "tldraw",
+];
+
+/// Meeting/video apps whose main content is screen-shared or GPU-rendered video.
+/// The a11y tree only returns UI chrome (buttons, menus) not the actual content.
+/// Matched against app_name (lowercased).
+const MEETING_APP_PATTERNS: &[&str] = &[
+    "zoom",
+    "teams",
+    "slack",
+    "webex",
+    "skype",
+    "facetime",
+    "google meet",
+    "discord",
+    "around",
+    "tuple",
+    "pop",
+    "gather",
+    "butter",
+    "ringcentral",
+    "bluejeans",
+    "gotomeeting",
+    "goto meeting",
+    "dialpad",
+    "chime",
+    "jitsi",
+    "whereby",
+    "loom",
+    "riverside",
+];
+
+/// Browser-hosted meeting URLs. Browser app names are usually "Chrome",
+/// "Arc", or "Safari", so app-name matching misses these sessions.
+const MEETING_URL_PATTERNS: &[&str] = &[
+    "meet.google.com",
+    "zoom.us/wc",
+    "zoom.us/j",
+    "app.zoom.us/wc",
+    "teams.microsoft.com",
+    "teams.live.com",
+    "webex.com/meet",
+    ".webex.com/meet",
+    "meet.jit.si",
+    "whereby.com",
+    "riverside.fm/studio",
+];
+
+/// URL patterns for canvas-rendered apps. When inside a Google Doc, the window
+/// title is the document name (not "Google Docs"), so we also check the URL.
+const CANVAS_URL_PATTERNS: &[&str] = &[
+    "docs.google.com",
+    "sheets.google.com",
+    "slides.google.com",
+    "figma.com",
+    "excalidraw.com",
+    "miro.com",
+    "tldraw.com",
+];
+
+/// Check if the accessibility tree captured mostly UI chrome and likely missed
+/// the actual content. Returns `true` when OCR should supplement a11y data.
+///
+/// Two checks:
+/// 1. **Known canvas apps**: window title matches a known pattern → always thin.
+/// 2. **Content density heuristic**: classify nodes by role; if <30% of text
+///    characters come from content roles (vs toolbar/menu chrome), it's thin.
+fn a11y_content_is_thin(
+    snap: &screenpipe_a11y::tree::TreeSnapshot,
+    window_name: Option<&str>,
+    browser_url: Option<&str>,
+    app_name: Option<&str>,
+) -> bool {
+    // 1a. Known canvas-rendered apps by window title
+    if let Some(win) = window_name {
+        let win_lower = win.to_lowercase();
+        if CANVAS_APP_PATTERNS
+            .iter()
+            .any(|pat| win_lower.contains(pat))
+        {
+            debug!("a11y_content_is_thin: known canvas app '{}'", win);
+            return true;
+        }
+    }
+
+    // 1b. Known canvas-rendered apps by URL (e.g. inside a Google Doc the
+    //     window title is the document name, not "Google Docs")
+    if let Some(url) = browser_url {
+        let url_lower = url.to_lowercase();
+        if CANVAS_URL_PATTERNS
+            .iter()
+            .any(|pat| url_lower.contains(pat))
+        {
+            debug!("a11y_content_is_thin: known canvas URL '{}'", url);
+            return true;
+        }
+
+        if MEETING_URL_PATTERNS
+            .iter()
+            .any(|pat| url_lower.contains(pat))
+        {
+            debug!("a11y_content_is_thin: meeting URL '{}'", url);
+            return true;
+        }
+    }
+
+    // 1c. Meeting/video apps — main content is screen-shared or GPU-rendered,
+    //     a11y tree only has UI chrome (buttons like "Mute my audio" repeated).
+    if let Some(app) = app_name {
+        let app_lower = app.to_lowercase();
+        if MEETING_APP_PATTERNS
+            .iter()
+            .any(|pat| app_lower.contains(pat))
+        {
+            debug!("a11y_content_is_thin: meeting app '{}'", app);
+            return true;
+        }
+    }
+
+    // 2. Content density heuristic
+    // Chrome roles: buttons, menus, toolbars — UI controls, not document content
+    const CHROME_ROLES: &[&str] = &[
+        "AXButton",
+        "AXMenuItem",
+        "AXMenuBar",
+        "AXMenu",
+        "AXToolbar",
+        "AXTabGroup",
+        "AXTab",
+        "AXPopUpButton",
+        "AXCheckBox",
+        "AXRadioButton",
+        "AXDisclosureTriangle",
+        "AXSlider",
+        "AXIncrementor",
+        "AXComboBox",
+        "AXScrollBar",
+    ];
+
+    let mut content_chars: usize = 0;
+    let mut total_chars: usize = 0;
+
+    for node in &snap.nodes {
+        let len = node.text.len();
+        if len == 0 {
+            continue;
+        }
+        total_chars += len;
+        if !CHROME_ROLES.iter().any(|r| node.role == *r) {
+            content_chars += len;
+        }
+    }
+
+    // Very little text overall — likely missing content
+    if total_chars < 100 {
+        debug!(
+            "a11y_content_is_thin: total_chars={} < 100, treating as thin",
+            total_chars
+        );
+        return true;
+    }
+
+    let ratio = content_chars as f64 / total_chars as f64;
+    if ratio < 0.3 {
+        debug!(
+            "a11y_content_is_thin: content_ratio={:.2} < 0.3 (content={}, total={})",
+            ratio, content_chars, total_chars
+        );
+        return true;
+    }
+
+    false
 }
 
 /// Sanitize PII from OCR text_json (a JSON string of bounding-box entries).
@@ -348,8 +601,10 @@ mod tests {
     #[tokio::test]
     async fn test_paired_capture_without_accessibility() {
         let tmp = TempDir::new().unwrap();
-        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80);
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         let image = test_image();
         let now = Utc::now();
@@ -364,9 +619,12 @@ mod tests {
             app_name: Some("TestApp"),
             window_name: Some("TestWindow"),
             browser_url: None,
+            document_path: None,
             focused: true,
             capture_trigger: "click",
             use_pii_removal: false,
+            languages: vec![],
+            elements_ref_frame_id: None,
         };
 
         let result = paired_capture(&ctx, None).await.unwrap();
@@ -381,8 +639,10 @@ mod tests {
     #[tokio::test]
     async fn test_paired_capture_with_accessibility_text() {
         let tmp = TempDir::new().unwrap();
-        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80);
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         let image = test_image();
         let now = Utc::now();
@@ -397,9 +657,12 @@ mod tests {
             app_name: Some("Safari"),
             window_name: Some("Example Page"),
             browser_url: Some("https://example.com"),
+            document_path: None,
             focused: true,
             capture_trigger: "app_switch",
             use_pii_removal: false,
+            languages: vec![],
+            elements_ref_frame_id: None,
         };
 
         let snap = TreeSnapshot {
@@ -411,8 +674,10 @@ mod tests {
                 text: "Hello World - Example Page".to_string(),
                 depth: 0,
                 bounds: None,
+                ..Default::default()
             }],
             browser_url: Some("https://example.com".to_string()),
+            document_path: None,
             timestamp: now,
             node_count: 1,
             walk_duration: std::time::Duration::from_millis(5),
@@ -436,8 +701,10 @@ mod tests {
     #[tokio::test]
     async fn test_paired_capture_empty_accessibility_text() {
         let tmp = TempDir::new().unwrap();
-        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80);
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         let image = test_image();
         let now = Utc::now();
@@ -452,9 +719,12 @@ mod tests {
             app_name: Some("TestApp"),
             window_name: None,
             browser_url: None,
+            document_path: None,
             focused: true,
             capture_trigger: "idle",
             use_pii_removal: false,
+            languages: vec![],
+            elements_ref_frame_id: None,
         };
 
         // Empty accessibility text should be treated as no text
@@ -464,6 +734,7 @@ mod tests {
             text_content: String::new(),
             nodes: vec![],
             browser_url: None,
+            document_path: None,
             timestamp: now,
             node_count: 0,
             walk_duration: std::time::Duration::from_millis(1),
@@ -560,5 +831,301 @@ mod tests {
         let text = "louis@screenpi.pe";
         let sanitized_text: Option<String> = Some(text).map(|t| t.to_string());
         assert_eq!(sanitized_text.as_deref(), Some("louis@screenpi.pe"));
+    }
+
+    // --- a11y_content_is_thin tests ---
+
+    fn make_snap(nodes: Vec<AccessibilityTreeNode>) -> TreeSnapshot {
+        let text = nodes
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        TreeSnapshot {
+            app_name: "Test".to_string(),
+            window_name: "Test Window".to_string(),
+            text_content: text,
+            nodes,
+            browser_url: None,
+            document_path: None,
+            timestamp: Utc::now(),
+            node_count: 0,
+            walk_duration: std::time::Duration::from_millis(1),
+            content_hash: 0,
+            simhash: 0,
+            truncated: false,
+            truncation_reason: screenpipe_a11y::tree::TruncationReason::None,
+            max_depth_reached: 0,
+        }
+    }
+
+    #[test]
+    fn test_thin_known_canvas_app_google_docs() {
+        let snap = make_snap(vec![AccessibilityTreeNode {
+            role: "AXStaticText".into(),
+            text: "Lots of real content here that is very long and should normally be fine".into(),
+            depth: 0,
+            bounds: None,
+            ..Default::default()
+        }]);
+        // Google Docs in window title → always thin regardless of content
+        assert!(a11y_content_is_thin(
+            &snap,
+            Some("Untitled - Google Docs"),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_thin_known_canvas_app_figma() {
+        let snap = make_snap(vec![]);
+        assert!(a11y_content_is_thin(
+            &snap,
+            Some("My Design - Figma"),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_not_thin_normal_webpage() {
+        // Normal webpage: mostly AXStaticText content
+        let snap = make_snap(vec![
+            AccessibilityTreeNode { role: "AXButton".into(), text: "Menu".into(), depth: 0, bounds: None, ..Default::default() },
+            AccessibilityTreeNode { role: "AXStaticText".into(), text: "This is a long article about dogs. Dogs are domesticated descendants of wolves. They were the first species to be domesticated over 14,000 years ago.".into(), depth: 1, bounds: None, ..Default::default() },
+            AccessibilityTreeNode { role: "AXLink".into(), text: "Read more about canine history".into(), depth: 1, bounds: None, ..Default::default() },
+        ]);
+        assert!(!a11y_content_is_thin(
+            &snap,
+            Some("Dog - Wikipedia"),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_thin_mostly_chrome() {
+        // All buttons/menus, very little content — like a canvas app's toolbar
+        let snap = make_snap(vec![
+            AccessibilityTreeNode {
+                role: "AXButton".into(),
+                text: "File".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXButton".into(),
+                text: "Edit".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXButton".into(),
+                text: "View".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXButton".into(),
+                text: "Insert".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXButton".into(),
+                text: "Format".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXButton".into(),
+                text: "Tools".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXButton".into(),
+                text: "Help".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXMenuItem".into(),
+                text: "Undo".into(),
+                depth: 1,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXMenuItem".into(),
+                text: "Redo".into(),
+                depth: 1,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXMenuItem".into(),
+                text: "Cut".into(),
+                depth: 1,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXMenuItem".into(),
+                text: "Copy".into(),
+                depth: 1,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXMenuItem".into(),
+                text: "Paste".into(),
+                depth: 1,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXMenuItem".into(),
+                text: "Select All".into(),
+                depth: 1,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXMenuItem".into(),
+                text: "Find and Replace".into(),
+                depth: 1,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".into(),
+                text: "Untitled".into(),
+                depth: 0,
+                bounds: None,
+                ..Default::default()
+            },
+        ]);
+        // >70% chrome text
+        assert!(a11y_content_is_thin(
+            &snap,
+            Some("Untitled document"),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_thin_very_little_text() {
+        let snap = make_snap(vec![AccessibilityTreeNode {
+            role: "AXStaticText".into(),
+            text: "Loading...".into(),
+            depth: 0,
+            bounds: None,
+            ..Default::default()
+        }]);
+        // < 100 chars total
+        assert!(a11y_content_is_thin(&snap, Some("Some App"), None, None));
+    }
+
+    #[test]
+    fn test_not_thin_vscode() {
+        // VS Code: lots of AXStaticText from editor content
+        let snap = make_snap(vec![
+            AccessibilityTreeNode { role: "AXButton".into(), text: "Explorer".into(), depth: 0, bounds: None, ..Default::default() },
+            AccessibilityTreeNode { role: "AXButton".into(), text: "Search".into(), depth: 0, bounds: None, ..Default::default() },
+            AccessibilityTreeNode { role: "AXStaticText".into(), text: "fn main() { println!(\"hello world\"); } // This is a Rust program with many lines of code that form a substantial amount of content text in the editor buffer area".into(), depth: 1, bounds: None, ..Default::default() },
+        ]);
+        assert!(!a11y_content_is_thin(
+            &snap,
+            Some("main.rs - Visual Studio Code"),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_thin_google_docs_by_url() {
+        // When inside a Google Doc, window title is the doc name, not "Google Docs".
+        // Use enough content text so the heuristic alone wouldn't flag it as thin.
+        let snap = make_snap(vec![
+            AccessibilityTreeNode { role: "AXStaticText".into(), text: "Docs home Star Add shortcut to Drive Document status Saved to Drive Request edit access Share Anyone with the link Join a call here or present".into(), depth: 0, bounds: None, ..Default::default() },
+        ]);
+        // Window title is doc name, but URL reveals it's Google Docs → thin
+        assert!(a11y_content_is_thin(
+            &snap,
+            Some("Creon's list of profound books"),
+            Some("https://docs.google.com/document/d/abc123/edit"),
+            None,
+        ));
+        // Same content on a non-canvas URL → not thin (content ratio is fine)
+        assert!(!a11y_content_is_thin(
+            &snap,
+            Some("Creon's list of profound books"),
+            Some("https://example.com"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_thin_browser_hosted_google_meet_by_url() {
+        let snap = make_snap(vec![AccessibilityTreeNode {
+            role: "AXStaticText".into(),
+            text: "Mute microphone Camera Captions Present now Participants Chat More options Meeting details People Controls Share screen presentation toolbar repeated meeting chrome".into(),
+            depth: 0,
+            bounds: None,
+            ..Default::default()
+        }]);
+
+        assert!(a11y_content_is_thin(
+            &snap,
+            Some("Team sync - Google Meet"),
+            Some("https://meet.google.com/abc-defg-hij"),
+            Some("Arc"),
+        ));
+    }
+
+    #[test]
+    fn test_thin_browser_hosted_zoom_by_url() {
+        let snap = make_snap(vec![AccessibilityTreeNode {
+            role: "AXStaticText".into(),
+            text: "Mute Start Video Security Participants Chat Share Screen Record Reactions Apps Whiteboards More leave meeting browser client controls".into(),
+            depth: 0,
+            bounds: None,
+            ..Default::default()
+        }]);
+
+        assert!(a11y_content_is_thin(
+            &snap,
+            Some("Zoom Meeting"),
+            Some("https://zoom.us/wc/123456789/start"),
+            Some("Google Chrome"),
+        ));
+    }
+
+    #[test]
+    fn test_calendar_page_with_meet_link_is_not_meeting_url() {
+        let snap = make_snap(vec![AccessibilityTreeNode {
+            role: "AXStaticText".into(),
+            text: "Calendar event details Product review agenda project milestones join with Google Meet attendee notes and preparation checklist with substantial readable event content".into(),
+            depth: 0,
+            bounds: None,
+            ..Default::default()
+        }]);
+
+        assert!(!a11y_content_is_thin(
+            &snap,
+            Some("Product review - Google Calendar"),
+            Some("https://calendar.google.com/calendar/u/0/r/eventedit/abc123"),
+            Some("Google Chrome"),
+        ));
     }
 }

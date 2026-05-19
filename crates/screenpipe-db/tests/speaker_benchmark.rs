@@ -527,17 +527,14 @@ mod speaker_benchmark {
     }
 
     async fn load_benchmark_data() -> Option<BenchmarkData> {
-        let db_path = dirs::home_dir()
-            .unwrap()
-            .join(".screenpipe")
-            .join("db.sqlite");
+        let db_path = screenpipe_core::paths::default_screenpipe_data_dir().join("db.sqlite");
 
         if !db_path.exists() {
             println!("SKIP: no DB at {}", db_path.display());
             return None;
         }
 
-        let db = DatabaseManager::new(db_path.to_str().unwrap())
+        let db = DatabaseManager::new(db_path.to_str().unwrap(), Default::default())
             .await
             .expect("failed to open DB");
 
@@ -646,11 +643,10 @@ mod speaker_benchmark {
         let mut results: Vec<(ClusterResult, Score)> = Vec::new();
 
         // Current system baseline
-        for &t in &[0.50] {
-            let r = strategy_current(&data.embeddings, t);
-            let s = score_result(&r, &data.speakers, &data.embeddings, &data.temporal_windows);
-            results.push((r, s));
-        }
+        let t = 0.50;
+        let r = strategy_current(&data.embeddings, t);
+        let s = score_result(&r, &data.speakers, &data.embeddings, &data.temporal_windows);
+        results.push((r, s));
 
         // Strategy A: current system at different thresholds
         for &t in &[0.55, 0.60, 0.65, 0.70, 0.75, 0.80] {

@@ -102,23 +102,74 @@ pub async fn get_frame_data(
         // If not in cache or cache disabled, get from database
         match state.db.get_frame(frame_id).await {
             Ok(Some((file_path, offset_index, is_snapshot))) => {
+                // Synced frame from another device — no local file exists.
+                // Return metadata (OCR text, app/window context) instead of 410.
+                if file_path.starts_with("cloud://") {
+                    let ocr_text = state
+                        .db
+                        .get_frame_ocr_text_json(frame_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    let timestamp = state.db.get_frame_timestamp(frame_id).await.ok().flatten();
+                    let (acc_text, _) = state
+                        .db
+                        .get_frame_accessibility_data(frame_id)
+                        .await
+                        .unwrap_or((None, None));
+
+                    let metadata = json!({
+                        "error": "Frame is on a remote device",
+                        "error_type": "remote_device",
+                        "frame_id": frame_id,
+                        "timestamp": timestamp,
+                        "ocr_text": ocr_text,
+                        "accessibility_text": acc_text,
+                    });
+                    return Err((StatusCode::NOT_FOUND, JsonResponse(metadata)));
+                }
+
                 if is_snapshot {
                     // Snapshot frame — serve JPEG directly (no ffmpeg needed)
-                    if query.redact_pii {
-                        return apply_pii_redaction(&state, frame_id, &file_path).await;
-                    }
-                    // Cache snapshot path too
-                    if let Some(cache) = &state.frame_image_cache {
-                        if let Ok(mut cache) = cache.try_lock() {
-                            cache.put(frame_id, (file_path.clone(), Instant::now()));
+                    match serve_file(&file_path).await {
+                        Ok(resp) => {
+                            if query.redact_pii {
+                                return apply_pii_redaction(&state, frame_id, &file_path).await;
+                            }
+                            // Cache snapshot path
+                            if let Some(cache) = &state.frame_image_cache {
+                                if let Ok(mut cache) = cache.try_lock() {
+                                    cache.put(frame_id, (file_path.clone(), Instant::now()));
+                                }
+                            }
+                            debug!(
+                                "Snapshot frame {} served in {:?}",
+                                frame_id,
+                                start_time.elapsed()
+                            );
+                            return Ok(resp);
+                        }
+                        Err(_) => {
+                            // Snapshot file missing (compacted/deleted) — try nearest frame
+                            debug!(
+                                "Snapshot file missing for frame {}, trying nearest frame",
+                                frame_id
+                            );
+                            if let Some(fallback) =
+                                try_nearest_frame(&state, frame_id, query.redact_pii).await
+                            {
+                                return Ok(fallback);
+                            }
+                            return Err((
+                                StatusCode::NOT_FOUND,
+                                JsonResponse(json!({
+                                    "error": "Snapshot file missing and no nearby frame available",
+                                    "error_type": "snapshot_missing",
+                                    "frame_id": frame_id
+                                })),
+                            ));
                         }
                     }
-                    debug!(
-                        "Snapshot frame {} served in {:?}",
-                        frame_id,
-                        start_time.elapsed()
-                    );
-                    return serve_file(&file_path).await;
                 }
 
                 // Legacy video-chunk frame — extract via ffmpeg
@@ -149,7 +200,19 @@ pub async fn get_frame_data(
 
                         // No fallback found either
                         let err_str = e.to_string();
-                        if err_str.contains("VIDEO_CORRUPTED")
+                        if err_str.contains("FFPROBE_NOT_FOUND") {
+                            error!("ffprobe not found — frame extraction will fail for all compacted frames: {}", err_str);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                JsonResponse(json!({
+                                    "error": "ffprobe not found - install ffprobe alongside ffmpeg to extract frames from compacted videos",
+                                    "error_type": "ffprobe_not_found",
+                                    "frame_id": frame_id,
+                                    "file_path": file_path,
+                                    "details": err_str
+                                })),
+                            ))
+                        } else if err_str.contains("VIDEO_CORRUPTED")
                             || err_str.contains("VIDEO_NOT_FOUND")
                         {
                             Err((
@@ -465,6 +528,9 @@ pub struct AccessibilityNode {
     pub depth: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<AccessibilityNodeBounds>,
+    /// Automation properties (stable ID, class, state, etc.) — present for newer captures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
 }
 
 /// Response type for frame context endpoint (accessibility-first, OCR fallback)
@@ -531,11 +597,46 @@ pub async fn get_frame_context(
                             })
                         });
 
+                        // Collect automation properties if present
+                        let properties = {
+                            let mut props = serde_json::Map::new();
+                            for key in &[
+                                "automation_id",
+                                "class_name",
+                                "value",
+                                "help_text",
+                                "url",
+                                "placeholder",
+                                "role_description",
+                                "subrole",
+                                "is_enabled",
+                                "is_focused",
+                                "is_selected",
+                                "is_expanded",
+                                "is_password",
+                                "is_keyboard_focusable",
+                                "accelerator_key",
+                                "access_key",
+                            ] {
+                                if let Some(v) = node_val.get(*key) {
+                                    if !v.is_null() {
+                                        props.insert((*key).to_string(), v.clone());
+                                    }
+                                }
+                            }
+                            if props.is_empty() {
+                                None
+                            } else {
+                                Some(serde_json::Value::Object(props))
+                            }
+                        };
+
                         nodes.push(AccessibilityNode {
                             role: role.clone(),
                             text: text.clone(),
                             depth,
                             bounds,
+                            properties,
                         });
 
                         // Extract URLs from link roles
@@ -638,9 +739,17 @@ fn extract_urls_regex(text: &str) -> Vec<String> {
 
 /// Response type for frame OCR data endpoint
 #[derive(OaSchema, Serialize)]
-pub struct FrameOcrResponse {
+pub struct FrameTextResponse {
     pub frame_id: i64,
     pub text_positions: Vec<TextPosition>,
+}
+
+/// Optional query parameter for filtering text positions by search term.
+#[derive(Debug, Deserialize, OaSchema)]
+pub struct FrameTextQuery {
+    /// When provided, only return text positions matching this search term.
+    /// Without this, the a11y fallback returns ALL text nodes (hundreds of them).
+    pub query: Option<String>,
 }
 
 /// Get OCR text positions with bounding boxes for a specific frame.
@@ -648,10 +757,11 @@ pub struct FrameOcrResponse {
 /// Both OCR and accessibility bounds are normalized to 0-1 relative to the
 /// monitor (full-screen capture), so they align correctly with the screenshot.
 #[oasgen]
-pub async fn get_frame_ocr_data(
+pub async fn get_frame_text_data(
     State(state): State<Arc<AppState>>,
     Path(frame_id): Path<i64>,
-) -> Result<JsonResponse<FrameOcrResponse>, (StatusCode, JsonResponse<Value>)> {
+    Query(params): Query<FrameTextQuery>,
+) -> Result<JsonResponse<FrameTextResponse>, (StatusCode, JsonResponse<Value>)> {
     // Get OCR data (bounding boxes from Apple Vision)
     let mut text_positions = match state.db.get_frame_text_positions(frame_id).await {
         Ok(tp) => tp,
@@ -706,10 +816,16 @@ pub async fn get_frame_ocr_data(
         }
     }
 
-    // Pure a11y fallback for frames with no OCR — grab all text nodes with bounds
+    // Pure a11y fallback for frames with no OCR — use accessibility tree bounding boxes.
+    // When a query param is provided, only return nodes matching the search term.
+    // Without a query, return all nodes (for text selection overlay).
     if text_positions.is_empty() {
         if let Ok((_, Some(tree_json))) = state.db.get_frame_accessibility_data(frame_id).await {
-            if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&tree_json) {
+            if let Some(query) = &params.query {
+                // Filtered: use the same matching logic as keyword search
+                text_positions = screenpipe_db::find_matching_a11y_positions(&tree_json, query);
+            } else if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&tree_json) {
+                // Unfiltered: return all nodes (existing behavior for text selection)
                 text_positions = nodes
                     .iter()
                     .filter_map(|n| {
@@ -741,7 +857,7 @@ pub async fn get_frame_ocr_data(
         }
     }
 
-    Ok(JsonResponse(FrameOcrResponse {
+    Ok(JsonResponse(FrameTextResponse {
         frame_id,
         text_positions,
     }))
@@ -755,11 +871,11 @@ pub async fn get_frame_ocr_data(
 pub async fn run_frame_ocr(
     State(state): State<Arc<AppState>>,
     Path(frame_id): Path<i64>,
-) -> Result<JsonResponse<FrameOcrResponse>, (StatusCode, JsonResponse<Value>)> {
+) -> Result<JsonResponse<FrameTextResponse>, (StatusCode, JsonResponse<Value>)> {
     // Check if OCR data already exists — avoid redundant work
     match state.db.get_frame_text_positions(frame_id).await {
         Ok(existing) if !existing.is_empty() => {
-            return Ok(JsonResponse(FrameOcrResponse {
+            return Ok(JsonResponse(FrameTextResponse {
                 frame_id,
                 text_positions: existing,
             }));
@@ -893,7 +1009,7 @@ pub async fn run_frame_ocr(
         .await
         .unwrap_or_default();
 
-    Ok(JsonResponse(FrameOcrResponse {
+    Ok(JsonResponse(FrameTextResponse {
         frame_id,
         text_positions,
     }))
@@ -1004,10 +1120,17 @@ pub(crate) async fn serve_file(path: &str) -> Result<Response, (StatusCode, Json
 
             Ok(response)
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            JsonResponse(json!({"error": format!("Failed to open file: {}", e)})),
-        )),
+        Err(e) => {
+            let status = if e.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((
+                status,
+                JsonResponse(json!({"error": format!("Failed to open file: {}", e)})),
+            ))
+        }
     }
 }
 

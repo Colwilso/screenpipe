@@ -17,7 +17,9 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .try_init();
 
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         // Run all migrations with better error handling
         match sqlx::migrate!("./src/migrations").run(&db.pool).await {
@@ -78,6 +80,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -128,6 +133,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -139,6 +147,9 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -207,6 +218,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -218,6 +232,9 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -281,8 +298,8 @@ mod tests {
         .unwrap();
 
         // Verify that frames_fts was populated
-        let fts_data: Option<(i64, String, String, String, bool)> = sqlx::query_as(
-            "SELECT rowid, browser_url, app_name, window_name, focused FROM frames_fts WHERE rowid = ?",
+        let fts_data: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT rowid, browser_url, app_name, window_name FROM frames_fts WHERE rowid = ?",
         )
         .bind(frame_id)
         .fetch_optional(&db.pool)
@@ -326,6 +343,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -337,6 +357,9 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -460,21 +483,20 @@ mod tests {
                 .await
                 .unwrap();
         println!("Raw frames in DB: {:?}", raw_frames);
-        // Check if OCR text is properly indexed in FTS
+        // Check if frames are properly indexed in FTS (ocr_text_fts was dropped)
         let ocr_fts_data: Vec<(i64, String)> =
-            sqlx::query_as("SELECT rowid, text FROM ocr_text_fts")
+            sqlx::query_as("SELECT rowid, full_text FROM frames_fts")
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();
-        println!("OCR FTS data: {:?}", ocr_fts_data);
+        println!("Frames FTS data (full_text): {:?}", ocr_fts_data);
 
         // check if frames_fts is properly indexed
-        let frame_fts_data: Vec<(i64, String, String, String, bool)> = sqlx::query_as(
-            "SELECT id, browser_url, app_name, window_name, focused FROM frames_fts",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .unwrap();
+        let frame_fts_data: Vec<(i64, String, String, String)> =
+            sqlx::query_as("SELECT rowid, browser_url, app_name, window_name FROM frames_fts")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
         println!("Frames FTS data: {:?}", frame_fts_data);
 
         let insert_result = db
@@ -538,6 +560,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -563,6 +588,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -578,6 +606,9 @@ mod tests {
                 0,
                 Some(mid_time),
                 Some(end_time),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -615,6 +646,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -629,6 +663,9 @@ mod tests {
                 0,
                 Some(start_time),
                 Some(end_time),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -765,6 +802,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -783,6 +823,7 @@ mod tests {
                 ContentType::Audio,
                 Some(start_time),
                 Some(end_time),
+                None,
                 None,
                 None,
                 None,
@@ -885,16 +926,16 @@ mod tests {
                 "neural networks process natural language understanding efficiently",
             ],
         ];
-        for n in 0..3 {
+        for (n, speaker_transcriptions) in transcriptions.iter().enumerate() {
             let speaker = db.insert_speaker(&vec![n as f32; 512]).await.unwrap();
-            for i in 0..=n {
+            for (i, transcription) in speaker_transcriptions.iter().enumerate() {
                 let audio_chunk_id = db
                     .insert_audio_chunk(&format!("audio{}{}", n, i), None)
                     .await
                     .unwrap();
                 db.insert_audio_transcription(
                     audio_chunk_id,
-                    transcriptions[n][i],
+                    transcription,
                     0,
                     "",
                     &AudioDevice {
@@ -966,16 +1007,16 @@ mod tests {
                 "ribosomes assemble protein chains from messenger templates",
             ],
         ];
-        for n in 0..3 {
+        for (n, speaker_transcriptions) in transcriptions_ids.iter().enumerate() {
             let speaker = db.insert_speaker(&vec![n as f32; 512]).await.unwrap();
-            for i in 0..=n {
+            for (i, transcription) in speaker_transcriptions.iter().enumerate() {
                 let audio_chunk_id = db
                     .insert_audio_chunk(&format!("audio_ids_{}{}", n, i), None)
                     .await
                     .unwrap();
                 db.insert_audio_transcription(
                     audio_chunk_id,
-                    transcriptions_ids[n][i],
+                    transcription,
                     0,
                     "",
                     &AudioDevice {
@@ -1102,9 +1143,68 @@ mod tests {
         let speakers = db.search_speakers("").await.unwrap();
         assert_eq!(speakers.len(), 0);
 
-        // make sure audio_chunks are deleted
-        let audio_chunks = db.get_audio_chunks_for_speaker(speaker.id).await.unwrap();
-        assert_eq!(audio_chunks.len(), 0);
+        // Directly verify the orphaned chunk row was deleted
+        assert!(
+            !db.audio_chunk_exists(audio_chunk_id).await.unwrap(),
+            "orphaned audio_chunk row should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_speaker_shared_chunk_preserved() {
+        let db = setup_test_db().await;
+
+        let speaker_a = db.insert_speaker(&vec![0.1; 512]).await.unwrap();
+        let speaker_b = db.insert_speaker(&vec![0.2; 512]).await.unwrap();
+
+        // Both speakers reference the same audio chunk
+        let shared_chunk_id = db.insert_audio_chunk("shared.mp4", None).await.unwrap();
+        let device = AudioDevice {
+            name: "test".to_string(),
+            device_type: DeviceType::Output,
+        };
+        db.insert_audio_transcription(
+            shared_chunk_id,
+            "speaker a says hello",
+            0,
+            "",
+            &device,
+            Some(speaker_a.id),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_audio_transcription(
+            shared_chunk_id,
+            "speaker b says goodbye",
+            1,
+            "",
+            &device,
+            Some(speaker_b.id),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Delete speaker_a -- shared chunk must survive
+        db.delete_speaker(speaker_a.id).await.unwrap();
+
+        assert!(
+            db.audio_chunk_exists(shared_chunk_id).await.unwrap(),
+            "shared chunk still referenced by speaker_b must not be deleted"
+        );
+
+        // Delete speaker_b -- now the chunk is orphaned and should be removed
+        db.delete_speaker(speaker_b.id).await.unwrap();
+
+        assert!(
+            !db.audio_chunk_exists(shared_chunk_id).await.unwrap(),
+            "chunk should be deleted once all referencing transcriptions are gone"
+        );
     }
 
     #[tokio::test]
@@ -1249,6 +1349,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1274,6 +1377,9 @@ mod tests {
                 None,
                 None,
                 Some("non_existent"),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1305,6 +1411,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1320,6 +1429,7 @@ mod tests {
             .count_search_results(
                 "Hello",
                 ContentType::OCR,
+                None,
                 None,
                 None,
                 None,
@@ -1387,30 +1497,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Insert accessibility data (replaces legacy ui_monitoring table)
-        sqlx::query(
-            r#"
-            INSERT INTO accessibility (
-                text_content,
-                timestamp,
-                app_name,
-                window_name
-            ) VALUES (?, ?, ?, ?)
-            "#,
-        )
-        .bind("Hello from UI")
-        .bind(Utc::now())
-        .bind("test_app")
-        .bind("test_window")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        // Insert accessibility data
+        db.insert_accessibility_text("test_app", "test_window", "Hello from UI", None)
+            .await
+            .unwrap();
 
         // Test count with All content types
         let count = db
             .count_search_results(
                 "Hello",
                 ContentType::All,
+                None,
                 None,
                 None,
                 None,
@@ -1446,6 +1543,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1459,6 +1557,7 @@ mod tests {
             .count_search_results(
                 "nonexistent",
                 ContentType::All,
+                None,
                 None,
                 None,
                 None,
@@ -1518,17 +1617,10 @@ mod tests {
         }
     }
 
-    /// Manually index accessibility rows into FTS for tests.
-    /// The background FTS indexer doesn't run in tests, so we do it inline.
-    async fn index_accessibility_fts(db: &DatabaseManager) {
-        sqlx::query(
-            "INSERT OR IGNORE INTO accessibility_fts(rowid, text_content, app_name, window_name) \
-             SELECT id, text_content, COALESCE(app_name, ''), COALESCE(window_name, '') \
-             FROM accessibility WHERE text_content IS NOT NULL AND text_content != ''",
-        )
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    /// No-op: accessibility and accessibility_fts tables were dropped by migration.
+    /// Kept as a stub so existing call sites don't need to be removed.
+    async fn index_accessibility_fts(_db: &DatabaseManager) {
+        // Tables dropped — nothing to index.
     }
 
     // =========================================================================
@@ -1556,6 +1648,9 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1663,6 +1758,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1677,6 +1775,9 @@ mod tests {
                 0,
                 Some(mid),
                 Some(after),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1732,6 +1833,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1760,6 +1864,9 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1804,6 +1911,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1826,6 +1936,9 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1864,6 +1977,9 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1918,6 +2034,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1959,6 +2078,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1971,6 +2091,7 @@ mod tests {
             .count_search_results(
                 "nonexistent",
                 ContentType::Accessibility,
+                None,
                 None,
                 None,
                 None,

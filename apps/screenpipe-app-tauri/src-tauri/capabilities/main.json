@@ -51,6 +51,7 @@
     "fs:allow-create",
     "fs:allow-mkdir",
     "fs:allow-remove",
+    "fs:allow-rename",
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
@@ -124,6 +125,14 @@
           "requireLiteralLeadingDot": false
         },
         {
+          "path": "$DOWNLOAD",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$DOWNLOAD/*",
+          "requireLiteralLeadingDot": false
+        },
+        {
           "path": "$HOME/.screenpipe/*",
           "requireLiteralLeadingDot": false
         },
@@ -152,6 +161,14 @@
           "requireLiteralLeadingDot": false
         },
         {
+          "path": "$HOME/.codex",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/.codex/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
           "path": "$HOME/Library/Application Support/Claude",
           "requireLiteralLeadingDot": false
         },
@@ -165,6 +182,54 @@
         },
         {
           "path": "$APPDATA/Claude/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Claude",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Claude/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$APPDATA/Obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$APPDATA/Obsidian/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Obsidian/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/Library/Application Support/obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/Library/Application Support/obsidian/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/.config/obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/.config/obsidian/**",
           "requireLiteralLeadingDot": false
         }
       ]

@@ -6,6 +6,8 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { Battery, BatteryCharging, BatteryLow, Zap, Leaf, Gauge } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { localFetch } from "@/lib/api";
 
 interface PowerState {
   battery_pct: number | null;
@@ -41,13 +43,14 @@ const PROFILE_INFO = {
 } as const;
 
 export function BatterySaverSection() {
+  const { updateSettings } = useSettings();
   const [status, setStatus] = useState<PowerStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch("http://localhost:3030/power");
+      const res = await localFetch("/power");
       if (res.ok) {
         const data: PowerStatus = await res.json();
         setStatus(data);
@@ -69,7 +72,7 @@ export function BatterySaverSection() {
     if (updating) return;
     setUpdating(true);
     try {
-      const res = await fetch("http://localhost:3030/power", {
+      const res = await localFetch("/power", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode }),
@@ -77,6 +80,8 @@ export function BatterySaverSection() {
       if (res.ok) {
         const data: PowerStatus = await res.json();
         setStatus(data);
+        // Persist to settings store so it survives app restarts
+        await updateSettings({ powerMode: mode });
       }
     } catch {
       // ignore

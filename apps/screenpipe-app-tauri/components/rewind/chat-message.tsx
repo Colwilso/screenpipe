@@ -1,12 +1,11 @@
 import { Message } from "ai";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { useState, useEffect, useRef } from "react";
+import { Suspense, lazy, useState, useEffect, useRef } from "react";
 import { emit } from "@tauri-apps/api/event";
 
 import { cn } from "@/lib/utils";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
-import { CodeBlock } from "@/components/ui/codeblock";
 import { MemoizedReactMarkdown } from "@/components/markdown";
 import {
 	IconOpenAI,
@@ -17,10 +16,53 @@ import {
 import { ChatMessageActions } from "@/components/rewind/chat-message-actions";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { VideoComponent } from "./video";
-import { MermaidDiagram } from "./mermaid-diagram";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { ChevronDown } from "lucide-react";
 import { commands } from "@/lib/utils/tauri";
 import { toast } from "@/components/ui/use-toast";
+
+const MermaidDiagram = lazy(() =>
+	import("./mermaid-diagram").then((mod) => ({ default: mod.MermaidDiagram })),
+);
+const CodeBlock = lazy(() =>
+	import("@/components/ui/codeblock").then((mod) => ({ default: mod.CodeBlock })),
+);
+
+function MermaidDiagramBlock({ chart }: { chart: string }) {
+	return (
+		<Suspense
+			fallback={
+				<div className="my-4 text-xs text-muted-foreground">
+					rendering diagram...
+				</div>
+			}
+		>
+			<MermaidDiagram chart={chart} />
+		</Suspense>
+	);
+}
+
+function LazyCodeBlock({
+	language,
+	value,
+}: {
+	language: string;
+	value: string;
+}) {
+	return (
+		<Suspense
+			fallback={
+				<pre className="overflow-x-auto rounded-lg bg-neutral-900 dark:bg-neutral-950 p-3 my-2 text-xs max-w-full not-prose">
+					<code className="font-mono text-xs block whitespace-pre-wrap break-all text-neutral-200">
+						{value}
+					</code>
+				</pre>
+			}
+		>
+			<CodeBlock language={language} value={value} />
+		</Suspense>
+	);
+}
 
 export interface ChatMessageProps {
 	message: Message;
@@ -78,6 +120,15 @@ export function ChatMessage({ message, ...props }: ChatMessageProps) {
 
 	const hasMP4File = (content: string) =>
 		content.trim().toLowerCase().includes(".mp4");
+
+	/** Extract the first absolute .mp4 path from a string that may contain surrounding text. */
+	const extractMP4Path = (content: string): string => {
+		// Match absolute paths (may contain spaces, dashes, dots, etc.)
+		const match = content.match(/\/(?:[^\s/`]+ )*[^\s/`]+\.mp4/i)
+			|| content.match(/(?:\/[^\n`"':]+)+\.mp4/i)
+			|| content.match(/[A-Z]:\\[^\n`"':]+\.mp4/i); // Windows
+		return match ? match[0].trim() : content.trim();
+	};
 
 	if (!message?.content?.trim()) {
 		return null;
@@ -162,11 +213,31 @@ export function ChatMessage({ message, ...props }: ChatMessageProps) {
 						p({ children }) {
 							return <p className="mb-2 last:mb-0">{children}</p>;
 						},
+						img({ src, alt, ...props }) {
+							if (!src) return null;
+							// ![](path.mp4) → render video player
+							if (src.toLowerCase().endsWith(".mp4")) {
+								return <VideoComponent filePath={extractMP4Path(src)} />;
+							}
+							// Convert local file paths to Tauri asset URLs
+							const imgSrc = src.startsWith("/")
+								? convertFileSrc(src)
+								: src;
+							return (
+								<img
+									src={imgSrc}
+									alt={alt || ""}
+									className="max-w-full h-auto rounded-md my-2"
+									loading="lazy"
+									{...props}
+								/>
+							);
+						},
 						a({ node, href, children, ...props }) {
 							const isMP4Link = href?.toLowerCase().includes(".mp4");
 
 							if (isMP4Link && href) {
-								return <VideoComponent filePath={href} />;
+								return <VideoComponent filePath={extractMP4Path(href)} />;
 							}
 							
 							// Handle screenpipe:// timeline deep links in-app
@@ -239,12 +310,12 @@ export function ChatMessage({ message, ...props }: ChatMessageProps) {
 
 							// Render mermaid diagrams
 							if (language === "mermaid") {
-								return <MermaidDiagram chart={content} />;
+								return <MermaidDiagramBlock chart={content} />;
 							}
 
 							if (isMP4File || !match) {
 								if (isMP4File) {
-									return <VideoComponent filePath={content.trim()} />;
+									return <VideoComponent filePath={extractMP4Path(content)} />;
 								}
 								return (
 									<code
@@ -257,11 +328,9 @@ export function ChatMessage({ message, ...props }: ChatMessageProps) {
 							}
 
 							return (
-								<CodeBlock
-									key={Math.random()}
+								<LazyCodeBlock
 									language={language}
 									value={content}
-									{...props}
 								/>
 							);
 						},

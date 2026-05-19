@@ -30,7 +30,7 @@
 use chrono::{DateTime, Utc};
 use screenpipe_db::ActiveSpeaker;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -147,6 +147,73 @@ pub fn decide_speaker_names(
         }
     }
 
+    // Rule 4: Process-of-elimination — if N-1 of N attendees are already identified
+    // among the observed speakers, name the remaining unnamed speaker as the remaining attendee.
+    // This works for any meeting size (2+).
+    {
+        // Collect all named speakers from observations (already named + just decided)
+        let newly_named_ids: HashSet<i64> = decisions.names.iter().map(|d| d.speaker_id).collect();
+        let newly_named_map: HashMap<i64, &str> = decisions
+            .names
+            .iter()
+            .map(|d| (d.speaker_id, d.name.as_str()))
+            .collect();
+
+        // Build set of all speaker names (existing + newly decided)
+        let mut identified_names: Vec<String> = Vec::new();
+        let mut unnamed_candidates: Vec<&ActiveSpeaker> = Vec::new();
+
+        for obs in observations {
+            if loopback_ids.contains(&obs.speaker_id) {
+                continue;
+            }
+            if obs.transcription_count < MIN_TRANSCRIPTION_COUNT {
+                continue;
+            }
+
+            if let Some(name) = newly_named_map.get(&obs.speaker_id) {
+                if !name.is_empty() {
+                    identified_names.push(name.to_string());
+                    continue;
+                }
+            }
+            if !is_unnamed(&obs.speaker_name) {
+                identified_names.push(obs.speaker_name.clone());
+                continue;
+            }
+            // Skip if already decided by rules above
+            if newly_named_ids.contains(&obs.speaker_id) {
+                continue;
+            }
+            unnamed_candidates.push(obs);
+        }
+
+        // Deduplicate unnamed candidates by speaker_id
+        let mut seen_ids = HashSet::new();
+        unnamed_candidates.retain(|c| seen_ids.insert(c.speaker_id));
+
+        if unnamed_candidates.len() == 1 {
+            // Find which attendees are NOT yet matched
+            let mut unmatched_attendees: Vec<&String> = context.attendees.iter().collect();
+            for name in &identified_names {
+                if let Some(pos) = unmatched_attendees
+                    .iter()
+                    .position(|att| names_match(name, att))
+                {
+                    unmatched_attendees.remove(pos);
+                }
+            }
+
+            if unmatched_attendees.len() == 1 {
+                decisions.names.push(NamingDecision {
+                    speaker_id: unnamed_candidates[0].speaker_id,
+                    name: unmatched_attendees[0].clone(),
+                    reason: "process-of-elimination: only remaining unmatched attendee".into(),
+                });
+            }
+        }
+    }
+
     // Rule 3: Multi-person meeting → tag output speakers with meeting context
     if context.attendees.len() > 2 {
         let meeting_info = format!(
@@ -223,18 +290,8 @@ fn names_match(user_name: &str, attendee: &str) -> bool {
         return true;
     }
 
-    // Extract name part if email
-    let user_name_part = if let Some(before_at) = user.split('@').next() {
-        before_at.replace(['.', '_'], " ")
-    } else {
-        user.clone()
-    };
-
-    let att_name_part = if let Some(before_at) = att.split('@').next() {
-        before_at.replace(['.', '_'], " ")
-    } else {
-        att.clone()
-    };
+    let user_name_part = normalize_identity_name_part(&user);
+    let att_name_part = normalize_identity_name_part(&att);
 
     // After email normalization, exact match
     if user_name_part == att_name_part {
@@ -268,8 +325,186 @@ fn names_match(user_name: &str, attendee: &str) -> bool {
     false
 }
 
+/// Normalize display names and email identities for speaker matching.
+///
+/// Email addresses are often used as calendar attendee names, and Google-style
+/// plus addressing can create aliases for the same person:
+/// `louis+teams1234@screenpi.pe` and `louis@screenpi.pe` should both compare as
+/// `louis`.
+fn normalize_identity_name_part(value: &str) -> String {
+    let trimmed = value.trim().to_lowercase();
+    if trimmed.contains('@') {
+        let before_at = trimmed.split('@').next().unwrap_or(trimmed.as_str());
+        let local = before_at.split('+').next().unwrap_or(before_at);
+        local.replace(['.', '_'], " ")
+    } else {
+        trimmed.replace(['.', '_'], " ")
+    }
+}
+
+fn is_email_identity(value: &str) -> bool {
+    let value = value.trim();
+    value.contains('@') && value.split('@').all(|part| !part.is_empty())
+}
+
+fn preferred_speaker_name<'a>(left: &'a str, right: &'a str) -> &'a str {
+    match (is_email_identity(left), is_email_identity(right)) {
+        (false, true) => left,
+        (true, false) => right,
+        _ => {
+            let left_has_plus = left.split('@').next().unwrap_or(left).contains('+');
+            let right_has_plus = right.split('@').next().unwrap_or(right).contains('+');
+            match (left_has_plus, right_has_plus) {
+                (false, true) => left,
+                (true, false) => right,
+                _ => left,
+            }
+        }
+    }
+}
+
 fn is_unnamed(name: &str) -> bool {
     name.trim().is_empty()
+}
+
+/// After naming a speaker, check if another speaker already exists with the
+/// same (possibly email-normalized) name AND a similar voice, then merge them
+/// keeping the one with more voice samples.
+///
+/// Requires BOTH signals to avoid false merges:
+/// - name similarity: "louis@screenpi.pe" normalizes to "Louis"
+/// - voice similarity: confirmed same person by embedding distance
+///
+/// Without voice confirmation, two different people named Louis could be
+/// incorrectly merged just because one happened to have an email-style name.
+async fn deduplicate_speaker_by_name(
+    db: &screenpipe_db::DatabaseManager,
+    newly_named_id: i64,
+    name: &str,
+) {
+    // Get voice-similar speakers first — this is the strong signal
+    let similar = match db.get_similar_speakers(newly_named_id, 10).await {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("speaker dedup: get_similar_speakers failed: {}", e);
+            return;
+        }
+    };
+
+    // Among voice-similar speakers, find one whose name also normalizes to the same person
+    for candidate in &similar {
+        if candidate.name.trim().is_empty() {
+            continue;
+        }
+        if names_match(name, &candidate.name) {
+            // Voice matches AND name matches → same person.
+            // Count both speakers' samples in parallel — independent DB reads.
+            let (our_res, their_res) = tokio::join!(
+                db.count_embeddings_for_speaker(newly_named_id),
+                db.count_embeddings_for_speaker(candidate.id),
+            );
+            let our_count = our_res.unwrap_or(0);
+            let their_count = their_res.unwrap_or(0);
+            // Prefer keeping the candidate (existing, previously-named speaker) when equal —
+            // it was identified first and likely has the cleaner display name.
+            let (keep_id, merge_id) = if our_count > their_count {
+                (newly_named_id, candidate.id)
+            } else {
+                (candidate.id, newly_named_id)
+            };
+
+            info!(
+                "speaker dedup: merging {} into {} (same voice + name: '{}' ≈ '{}', samples {} vs {})",
+                merge_id, keep_id, name, candidate.name, our_count, their_count
+            );
+
+            if let Err(e) = db.merge_speakers(keep_id, merge_id).await {
+                warn!("speaker dedup: merge failed: {}", e);
+            }
+            break;
+        }
+    }
+}
+
+/// Clean up existing named duplicates created by account/calendar aliases.
+///
+/// This is intentionally conservative: it requires both name normalization and
+/// voice similarity before merging, so two different people with similar names
+/// are not merged just because their email local parts look alike.
+async fn deduplicate_existing_speaker_aliases(db: &screenpipe_db::DatabaseManager) {
+    let speakers = match db.get_named_speakers_with_centroids().await {
+        Ok(speakers) => speakers,
+        Err(e) => {
+            debug!(
+                "speaker alias cleanup: failed to list named speakers: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let mut merged_ids = HashSet::new();
+    for (speaker_id, speaker_name, _) in speakers {
+        if merged_ids.contains(&speaker_id) {
+            continue;
+        }
+
+        let similar = match db.get_similar_speakers(speaker_id, 10).await {
+            Ok(similar) => similar,
+            Err(e) => {
+                debug!(
+                    "speaker alias cleanup: failed to get similar speakers for {}: {}",
+                    speaker_id, e
+                );
+                continue;
+            }
+        };
+
+        for candidate in similar {
+            if merged_ids.contains(&candidate.id) || candidate.name.trim().is_empty() {
+                continue;
+            }
+            if !names_match(&speaker_name, &candidate.name) {
+                continue;
+            }
+
+            let preferred = preferred_speaker_name(&speaker_name, &candidate.name);
+            let (our_res, their_res) = tokio::join!(
+                db.count_embeddings_for_speaker(speaker_id),
+                db.count_embeddings_for_speaker(candidate.id),
+            );
+            let our_count = our_res.unwrap_or(0);
+            let their_count = their_res.unwrap_or(0);
+
+            let (keep_id, merge_id, keep_name) = if preferred == speaker_name {
+                (speaker_id, candidate.id, speaker_name.as_str())
+            } else if preferred == candidate.name {
+                (candidate.id, speaker_id, candidate.name.as_str())
+            } else if our_count >= their_count {
+                (speaker_id, candidate.id, speaker_name.as_str())
+            } else {
+                (candidate.id, speaker_id, candidate.name.as_str())
+            };
+
+            info!(
+                "speaker alias cleanup: merging {} into {} (same voice + alias: '{}' ≈ '{}')",
+                merge_id, keep_id, speaker_name, candidate.name
+            );
+
+            match db.merge_speakers(keep_id, merge_id).await {
+                Ok(_) => {
+                    merged_ids.insert(merge_id);
+                    if let Err(e) = db.update_speaker_name(keep_id, keep_name).await {
+                        debug!(
+                            "speaker alias cleanup: failed to preserve preferred name for {}: {}",
+                            keep_id, e
+                        );
+                    }
+                }
+                Err(e) => warn!("speaker alias cleanup: merge failed: {}", e),
+            }
+        }
+    }
 }
 
 // ── Background task ──────────────────────────────────────────────────────
@@ -304,6 +539,13 @@ pub fn start_speaker_identification(
     db: Arc<screenpipe_db::DatabaseManager>,
     user_name: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
+    {
+        let db2 = db.clone();
+        tokio::spawn(async move {
+            deduplicate_existing_speaker_aliases(&db2).await;
+        });
+    }
+
     // Auto-name the dominant input speaker as the user (runs independently of meetings)
     if let Some(name) = user_name.clone() {
         if !name.trim().is_empty() {
@@ -343,6 +585,7 @@ async fn auto_name_input_speaker(db: Arc<screenpipe_db::DatabaseManager>, user_n
                             "auto speaker identification: named dominant input speaker {} as '{}'",
                             speaker_id, user_name
                         );
+                        deduplicate_speaker_by_name(&db, speaker_id, user_name).await;
                         // Done — the dominant input speaker is now named.
                         // Keep running in case new unnamed speakers accumulate
                         // (e.g. after centroid drift creates a new cluster for the same person).
@@ -448,6 +691,11 @@ async fn run_speaker_identification_loop(
                                             decision.reason,
                                         );
                                         named_in_meeting.insert(decision.speaker_id);
+                                        deduplicate_speaker_by_name(
+                                            &db,
+                                            decision.speaker_id,
+                                            &decision.name,
+                                        ).await;
                                     }
                                     Err(e) => {
                                         warn!(
@@ -538,6 +786,28 @@ mod tests {
     fn test_names_match_email_normalization() {
         assert!(names_match("alice.smith@example.com", "Alice Smith"));
         assert!(names_match("alice_smith@company.org", "Alice Smith"));
+    }
+
+    #[test]
+    fn test_names_match_email_single_name() {
+        // The exact bug case: calendar stores "louis@screenpi.pe", speaker was named "Louis"
+        assert!(names_match("louis@screenpi.pe", "Louis"));
+        assert!(names_match("Louis", "louis@screenpi.pe"));
+        // Reverse: both as emails
+        assert!(names_match("louis@screenpi.pe", "louis@company.com"));
+    }
+
+    #[test]
+    fn test_names_match_plus_addressed_email_aliases() {
+        assert!(names_match(
+            "louis+teams1234@screenpi.pe",
+            "louis@screenpi.pe"
+        ));
+        assert!(names_match("Louis", "louis+teams1234@screenpi.pe"));
+        assert!(names_match(
+            "louis.pereira+teams1234@screenpi.pe",
+            "Louis Pereira"
+        ));
     }
 
     #[test]
@@ -868,5 +1138,252 @@ mod tests {
 
         let output_d = decisions.names.iter().find(|d| d.speaker_id == 2).unwrap();
         assert_eq!(output_d.name, "Bob Jones");
+    }
+
+    // ── Rule 4: Process-of-elimination tests ──────────────────────────
+
+    #[test]
+    fn test_rule4_elimination_three_attendees() {
+        // 3 attendees, 2 already named (via rules 1+2 won't fire for 3-person,
+        // but speakers can be pre-named in DB)
+        let context = ctx(
+            &["Alice Smith", "Bob Jones", "Charlie Brown"],
+            Some("Alice Smith"),
+            Some("Team Meeting"),
+        );
+        let observations = vec![
+            speaker(1, "Alice Smith", true, 10), // already named
+            speaker(2, "Bob Jones", false, 10),  // already named
+            speaker(3, "", false, 5),            // unnamed output
+        ];
+        let decisions = decide_speaker_names(&context, &observations);
+
+        // Rule 4 should name speaker 3 as Charlie Brown
+        let charlie = decisions.names.iter().find(|d| d.speaker_id == 3);
+        assert!(charlie.is_some(), "expected Rule 4 to name speaker 3");
+        assert_eq!(charlie.unwrap().name, "Charlie Brown");
+        assert!(charlie.unwrap().reason.contains("elimination"));
+    }
+
+    #[test]
+    fn test_rule4_does_not_trigger_with_multiple_unnamed() {
+        // 3 attendees but 2 unnamed — can't determine which is which
+        let context = ctx(
+            &["Alice Smith", "Bob Jones", "Charlie Brown"],
+            Some("Alice Smith"),
+            Some("Team Meeting"),
+        );
+        let observations = vec![
+            speaker(1, "Alice Smith", true, 10),
+            speaker(2, "", false, 5), // unnamed
+            speaker(3, "", false, 5), // unnamed
+        ];
+        let decisions = decide_speaker_names(&context, &observations);
+
+        // Rule 4 should NOT fire (2 unnamed, 2 unmatched attendees)
+        let elimination_decisions: Vec<_> = decisions
+            .names
+            .iter()
+            .filter(|d| d.reason.contains("elimination"))
+            .collect();
+        assert!(elimination_decisions.is_empty());
+    }
+
+    #[test]
+    fn test_rule4_insufficient_transcriptions_no_trigger() {
+        let context = ctx(
+            &["Alice Smith", "Bob Jones", "Charlie Brown"],
+            Some("Alice Smith"),
+            None,
+        );
+        let observations = vec![
+            speaker(1, "Alice Smith", true, 10),
+            speaker(2, "Bob Jones", false, 10),
+            speaker(3, "", false, 2), // only 2 transcriptions — below threshold
+        ];
+        let decisions = decide_speaker_names(&context, &observations);
+
+        let elimination_decisions: Vec<_> = decisions
+            .names
+            .iter()
+            .filter(|d| d.reason.contains("elimination"))
+            .collect();
+        assert!(elimination_decisions.is_empty());
+    }
+
+    #[test]
+    fn test_rule4_works_with_rule1_output() {
+        // In a 1:1, rules 1+2 already name both speakers.
+        // Rule 4 shouldn't double-name. But in a 3-person meeting
+        // where rule 1 names the input speaker, rule 4 can name
+        // the remaining output speaker.
+        let context = ctx(
+            &["Alice Smith", "Bob Jones", "Charlie Brown"],
+            Some("Alice Smith"),
+            None,
+        );
+        let observations = vec![
+            speaker(1, "", true, 5),            // unnamed input → Rule 1 names as Alice
+            speaker(2, "Bob Jones", false, 10), // already named
+            speaker(3, "", false, 5),           // unnamed output
+        ];
+        let decisions = decide_speaker_names(&context, &observations);
+
+        // Rule 1 should name speaker 1 as Alice
+        let alice = decisions.names.iter().find(|d| d.speaker_id == 1);
+        assert!(alice.is_some());
+        assert_eq!(alice.unwrap().name, "Alice Smith");
+
+        // Rule 4 should name speaker 3 as Charlie Brown
+        let charlie = decisions.names.iter().find(|d| d.speaker_id == 3);
+        assert!(charlie.is_some(), "expected Rule 4 to name speaker 3");
+        assert_eq!(charlie.unwrap().name, "Charlie Brown");
+    }
+
+    // ── deduplicate_speaker_by_name integration tests ─────────────────────
+    //
+    // These tests use a real in-memory DatabaseManager (with sqlite-vec loaded)
+    // so that get_similar_speakers / vec_distance_cosine work correctly.
+
+    async fn setup_db() -> screenpipe_db::DatabaseManager {
+        let db = screenpipe_db::DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        sqlx::migrate!("../../crates/screenpipe-db/src/migrations")
+            .run(&db.pool)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// Insert a speaker with a given embedding and optionally a name,
+    /// plus one audio transcription so it appears in RecentAudioPaths.
+    async fn seed_speaker(
+        db: &screenpipe_db::DatabaseManager,
+        embedding: &[f32],
+        name: Option<&str>,
+    ) -> i64 {
+        use screenpipe_db::{AudioDevice, DeviceType};
+
+        let speaker = db.insert_speaker(embedding).await.unwrap();
+        let id = speaker.id;
+
+        if let Some(n) = name {
+            db.update_speaker_name(id, n).await.unwrap();
+        }
+
+        // Attach one transcription so the speaker appears in RecentAudioPaths
+        let chunk_id = db
+            .insert_audio_chunk(&format!("test_{}.mp4", id), None)
+            .await
+            .unwrap();
+        db.insert_audio_transcription(
+            chunk_id,
+            &format!("test transcription for speaker {}", id),
+            0,
+            "test",
+            &AudioDevice {
+                name: "test_mic".to_string(),
+                device_type: DeviceType::Input,
+            },
+            Some(id),
+            Some(0.0),
+            Some(1.0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        id
+    }
+
+    #[tokio::test]
+    async fn test_dedup_merges_email_and_display_name() {
+        let db = setup_db().await;
+
+        // Same embedding → cosine distance 0 → voice-similar
+        let embedding: Vec<f32> = vec![0.1; 512];
+
+        // Speaker A: already named "Louis"
+        let id_a = seed_speaker(&db, &embedding, Some("Louis")).await;
+
+        // Speaker B: unnamed (will be named "louis@screenpi.pe" by calendar)
+        let id_b = seed_speaker(&db, &embedding, None).await;
+
+        // Simulate what calendar_speaker_id does: name speaker B from calendar attendee email
+        db.update_speaker_name(id_b, "louis@screenpi.pe")
+            .await
+            .unwrap();
+
+        // Run the dedup — should detect voice+name match and merge B into A
+        deduplicate_speaker_by_name(&db, id_b, "louis@screenpi.pe").await;
+
+        // After merge: "louis@screenpi.pe" entry should be gone
+        let email_speaker = db.find_speaker_by_name("louis@screenpi.pe").await.unwrap();
+        assert!(
+            email_speaker.is_none(),
+            "louis@screenpi.pe should have been merged away"
+        );
+
+        // "Louis" should still exist
+        let louis = db.find_speaker_by_name("Louis").await.unwrap();
+        assert!(louis.is_some(), "Louis should still exist after merge");
+    }
+
+    #[tokio::test]
+    async fn test_startup_alias_cleanup_merges_plus_addressed_duplicate() {
+        let db = setup_db().await;
+
+        let embedding: Vec<f32> = vec![0.1; 512];
+        let id_a = seed_speaker(&db, &embedding, Some("louis@screenpi.pe")).await;
+        let id_b = seed_speaker(&db, &embedding, Some("louis+teams1234@screenpi.pe")).await;
+
+        deduplicate_existing_speaker_aliases(&db).await;
+
+        let base = db.find_speaker_by_name("louis@screenpi.pe").await.unwrap();
+        assert!(base.is_some(), "base email identity should be kept");
+
+        let plus = db
+            .find_speaker_by_name("louis+teams1234@screenpi.pe")
+            .await
+            .unwrap();
+        assert!(plus.is_none(), "plus-addressed duplicate should be merged");
+
+        let merged_id = base.unwrap().id;
+        assert!(
+            merged_id == id_a || merged_id == id_b,
+            "merged speaker should keep one of the original ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_does_not_merge_different_voices() {
+        let db = setup_db().await;
+
+        // Different embeddings → cosine distance > 0.8 → not voice-similar
+        let embedding_a: Vec<f32> = (0..512).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+        let embedding_b: Vec<f32> = (0..512).map(|i| if i == 1 { 1.0 } else { 0.0 }).collect();
+
+        let id_a = seed_speaker(&db, &embedding_a, Some("Louis")).await;
+        let id_b = seed_speaker(&db, &embedding_b, None).await;
+
+        db.update_speaker_name(id_b, "louis@screenpi.pe")
+            .await
+            .unwrap();
+
+        // Dedup should NOT merge: same-ish name but different voices
+        deduplicate_speaker_by_name(&db, id_b, "louis@screenpi.pe").await;
+
+        // Both should still exist independently
+        let email_speaker = db.find_speaker_by_name("louis@screenpi.pe").await.unwrap();
+        assert!(
+            email_speaker.is_some(),
+            "different-voice speakers must not be merged"
+        );
+        let _ = db.find_speaker_by_name("Louis").await.unwrap();
+
+        // Cleanup: delete the temporary speakers
+        let _ = db.delete_speaker(id_a).await;
+        let _ = db.delete_speaker(id_b).await;
     }
 }

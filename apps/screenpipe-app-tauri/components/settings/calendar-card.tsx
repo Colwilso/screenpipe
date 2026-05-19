@@ -20,6 +20,28 @@ import {
 import { platform } from "@tauri-apps/plugin-os";
 import { invoke } from "@tauri-apps/api/core";
 import posthog from "posthog-js";
+import { getStore, saveAndEncrypt } from "@/lib/hooks/use-settings";
+
+const STORE_KEY = "calendarUserDisconnected";
+const ENABLED_KEY = "calendarEnabled";
+
+async function getCalendarPref(key: string): Promise<boolean> {
+  try {
+    const store = await getStore();
+    const val = await store.get<boolean>(key);
+    return val ?? false;
+  } catch {
+    return false;
+  }
+}
+
+async function setCalendarPref(key: string, value: boolean): Promise<void> {
+  try {
+    const store = await getStore();
+    await store.set(key, value);
+    await saveAndEncrypt(store);
+  } catch {}
+}
 
 interface CalendarEventItem {
   id: string;
@@ -34,7 +56,7 @@ interface CalendarEventItem {
   isAllDay: boolean;
 }
 
-export function CalendarCard() {
+export function CalendarCard({ onConnectionChange }: { onConnectionChange?: () => void } = {}) {
   const [os, setOs] = useState<string>("");
   const [enabled, setEnabled] = useState(false);
   const [authorized, setAuthorized] = useState(false);
@@ -48,19 +70,30 @@ export function CalendarCard() {
     setOs(platform());
   }, []);
 
-  // Load enabled state from localStorage
+  // Load enabled state from Tauri store (migrate from localStorage if needed)
   useEffect(() => {
-    try {
-      const stored = localStorage?.getItem("calendar-enabled");
-      if (stored !== null) setEnabled(stored === "true");
-    } catch {}
+    (async () => {
+      try {
+        const stored = await getCalendarPref(ENABLED_KEY);
+        // If nothing in store yet, check old localStorage for migration
+        if (!stored) {
+          const legacy = localStorage?.getItem("calendar-enabled");
+          if (legacy !== null) {
+            const val = legacy === "true";
+            setEnabled(val);
+            await setCalendarPref(ENABLED_KEY, val);
+            localStorage?.removeItem("calendar-enabled");
+            return;
+          }
+        }
+        setEnabled(stored);
+      } catch {}
+    })();
   }, []);
 
-  const toggleEnabled = (val: boolean) => {
+  const toggleEnabled = async (val: boolean) => {
     setEnabled(val);
-    try {
-      localStorage?.setItem("calendar-enabled", String(val));
-    } catch {}
+    await setCalendarPref(ENABLED_KEY, val);
     posthog.capture(val ? "calendar_enabled" : "calendar_disabled");
   };
 
@@ -79,21 +112,25 @@ export function CalendarCard() {
     setIsLoadingEvents(false);
   }, []);
 
-  // Check calendar authorization status
+  // Check calendar authorization status, respecting user's explicit disconnect
   const checkStatus = useCallback(async () => {
     try {
-      const status = await invoke<{
-        available: boolean;
-        authorized: boolean;
-        authorizationStatus: string;
-        calendarCount: number;
-      }>("calendar_status");
+      const [status, userDisconnected] = await Promise.all([
+        invoke<{
+          available: boolean;
+          authorized: boolean;
+          authorizationStatus: string;
+          calendarCount: number;
+        }>("calendar_status"),
+        getCalendarPref(STORE_KEY),
+      ]);
 
-      setAuthorized(status.authorized);
-      setCalendarCount(status.calendarCount);
-      if (status.authorizationStatus === "Denied") {
-        setAuthDenied(true);
-      }
+      // If the OS permission is granted but the user explicitly disconnected,
+      // treat as not connected in the UI — don't auto-reconnect.
+      const effectivelyAuthorized = status.authorized && !userDisconnected;
+      setAuthorized(effectivelyAuthorized);
+      setCalendarCount(effectivelyAuthorized ? status.calendarCount : 0);
+      setAuthDenied(status.authorizationStatus === "Denied");
     } catch {}
   }, []);
 
@@ -101,6 +138,21 @@ export function CalendarCard() {
     if (os === "macos" || os === "windows") {
       checkStatus();
     }
+  }, [os, checkStatus]);
+
+  // Re-check status when the app regains focus — covers the case where the
+  // user toggled calendar access in System Settings and came back.
+  useEffect(() => {
+    if (os !== "macos" && os !== "windows") return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") checkStatus();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", checkStatus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", checkStatus);
+    };
   }, [os, checkStatus]);
 
   // Fetch events when authorized + enabled
@@ -114,15 +166,16 @@ export function CalendarCard() {
   const authorizeCalendar = async () => {
     setIsAuthorizing(true);
     setAuthDenied(false);
+    // Clear the explicit-disconnect flag so checkStatus won't suppress the connection
+    await setCalendarPref(STORE_KEY, false);
     try {
       const result = await invoke<string>("calendar_authorize");
       if (result === "granted") {
         setAuthorized(true);
         setEnabled(true);
-        try {
-          localStorage?.setItem("calendar-enabled", "true");
-        } catch {}
+        await setCalendarPref(ENABLED_KEY, true);
         posthog.capture("calendar_authorized", { result: "granted" });
+        onConnectionChange?.();
         checkStatus();
       } else {
         setAuthDenied(true);
@@ -198,8 +251,52 @@ export function CalendarCard() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={authorizeCalendar}
-                  disabled={isAuthorizing || authDenied}
+                  onClick={authDenied ? async () => {
+                    setIsAuthorizing(true);
+                    // Step 1: clear the stale TCC record. Cross-version cdhash
+                    // / Designated-Requirement drift on the prod bundle leaves
+                    // a "denied" entry that macOS silently rejects future
+                    // requestFullAccessToEventsWithCompletion calls against —
+                    // so the app never re-registers in Privacy → Calendars
+                    // and the pane shows up empty. tccutil reset clears it.
+                    try {
+                      await invoke<string>("calendar_reset_permission");
+                    } catch {
+                      // best-effort — still attempt the request below
+                    }
+                    // Step 2: re-trigger the OS request. With the record gone
+                    // status is now NotDetermined, so this hits a fresh code
+                    // path that registers screenpipe in Privacy → Calendars
+                    // (and shows the native prompt).
+                    try {
+                      await invoke<string>("calendar_authorize");
+                    } catch {
+                      // ignore — still try to open Settings
+                    }
+                    // Give the OS a moment to update TCC state
+                    await new Promise((r) => setTimeout(r, 400));
+
+                    // Open System Settings to Calendar privacy pane
+                    const { Command } = await import("@tauri-apps/plugin-shell");
+                    const urls = [
+                      "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
+                      "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Calendars",
+                      "x-apple.systempreferences:com.apple.preference.security?Privacy",
+                    ];
+                    for (const url of urls) {
+                      try {
+                        await Command.create("open", [url]).execute();
+                        break;
+                      } catch {
+                        // try next
+                      }
+                    }
+
+                    setIsAuthorizing(false);
+                    // Re-check after user has had time to toggle
+                    setTimeout(checkStatus, 3000);
+                  } : authorizeCalendar}
+                  disabled={isAuthorizing}
                   className="text-xs"
                 >
                   {isAuthorizing ? (
@@ -209,17 +306,18 @@ export function CalendarCard() {
                   ) : (
                     <Calendar className="h-3 w-3 mr-1.5" />
                   )}
-                  {authDenied ? "Access denied" : "Connect Calendar"}
+                  {authDenied ? "Fix Calendar Permission" : "Connect Calendar"}
                 </Button>
 
                 {authDenied && (
-                  <p className="text-xs text-muted-foreground">
-                    Open{" "}
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    Calendar access was denied. Click the button above — it
+                    re-registers screenpipe in{" "}
                     <span className="font-medium">
-                      System Settings &rarr; Privacy &amp; Security &rarr;
-                      Calendars
+                      Privacy &amp; Security &rarr; Calendars
                     </span>{" "}
-                    and enable screenpipe, then restart the app.
+                    and opens System Settings. Toggle screenpipe ON there,
+                    then come back.
                   </p>
                 )}
               </div>
@@ -240,12 +338,14 @@ export function CalendarCard() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => {
+                  onClick={async () => {
                     setAuthorized(false);
                     setEnabled(false);
-                    try {
-                      localStorage?.setItem("calendar-enabled", "false");
-                    } catch {}
+                    await Promise.all([
+                      setCalendarPref(STORE_KEY, true),
+                      setCalendarPref(ENABLED_KEY, false),
+                    ]);
+                    onConnectionChange?.();
                     posthog.capture("calendar_disconnected");
                   }}
                   className="text-xs text-muted-foreground hover:text-destructive h-7 px-2"

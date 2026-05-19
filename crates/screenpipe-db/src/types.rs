@@ -1,9 +1,34 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use oasgen::OaSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::error::Error as StdError;
 use std::fmt::{self, Display};
+
+/// Parse a timestamp string that may be in RFC 3339 ("2026-03-26T21:07:37+00:00"),
+/// chrono Display ("2026-03-26 21:07:37.993675 UTC"), or naive ("2026-03-26 21:07:37")
+/// format. Returns epoch (1970-01-01) if all parsing fails rather than panicking.
+fn parse_flexible_timestamp(s: &str) -> DateTime<Utc> {
+    // RFC 3339 / ISO 8601 (correct format from to_rfc3339())
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return dt.with_timezone(&Utc);
+    }
+    // chrono Display format: "2026-03-26 21:07:37.993675 UTC"
+    if let Some(trimmed) = s.strip_suffix(" UTC") {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f") {
+            return naive.and_utc();
+        }
+    }
+    // Naive without timezone: "2026-03-26 21:07:37" or with fractional
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return naive.and_utc();
+    }
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return naive.and_utc();
+    }
+    // Last resort: epoch
+    DateTime::UNIX_EPOCH
+}
 
 /// Audio chunk that has no corresponding transcription row.
 /// Used by the reconciliation sweep to detect and retry orphaned chunks.
@@ -52,7 +77,7 @@ impl StdError for DatabaseError {}
 
 /// Search result variants for different content types.
 ///
-/// Note: `UI` is for accessibility text traversal (ui_monitoring table).
+/// Note: `UI` is for accessibility text traversal (accessibility table).
 /// `Input` is for user actions like clicks/keystrokes (ui_events table).
 #[derive(OaSchema, Debug, Serialize, Deserialize)]
 pub enum SearchResult {
@@ -62,6 +87,8 @@ pub enum SearchResult {
     UI(UiContent),
     /// User input actions (clicks, keystrokes, clipboard)
     Input(UiEventRecord),
+    /// Persistent memory
+    Memory(MemoryRecord),
 }
 
 #[derive(FromRow, Debug)]
@@ -115,6 +142,7 @@ pub struct OCRResult {
 /// - `audio` - Transcribed speech
 /// - `input` - User actions (clicks, keystrokes, clipboard)
 /// - `accessibility` - Accessibility tree text
+/// - `memory` - Persistent facts, preferences, decisions
 #[derive(OaSchema, Debug, Deserialize, PartialEq, Default, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {
@@ -129,6 +157,8 @@ pub enum ContentType {
     Input,
     /// Accessibility tree text
     Accessibility,
+    /// Persistent memories: facts, preferences, decisions, insights
+    Memory,
 }
 
 #[derive(FromRow)]
@@ -145,6 +175,11 @@ pub struct AudioResultRaw {
     pub speaker_id: Option<i64>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub diarization_mode: Option<String>,
+    pub diarization_speaker_label: Option<String>,
+    pub diarization_provider: Option<String>,
+    pub diarization_source: Option<String>,
+    pub diarization_confidence: Option<f64>,
 }
 
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
@@ -152,6 +187,58 @@ pub struct Speaker {
     pub id: i64,
     pub name: String,
     pub metadata: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDiarizationSegment {
+    pub provider_speaker_label: String,
+    pub speaker_id: Option<i64>,
+    pub source: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub confidence: Option<f64>,
+    pub overlap: bool,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplacementAudioTranscription {
+    pub transcription: String,
+    pub speaker_id: Option<i64>,
+    pub start_time: f64,
+    pub end_time: f64,
+}
+
+/// A persistent memory: fact, preference, decision, or insight.
+#[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
+pub struct MemoryRecord {
+    pub id: i64,
+    pub content: String,
+    pub source: String,
+    pub source_context: Option<String>,
+    pub tags: Option<String>,
+    pub importance: f64,
+    pub frame_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A memory row + the columns the cross-device sync layer needs.
+/// Used only by [`DatabaseManager::list_memories_for_sync`] — the
+/// HTTP/UI surface keeps using [`MemoryRecord`] to avoid leaking
+/// sync state into the public API.
+#[derive(Debug, FromRow, Clone)]
+pub struct MemorySyncRow {
+    pub id: i64,
+    pub sync_uuid: Option<String>,
+    pub content: String,
+    pub source: String,
+    pub source_context: Option<String>,
+    pub tags: Option<String>,
+    pub importance: f64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub sync_modified_by: Option<String>,
 }
 
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
@@ -162,7 +249,29 @@ pub struct MeetingRecord {
     pub meeting_app: String,
     pub title: Option<String>,
     pub attendees: Option<String>,
+    pub note: Option<String>,
     pub detection_source: String,
+    pub created_at: String,
+}
+
+#[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingTranscriptSegment {
+    pub id: i64,
+    pub meeting_id: i64,
+    pub source: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub item_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub audio_transcription_id: Option<i64>,
+    pub audio_chunk_id: Option<i64>,
+    pub audio_file_path: Option<String>,
+    pub speaker_id: Option<i64>,
+    pub speaker_name: Option<String>,
+    pub transcript: String,
+    pub captured_at: String,
     pub created_at: String,
 }
 
@@ -192,8 +301,16 @@ pub struct AudioResult {
     pub device_name: String,
     pub device_type: DeviceType,
     pub speaker: Option<Speaker>,
+    pub speaker_label: Option<String>,
+    pub speaker_source: Option<String>,
+    pub speaker_confidence: Option<f64>,
+    pub speaker_provisional: bool,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub source: Option<String>,
+    pub meeting_id: Option<i64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(OaSchema, Debug, Deserialize, PartialEq)]
@@ -358,6 +475,8 @@ pub struct FrameRow {
     pub window_name: String,
     pub ocr_text: String,
     pub text_json: String,
+    /// Accessibility tree JSON — used as fallback for bounding boxes when OCR text_json is empty
+    pub accessibility_tree_json: Option<String>,
 }
 
 /// Lightweight frame row for grouped search — skips text/text_json columns.
@@ -515,11 +634,13 @@ pub struct UiEventRecord {
     pub frame_id: Option<i64>,
 }
 
-/// Raw row from ui_events table
+/// Raw row from ui_events table.
+/// `timestamp` is read as String to handle both legacy format ("2026-03-26 21:07:37 UTC")
+/// and RFC 3339 format ("2026-03-26T21:07:37+00:00") from existing databases.
 #[derive(Debug, FromRow)]
 pub struct UiEventRow {
     pub id: i64,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: String,
     pub session_id: Option<String>,
     pub relative_ms: i64,
     pub event_type: String,
@@ -566,7 +687,7 @@ impl From<UiEventRow> for UiEventRecord {
 
         UiEventRecord {
             id: row.id,
-            timestamp: row.timestamp,
+            timestamp: parse_flexible_timestamp(&row.timestamp),
             session_id: row.session_id,
             relative_ms: row.relative_ms,
             event_type: row.event_type.parse().unwrap_or(UiEventType::Click),
@@ -673,6 +794,12 @@ pub struct Element {
     pub bounds: Option<ElementBounds>,
     pub confidence: Option<f64>,
     pub sort_order: i32,
+    /// True when this element was visually present on the captured frame.
+    /// `None` for elements captured before the on-screen check landed
+    /// (legacy rows) — search filters treat that as "unknown" rather than
+    /// implicitly true/false. See issue #2436.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_screen: Option<bool>,
 }
 
 /// Flat row for bulk insert (parent_id assigned after insert)
@@ -704,6 +831,10 @@ pub struct ElementRow {
     pub height_bound: Option<f64>,
     pub confidence: Option<f64>,
     pub sort_order: i32,
+    /// SQLite INTEGER (1/0/NULL) decoded as Option<bool>. NULL = unknown
+    /// (legacy rows pre-issue-#2436 fix); search treats unknown as
+    /// neither on- nor off-screen.
+    pub on_screen: Option<bool>,
 }
 
 impl From<ElementRow> for Element {
@@ -733,6 +864,7 @@ impl From<ElementRow> for Element {
             bounds,
             confidence: row.confidence,
             sort_order: row.sort_order,
+            on_screen: row.on_screen,
         }
     }
 }
@@ -757,5 +889,32 @@ mod tests {
             ContentType::Accessibility,
             serde_json::from_str(r#""accessibility""#).unwrap()
         );
+        assert_eq!(
+            ContentType::Memory,
+            serde_json::from_str(r#""memory""#).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_flexible_timestamp_all_formats_agree() {
+        let rfc = super::parse_flexible_timestamp("2026-03-26T21:07:37.993675+00:00");
+        let display = super::parse_flexible_timestamp("2026-03-26 21:07:37.993675 UTC");
+        let naive = super::parse_flexible_timestamp("2026-03-26 21:07:37");
+        // All three should parse to the same date (naive loses sub-second)
+        assert_eq!(rfc.date_naive(), display.date_naive());
+        assert_eq!(rfc.date_naive(), naive.date_naive());
+        assert_eq!(rfc, display);
+        assert_eq!(
+            naive.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-26 21:07:37"
+        );
+        // None should be epoch
+        assert_ne!(rfc, chrono::DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn parse_flexible_timestamp_garbage_returns_epoch() {
+        let ts = super::parse_flexible_timestamp("not-a-date");
+        assert_eq!(ts, chrono::DateTime::UNIX_EPOCH);
     }
 }

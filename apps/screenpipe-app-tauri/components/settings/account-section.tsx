@@ -22,16 +22,38 @@ import { Card } from "../ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { localFetch } from "@/lib/api";
 import { listen } from "@tauri-apps/api/event";
 import { PricingToggle } from "./pricing-toggle";
 import { ReferralCard } from "./referral-card";
+import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import posthog from "posthog-js";
 
+/**
+ * Map a thrown fetch error into a user-readable description.
+ *
+ * Reason: WebKit returns `TypeError: Load failed` when a fetch to a
+ * host:port that isn't bound (engine server still warming up after
+ * launch or mid-restart) — that message reaches the user as
+ * "Load failed (localhost:3030)" which is opaque. Replace any
+ * connection-style failure with a clear, actionable line; pass other
+ * errors through verbatim.
+ */
+function syncErrorDescription(e: unknown): string {
+  const msg = (e instanceof Error ? e.message : String(e)) || "";
+  // WebKit ("Load failed"), Chromium ("Failed to fetch"), Firefox ("NetworkError")
+  if (/load failed|failed to fetch|networkerror|network request failed/i.test(msg)) {
+    return "screenpipe server isn't reachable — give it a few seconds after launch and try again";
+  }
+  return msg;
+}
 
 export function AccountSection() {
   const { settings, updateSettings, loadUser } = useSettings();
+  const { isServerDown } = useHealthCheck();
   const [isAnnual, setIsAnnual] = useState(true);
   const [pipeSyncing, setPipeSyncing] = useState(false);
+  const [memoriesSyncing, setMemoriesSyncing] = useState(false);
 
   useEffect(() => {
     if (!settings.user?.email) {
@@ -55,7 +77,7 @@ export function AccountSection() {
                     stripe_connected: true,
                   },
                 });
-                loadUser(settings.user.token!, true);
+                loadUser(settings.user.token!);
               }
               toast({
                 title: "stripe connected!",
@@ -177,23 +199,18 @@ export function AccountSection() {
     <div className="space-y-6">
       {/* Header + login status */}
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Account
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            {settings.user?.token
-              ? `logged in as ${settings.user.email}`
-              : "not logged in"}
-          </p>
-        </div>
+        <p className="text-sm text-muted-foreground">
+          {settings.user?.token
+            ? `logged in as ${settings.user.email}`
+            : "not logged in"}
+        </p>
         <div className="flex gap-2">
           {settings.user?.token ? (
             <>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => openUrl("https://screenpi.pe/user-dashboard")}
+                onClick={() => openUrl("https://screenpi.pe/account")}
               >
                 <UserCog className="w-4 h-4 mr-1.5" />
                 manage
@@ -202,7 +219,7 @@ export function AccountSection() {
                 variant="outline"
                 size="sm"
                 onClick={async () => {
-                  updateSettings({ user: undefined });
+                  updateSettings({ user: null as any });
                   // Restart Pi with null token so it stops using the old
                   // account's quota. Next message will auto-start as anonymous.
                   try {
@@ -254,7 +271,7 @@ export function AccountSection() {
               <span>✓</span> cloud transcription — higher quality
             </div>
             <div className="flex items-center gap-2">
-              <span>✓</span> higher AI query limits + credits
+              <span>✓</span> 100x more AI queries
             </div>
             <div className="flex items-center gap-2">
               <span>✓</span> priority support
@@ -297,21 +314,95 @@ export function AccountSection() {
                     variant="ghost"
                     size="sm"
                     className="text-xs uppercase tracking-wide"
-                    disabled={pipeSyncing}
+                    title={
+                      isServerDown
+                        ? "screenpipe server is starting up — try again in a moment"
+                        : undefined
+                    }
+                    disabled={pipeSyncing || isServerDown}
                     onClick={async () => {
                       setPipeSyncing(true);
                       try {
-                        await fetch("http://localhost:3030/sync/pipes/pull", { method: "POST" });
-                        await fetch("http://localhost:3030/sync/pipes/push", { method: "POST" });
+                        await localFetch("/sync/pipes/pull", { method: "POST" });
+                        await localFetch("/sync/pipes/push", { method: "POST" });
                         toast({ title: "pipes synced" });
-                      } catch (e: any) {
-                        toast({ title: "sync failed", description: e.message, variant: "destructive" });
+                      } catch (e) {
+                        toast({
+                          title: "sync failed",
+                          description: syncErrorDescription(e),
+                          variant: "destructive",
+                        });
                       } finally {
                         setPipeSyncing(false);
                       }
                     }}
                   >
                     <RefreshCw className={`h-3 w-3 mr-1 ${pipeSyncing ? "animate-spin" : ""}`} />
+                    sync now
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Memories sync — independent toggle. A user might keep pipes
+              device-local but want their memories everywhere, or vice versa. */}
+          <div className="mt-4 pt-4 border-t border-border/50">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">memories sync across devices</p>
+                <p className="text-xs text-muted-foreground">
+                  sync your memories (facts, preferences, decisions) across devices
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="memories-sync-toggle"
+                    checked={!!settings.memoriesSyncEnabled}
+                    onCheckedChange={async (checked) => {
+                      await updateSettings({ memoriesSyncEnabled: checked });
+                      toast({
+                        title: checked ? "memories sync enabled" : "memories sync disabled",
+                        description: checked
+                          ? "memories will sync across your devices"
+                          : "memories will no longer sync",
+                      });
+                    }}
+                  />
+                  <Label htmlFor="memories-sync-toggle" className="text-xs text-muted-foreground cursor-pointer sr-only">
+                    sync
+                  </Label>
+                </div>
+                {settings.memoriesSyncEnabled && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs uppercase tracking-wide"
+                    title={
+                      isServerDown
+                        ? "screenpipe server is starting up — try again in a moment"
+                        : undefined
+                    }
+                    disabled={memoriesSyncing || isServerDown}
+                    onClick={async () => {
+                      setMemoriesSyncing(true);
+                      try {
+                        await localFetch("/sync/memories/pull", { method: "POST" });
+                        await localFetch("/sync/memories/push", { method: "POST" });
+                        toast({ title: "memories synced" });
+                      } catch (e) {
+                        toast({
+                          title: "sync failed",
+                          description: syncErrorDescription(e),
+                          variant: "destructive",
+                        });
+                      } finally {
+                        setMemoriesSyncing(false);
+                      }
+                    }}
+                  >
+                    <RefreshCw className={`h-3 w-3 mr-1 ${memoriesSyncing ? "animate-spin" : ""}`} />
                     sync now
                   </Button>
                 )}
@@ -379,7 +470,7 @@ export function AccountSection() {
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                  higher AI query limits + credits
+                  100x more AI queries
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
@@ -471,7 +562,7 @@ export function AccountSection() {
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                  higher AI query limits + credits
+                  100x more AI queries
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />

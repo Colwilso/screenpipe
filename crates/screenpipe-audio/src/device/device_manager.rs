@@ -13,14 +13,33 @@ use tracing::info;
 pub struct DeviceManager {
     streams: Arc<DashMap<AudioDevice, Arc<AudioStream>>>,
     states: Arc<DashMap<AudioDevice, Arc<AtomicBool>>>,
+    /// When true, System Audio (output) uses the CoreAudio Process Tap path
+    /// on macOS 14.4+ instead of ScreenCaptureKit. Propagated to
+    /// AudioStream::from_device at device-start time. Has no effect on
+    /// macOS <14.4 or non-macOS — falls back to SCK there.
+    use_coreaudio_tap: AtomicBool,
+    /// When true, Windows WASAPI input streams request endpoint AEC.
+    windows_input_aec: AtomicBool,
 }
 
 impl DeviceManager {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(use_coreaudio_tap: bool, windows_input_aec: bool) -> Result<Self> {
         let streams = Arc::new(DashMap::new());
         let states = Arc::new(DashMap::new());
 
-        Ok(Self { streams, states })
+        Ok(Self {
+            streams,
+            states,
+            use_coreaudio_tap: AtomicBool::new(use_coreaudio_tap),
+            windows_input_aec: AtomicBool::new(windows_input_aec),
+        })
+    }
+
+    pub fn configure_backend_flags(&self, use_coreaudio_tap: bool, windows_input_aec: bool) {
+        self.use_coreaudio_tap
+            .store(use_coreaudio_tap, Ordering::Relaxed);
+        self.windows_input_aec
+            .store(windows_input_aec, Ordering::Relaxed);
     }
 
     pub async fn devices(&self) -> Vec<AudioDevice> {
@@ -37,13 +56,19 @@ impl DeviceManager {
         }
 
         let is_running = Arc::new(AtomicBool::new(false));
-        let stream =
-            match AudioStream::from_device(Arc::new(device.clone()), is_running.clone()).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    return Err(e);
-                }
-            };
+        let stream = match AudioStream::from_device(
+            Arc::new(device.clone()),
+            is_running.clone(),
+            self.use_coreaudio_tap.load(Ordering::Relaxed),
+            self.windows_input_aec.load(Ordering::Relaxed),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                return Err(e);
+            }
+        };
 
         info!("starting recording for device: {}", device);
 

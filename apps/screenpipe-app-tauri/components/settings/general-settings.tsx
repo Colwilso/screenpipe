@@ -4,11 +4,13 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { LockedSetting } from "@/components/enterprise-locked-setting";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Rocket, Moon, Sun, Monitor, FlaskConical, Shield, ExternalLink, Layers, RefreshCw, Undo2, MessageSquare, Lightbulb } from "lucide-react";
+import { Rocket, Moon, Sun, Monitor, FlaskConical, Shield, ExternalLink, Layers, RefreshCw, MessageSquare, Sparkles } from "lucide-react";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
@@ -17,15 +19,13 @@ import { getVersion } from "@tauri-apps/api/app";
 import { commands } from "@/lib/utils/tauri";
 import { UpdateBanner } from "@/components/update-banner";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 export default function GeneralSettings() {
   const isEnterprise = useIsEnterpriseBuild();
   const { settings, updateSettings } = useSettings();
   const { toast } = useToast();
   const [currentVersion, setCurrentVersion] = useState<string | null>(null);
-  const [availableVersions, setAvailableVersions] = useState<string[]>([]);
-  const [isRollingBack, setIsRollingBack] = useState(false);
-  const [showVersions, setShowVersions] = useState(false);
 
   useEffect(() => {
     getVersion().then(setCurrentVersion).catch(() => {});
@@ -37,65 +37,53 @@ export default function GeneralSettings() {
     }
   };
 
-  const fetchVersions = async () => {
-    if (availableVersions.length > 0) {
-      setShowVersions(!showVersions);
-      return;
-    }
+  const getDesktopPlatform = async () => {
     try {
       const { arch, type: osType } = await import("@tauri-apps/plugin-os").then(m => ({ arch: m.arch(), type: m.type() }));
-      let targetArch = "darwin-aarch64";
-      if (osType === "macos") targetArch = arch === "x86_64" ? "darwin-x86_64" : "darwin-aarch64";
-      else if (osType === "windows") targetArch = "windows-x86_64";
-
-      const resp = await fetch(`https://screenpi.pe/api/app-update/versions/${targetArch}`);
-      if (!resp.ok) throw new Error("failed to fetch versions");
-      const data = await resp.json();
-      const versions = (data.versions || []).filter((v: string) => v !== currentVersion);
-      setAvailableVersions(versions);
-      setShowVersions(true);
-    } catch (e: any) {
-      toast({ title: "failed to load versions", description: e?.toString(), variant: "destructive" });
+      if (osType === "macos") return arch === "x86_64" ? "darwin-x86_64" : "darwin-aarch64";
+      if (osType === "windows") return "windows-x86_64";
+      if (osType === "linux") return "linux-x86_64";
+    } catch {
+      return null;
     }
+    return null;
   };
 
-  const handleRollback = async (version: string) => {
-    if (isRollingBack) return;
-    setIsRollingBack(true);
+  const handleOpenVersions = async () => {
+    const params = new URLSearchParams({ source: "desktop" });
+    if (currentVersion) params.set("app_version", currentVersion);
+
+    const platform = await getDesktopPlatform();
+    if (platform) params.set("platform", platform);
+
+    const path = isEnterprise ? "/enterprise" : "/account/versions";
+    if (isEnterprise) params.set("tab", "builds");
+    const url = `https://screenpi.pe${path}?${params.toString()}`;
+
     try {
-      toast({
-        title: "downloading...",
-        description: `installing v${version}. this is at your own risk — db migrations are not reversed.`,
-        duration: 10000,
-      });
-      const result = await commands.rollbackToVersion(version);
-      if (result.status === "error") throw new Error(result.error);
+      await openUrl(url);
     } catch (e: any) {
-      setIsRollingBack(false);
+      window.open(url, "_blank");
       toast({
-        title: "rollback failed",
-        description: e?.toString() || "unknown error",
+        title: "opened in browser",
+        description: e?.toString() || "check your browser for version downloads",
         variant: "destructive",
-        duration: 5000,
       });
     }
   };
 
   return (
-    <div className="space-y-5">
-      <div className="space-y-1">
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold tracking-tight text-foreground">
-            General
-          </h1>
+    <div className="space-y-5" data-testid="section-settings-general">
+      <p className="text-muted-foreground text-sm mb-4">
+        Startup, updates, and notifications
+      </p>
+
+      <div className="flex items-center justify-end">
           <UpdateBanner compact />
-        </div>
-        <p className="text-muted-foreground text-sm">
-          Startup, updates, and notifications
-        </p>
       </div>
 
       <div className="space-y-2">
+        <LockedSetting settingKey="auto_start">
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
@@ -117,6 +105,7 @@ export default function GeneralSettings() {
             </div>
           </CardContent>
         </Card>
+        </LockedSetting>
 
         {!isEnterprise && (
           <Card className="border-border bg-card">
@@ -142,131 +131,120 @@ export default function GeneralSettings() {
           </Card>
         )}
 
-        {!isEnterprise && (
-          <Card className="border-border bg-card">
-            <CardContent className="px-3 py-2.5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-2.5">
-                  <Undo2 className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div>
-                    <h3 className="text-sm font-medium text-foreground">
-                      Version{currentVersion ? ` ${currentVersion}` : ""}
-                    </h3>
-                    <p className="text-xs text-muted-foreground">
-                      install a previous version (at your own risk)
-                    </p>
-                  </div>
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">Auto-Update Pipes</h3>
+                  <p className="text-xs text-muted-foreground">Update store pipes you haven&apos;t modified</p>
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={fetchVersions}
-                  disabled={isRollingBack}
-                  className="ml-4 h-7 text-xs"
-                >
-                  {isRollingBack ? "installing..." : showVersions ? "hide" : "show versions"}
-                </Button>
               </div>
-              {showVersions && availableVersions.length > 0 && (
-                <div className="mt-3 space-y-1 border-t pt-2">
-                  <p className="text-[10px] text-muted-foreground mb-2">
-                    ⚠️ database migrations are not reversed. use at your own risk.
+              <Switch
+                id="auto-update-pipes-toggle"
+                checked={settings?.autoUpdatePipes ?? true}
+                onCheckedChange={(checked) =>
+                  handleSettingsChange({ autoUpdatePipes: checked })
+                }
+                className="ml-4"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Sparkles className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">Enhanced AI</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Use Screenpipe Cloud for smarter suggestions
                   </p>
-                  {availableVersions.map((v) => (
-                    <div key={v} className="flex items-center justify-between py-0.5">
-                      <span className="text-xs text-muted-foreground">v{v}</span>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleRollback(v)}
-                        disabled={isRollingBack}
-                        className="h-6 text-[11px] px-2"
-                      >
-                        install
-                      </Button>
-                    </div>
-                  ))}
+                  <p className="text-[10px] text-muted-foreground/60 mt-0.5">
+                    sends recent activity to screenpipe cloud for processing. we don&apos;t store your data (zero retention).
+                  </p>
                 </div>
-              )}
-            </CardContent>
-          </Card>
-        )}
+              </div>
+              <Switch
+                id="enhanced-ai-toggle"
+                checked={settings?.enhancedAI ?? false}
+                onCheckedChange={async (checked) => {
+                  handleSettingsChange({ enhancedAI: checked });
+                  const token = settings?.user?.token || "";
+                  try {
+                    await commands.setEnhancedAiSuggestions(checked, token);
+                  } catch {}
+                }}
+                className="ml-4"
+              />
+            </div>
+          </CardContent>
+        </Card>
 
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
-                <Lightbulb className="h-4 w-4 text-muted-foreground shrink-0" />
+                <ExternalLink className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Pipe suggestions</h3>
-                  <p className="text-xs text-muted-foreground">Get periodic notifications with automation ideas based on your data</p>
+                  <h3 className="text-sm font-medium text-foreground">
+                    Version{currentVersion ? ` ${currentVersion}` : ""}
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    {isEnterprise
+                      ? "Open builds managed by your organization"
+                      : "Open recent stable versions on screenpipe.com"}
+                  </p>
                 </div>
               </div>
-              <div className="flex items-center gap-3">
-                <select
-                  className="text-xs border rounded px-2 py-1 bg-background"
-                  value={settings?.pipeSuggestionFrequencyHours ?? 24}
-                  onChange={(e) =>
-                    handleSettingsChange({ pipeSuggestionFrequencyHours: parseInt(e.target.value, 10) })
-                  }
-                  disabled={settings?.pipeSuggestionsEnabled === false}
-                >
-                  <option value={6}>every 6h</option>
-                  <option value={12}>every 12h</option>
-                  <option value={24}>daily</option>
-                  <option value={72}>every 3 days</option>
-                  <option value={168}>weekly</option>
-                </select>
-                <Switch
-                  checked={settings?.pipeSuggestionsEnabled !== false}
-                  onCheckedChange={(checked) =>
-                    handleSettingsChange({ pipeSuggestionsEnabled: checked })
-                  }
-                />
-              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleOpenVersions}
+                className="ml-4 h-7 text-xs gap-1.5"
+              >
+                open
+                <ExternalLink className="h-3 w-3" />
+              </Button>
             </div>
           </CardContent>
         </Card>
+
       </div>
 
-      {/* pipe suggestions */}
-      <div className="space-y-2">
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Lightbulb className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">Pipe suggestions</h3>
-                  <p className="text-xs text-muted-foreground">Get periodic notifications with automation ideas based on your data</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <select
-                  className="text-xs border rounded px-2 py-1 bg-background"
-                  value={settings?.pipeSuggestionFrequencyHours ?? 24}
-                  onChange={(e) =>
-                    handleSettingsChange({ pipeSuggestionFrequencyHours: parseInt(e.target.value, 10) })
-                  }
-                  disabled={settings?.pipeSuggestionsEnabled === false}
-                >
-                  <option value={6}>every 6h</option>
-                  <option value={12}>every 12h</option>
-                  <option value={24}>daily</option>
-                  <option value={72}>every 3 days</option>
-                  <option value={168}>weekly</option>
-                </select>
-                <Switch
-                  checked={settings?.pipeSuggestionsEnabled !== false}
-                  onCheckedChange={(checked) =>
-                    handleSettingsChange({ pipeSuggestionsEnabled: checked })
-                  }
-                />
+      <Separator />
+
+      <Card className="border-border bg-card">
+        <CardContent className="px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2.5">
+              <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground">Reset Onboarding</h3>
+                <p className="text-xs text-muted-foreground">Run the setup wizard again</p>
               </div>
             </div>
-          </CardContent>
-        </Card>
-      </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-4 h-7 text-xs"
+              onClick={async () => {
+                try {
+                  await commands.resetOnboarding();
+                  await commands.showOnboardingWindow();
+                } catch (e) {
+                  console.error("failed to open onboarding:", e);
+                }
+              }}
+            >
+              reset
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
     </div>
   );

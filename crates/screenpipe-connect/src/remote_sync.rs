@@ -12,11 +12,19 @@ use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
+
+/// Overall sync timeout (30 minutes).
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Per-file upload timeout (10 minutes — enough for ~2GB at slow speeds).
+const FILE_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Configuration for remote sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +63,18 @@ pub struct DiscoveredHost {
 
 /// Skip files and directories that should never be synced.
 fn should_skip(name: &str) -> bool {
-    // SQLite journal files (copying mid-write corrupts the DB)
-    name.ends_with(".sqlite-wal")
+    // SQLite live files. We never copy these directly: the main `.sqlite`
+    // file is being written to mid-flight (page-level torn writes during
+    // SFTP), and `-wal`/`-shm` are partial state that the destination can't
+    // safely reassemble. The DB is uploaded separately via `VACUUM INTO`,
+    // which produces a self-contained, transactionally-consistent snapshot.
+    name.ends_with(".sqlite")
+        || name.ends_with(".sqlite-wal")
         || name.ends_with(".sqlite-shm")
         || name.ends_with(".lock")
+        // Our own snapshot tempfiles (in case a previous run was killed
+        // before cleanup).
+        || name.starts_with(".openclaw-snapshot-")
         // Package manager / build artifacts
         || name == "node_modules"
         || name == ".git"
@@ -107,12 +123,6 @@ WHERE o.text LIKE '%search%' ORDER BY f.timestamp DESC LIMIT 20;
 SELECT timestamp, transcription, device, is_input_device
 FROM audio_transcriptions
 WHERE transcription LIKE '%search%' ORDER BY timestamp DESC LIMIT 20;
-```
-
-**accessibility** — Accessibility tree text (macOS)
-```sql
-SELECT timestamp, app_name, window_name, text_content
-FROM accessibility WHERE text_content LIKE '%search%' ORDER BY timestamp DESC;
 ```
 
 **speakers** — Identified speakers
@@ -274,6 +284,14 @@ async fn list_remote_recursive(sftp: &SftpSession, base: &str, prefix: &str) -> 
     files
 }
 
+/// Get remote file metadata (size, mtime). Returns None if file doesn't exist.
+async fn remote_file_meta(sftp: &SftpSession, path: &str) -> Option<(u64, Option<u64>)> {
+    sftp.metadata(path)
+        .await
+        .ok()
+        .map(|m| (m.size.unwrap_or(0), m.mtime.map(|t| t as u64)))
+}
+
 async fn upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<u64> {
     let mut src = tokio::fs::File::open(local)
         .await
@@ -300,6 +318,19 @@ async fn upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<u
         .await
         .map_err(|e| anyhow::anyhow!("close {}: {}", remote, e))?;
     Ok(written)
+}
+
+/// Upload a file with a per-file timeout.
+async fn upload_file_with_timeout(sftp: &SftpSession, local: &Path, remote: &str) -> Result<u64> {
+    tokio::time::timeout(FILE_UPLOAD_TIMEOUT, upload_file(sftp, local, remote))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "upload timed out after {}s: {}",
+                FILE_UPLOAD_TIMEOUT.as_secs(),
+                remote
+            )
+        })?
 }
 
 /// Recursively sync a local directory to remote. Skips files already on remote.
@@ -353,14 +384,41 @@ async fn sync_dir(
             ))
             .await;
         } else if ft.is_file() {
-            // Always re-upload db.sqlite (it changes every sync).
-            // For everything else, skip if already on remote.
             let is_db = name == "db.sqlite";
-            if !is_db && remote_files.contains(&relative) {
+
+            if is_db {
+                // Delta sync for db.sqlite: compare local size+mtime vs remote.
+                // Only re-upload if the file has actually changed.
+                let local_meta = entry.metadata().await.ok();
+                let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let local_mtime = local_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+
+                if let Some((remote_size, remote_mtime)) =
+                    remote_file_meta(sftp, &remote_path).await
+                {
+                    let size_match = remote_size == local_size;
+                    let mtime_match = match (local_mtime, remote_mtime) {
+                        (Some(l), Some(r)) => l <= r,
+                        _ => false, // if we can't compare mtime, re-upload
+                    };
+                    if size_match && mtime_match {
+                        debug!("db.sqlite unchanged ({}B), skipping", local_size);
+                        continue;
+                    }
+                    debug!(
+                        "db.sqlite changed: local={}B remote={}B, re-uploading",
+                        local_size, remote_size
+                    );
+                }
+            } else if remote_files.contains(&relative) {
                 continue;
             }
 
-            match upload_file(sftp, &local_path, &remote_path).await {
+            match upload_file_with_timeout(sftp, &local_path, &remote_path).await {
                 Ok(bytes) => {
                     *files_transferred += 1;
                     *bytes_transferred += bytes;
@@ -378,15 +436,60 @@ async fn sync_dir(
 
 /// Sync the entire ~/.screenpipe directory to the remote server.
 pub async fn sync_to_remote(config: &SyncConfig, data_dir: &Path) -> SyncResult {
-    match sync_to_remote_inner(config, data_dir).await {
-        Ok(r) => r,
-        Err(e) => SyncResult {
+    // Wrap the entire sync in a timeout
+    match tokio::time::timeout(SYNC_TIMEOUT, sync_to_remote_inner(config, data_dir)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => SyncResult {
             ok: false,
             files_transferred: 0,
             bytes_transferred: 0,
             error: Some(e.to_string()),
         },
+        Err(_) => SyncResult {
+            ok: false,
+            files_transferred: 0,
+            bytes_transferred: 0,
+            error: Some(format!(
+                "sync timed out after {} minutes",
+                SYNC_TIMEOUT.as_secs() / 60
+            )),
+        },
     }
+}
+
+/// Open a short-lived sqlx pool against the live DB and run `VACUUM INTO`
+/// to produce a self-contained snapshot at `dest`. SQLite's WAL mode lets
+/// our connection coexist with the engine's writer pool; readers don't block
+/// writers and vice versa. The pool is dropped (connections closed) before
+/// we return — important because we then SFTP the snapshot file.
+async fn snapshot_db(live_db: &Path, dest: &Path) -> Result<()> {
+    let url = format!("sqlite://{}", live_db.to_string_lossy());
+    let opts = SqliteConnectOptions::from_str(&url)
+        .with_context(|| format!("invalid sqlite url: {}", url))?
+        .read_only(true)
+        // No journal file is created for read-only opens, but be explicit:
+        .create_if_missing(false);
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect_with(opts)
+        .await
+        .context("failed to open read-only connection to live db")?;
+
+    // VACUUM INTO is a single statement that takes a transactional read
+    // snapshot and writes the entire DB to `dest`. The destination must
+    // not already exist (the caller removes any stale file beforehand).
+    // We escape single quotes by doubling them — SQLite's standard escape.
+    let dest_str = dest.to_string_lossy();
+    let stmt = format!("VACUUM INTO '{}'", dest_str.replace('\'', "''"));
+    let result = sqlx::query(&stmt).execute(&pool).await;
+
+    pool.close().await;
+
+    result
+        .map(|_| ())
+        .with_context(|| format!("VACUUM INTO '{}' failed", dest_str))
 }
 
 async fn sync_to_remote_inner(config: &SyncConfig, data_dir: &Path) -> Result<SyncResult> {
@@ -394,6 +497,66 @@ async fn sync_to_remote_inner(config: &SyncConfig, data_dir: &Path) -> Result<Sy
         "sync starting → {}@{}:{}",
         config.user, config.host, config.port
     );
+
+    // Take a transactionally-consistent snapshot of the live DB via
+    // `VACUUM INTO` before any file transfer starts. Reasons we do not
+    // copy the live `db.sqlite` directly:
+    //   - SFTP reads pages over a network while the engine keeps writing,
+    //     yielding torn pages on the destination → "database disk image
+    //     is malformed" (issue #2907).
+    //   - `PRAGMA wal_checkpoint(TRUNCATE)` (the previous approach) only
+    //     flushes the WAL once; the engine's periodic checkpoint can fire
+    //     during the SFTP copy and rewrite db.sqlite mid-transfer.
+    // We open our own read-only sqlx connection (WAL mode allows concurrent
+    // readers + the engine's writer) and run VACUUM INTO. The output is a
+    // complete, self-contained `.sqlite` file that we upload as `db.sqlite`.
+    // The live one is excluded from `sync_dir` via `should_skip`.
+    let db_path = data_dir.join("db.sqlite");
+    let snapshot_path: Option<PathBuf> = if db_path.exists() {
+        let snap = data_dir.join(format!(
+            ".openclaw-snapshot-{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // Defensive: VACUUM INTO refuses to overwrite an existing destination.
+        let _ = tokio::fs::remove_file(&snap).await;
+
+        match snapshot_db(&db_path, &snap).await {
+            Ok(()) => {
+                let bytes = tokio::fs::metadata(&snap)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                info!("db snapshot ready ({} bytes)", bytes);
+                Some(snap)
+            }
+            Err(e) => {
+                warn!(
+                    "VACUUM INTO failed ({}); SKIPPING db.sqlite from this sync to avoid \
+                     uploading a corrupt copy. media files will still sync.",
+                    e
+                );
+                let _ = tokio::fs::remove_file(&snap).await;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // RAII-style cleanup — unlink the snapshot whether we succeed or fail.
+    struct SnapshotGuard(Option<PathBuf>);
+    impl Drop for SnapshotGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                // Sync remove — Drop can't await. Acceptable: tempfile is
+                // local and small fs op; failure here is non-fatal (the
+                // `.openclaw-snapshot-*` prefix is in `should_skip` so a
+                // stray leftover won't pollute the next sync).
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    let _snapshot_guard = SnapshotGuard(snapshot_path.clone());
 
     let (session, sftp) = connect_sftp(config).await?;
 
@@ -421,7 +584,8 @@ async fn sync_to_remote_inner(config: &SyncConfig, data_dir: &Path) -> Result<Sy
     let mut files_transferred: u64 = 0;
     let mut bytes_transferred: u64 = 0;
 
-    // Recursively copy everything
+    // Recursively copy everything (db.sqlite is excluded by `should_skip`
+    // — uploaded separately below from the snapshot).
     sync_dir(
         &sftp,
         data_dir,
@@ -432,6 +596,23 @@ async fn sync_to_remote_inner(config: &SyncConfig, data_dir: &Path) -> Result<Sy
         &mut bytes_transferred,
     )
     .await;
+
+    // Upload the VACUUM INTO snapshot as the destination's db.sqlite.
+    // Always full-upload (not incremental) — the snapshot reflects the
+    // current state of the DB and the remote needs to match it.
+    if let Some(snap) = snapshot_path.as_ref() {
+        let remote_db = format!("{}/db.sqlite", remote_base);
+        match upload_file_with_timeout(&sftp, snap, &remote_db).await {
+            Ok(n) => {
+                files_transferred += 1;
+                bytes_transferred += n;
+                info!("db.sqlite snapshot uploaded ({} bytes)", n);
+            }
+            Err(e) => {
+                warn!("failed to upload db.sqlite snapshot: {}", e);
+            }
+        }
+    }
 
     // Drop the skill file so AI agents know how to use the data
     let skill_path = format!("{}/SCREENPIPE.md", remote_base);
@@ -528,6 +709,22 @@ pub async fn discover_ssh_hosts() -> Vec<DiscoveredHost> {
     }
 
     hosts.extend(discover_tailscale().await);
+
+    // mDNS discovery — find screenpipe instances advertising on LAN
+    for (host, port) in crate::mdns::browse().await {
+        hosts.push(DiscoveredHost {
+            host: if port != 3030 {
+                format!("{}:{}", host, port)
+            } else {
+                host
+            },
+            port,
+            user: None,
+            key_path: None,
+            source: "mdns".into(),
+            alias: None,
+        });
+    }
 
     // Dedup + filter noise
     let mut seen = HashSet::new();
@@ -681,11 +878,11 @@ fn parse_known_hosts(content: &str) -> Vec<DiscoveredHost> {
 }
 
 async fn discover_tailscale() -> Vec<DiscoveredHost> {
-    let out = match tokio::process::Command::new("tailscale")
-        .args(["status", "--json"])
-        .output()
-        .await
-    {
+    let mut ts_cmd = tokio::process::Command::new("tailscale");
+    ts_cmd.args(["status", "--json"]);
+    #[cfg(windows)]
+    ts_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let out = match ts_cmd.output().await {
         Ok(o) if o.status.success() => o,
         _ => return vec![],
     };
@@ -757,6 +954,9 @@ mod tests {
     fn test_should_skip() {
         assert!(should_skip("db.sqlite-wal"));
         assert!(should_skip("db.sqlite-shm"));
+        // Live .sqlite is skipped: the DB ships via VACUUM INTO snapshot
+        // (page-level torn writes mid-SFTP would corrupt a direct copy).
+        assert!(should_skip("db.sqlite"));
         assert!(should_skip("some.lock"));
         assert!(should_skip("node_modules"));
         assert!(should_skip(".git"));
@@ -765,7 +965,6 @@ mod tests {
         assert!(should_skip("target"));
         assert!(should_skip("something.tmp"));
         assert!(should_skip("app.log"));
-        assert!(!should_skip("db.sqlite"));
         assert!(!should_skip("data"));
         assert!(!should_skip("some_audio.mp4"));
     }

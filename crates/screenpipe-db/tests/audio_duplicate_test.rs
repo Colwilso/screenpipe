@@ -9,13 +9,14 @@
 /// 2. Cross-device duplicates (similarity check across all devices)
 ///
 /// Run with: cargo test --package screenpipe-db --test audio_duplicate_test -- --nocapture
-
 #[cfg(test)]
 mod tests {
     use screenpipe_db::{AudioDevice, DatabaseManager, DeviceType};
 
     async fn setup_test_db() -> DatabaseManager {
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         match sqlx::migrate!("./src/migrations").run(&db.pool).await {
             Ok(_) => {}
