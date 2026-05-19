@@ -586,6 +586,7 @@ const AISection = ({
       "native-ollama": "ollama",
       "screenpipe-cloud": "screenpipe-cloud",
       "acp": "claude code",
+      "bedrock": "bedrock",
     };
 
     let newUrl = "";
@@ -609,10 +610,6 @@ const AISection = ({
         newUrl = "https://api.anthropic.com";
         newModel = "claude-sonnet-5";
         break;
-      case "bedrock":
-        newUrl = ""; // Bedrock uses AWS SDK, not HTTP
-        newModel = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
-        break;
       case "screenpipe-cloud":
         newUrl = ""; // Pi uses RPC mode, not HTTP
         newModel = "auto";
@@ -620,6 +617,8 @@ const AISection = ({
       case "acp":
         // The external adapter owns its own model/endpoint; the preset only
         // records which adapter to launch.
+      case "bedrock":
+        // Bedrock uses AWS SDK, not HTTP; model list is fetched dynamically.
         newUrl = "";
         newModel = "";
         break;
@@ -644,8 +643,59 @@ const AISection = ({
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
 
+  const runBedrockDiagnostics = useCallback(async () => {
+    setTestStatus("testing");
+    setDiagnosticsOpen(true);
+    setTestResults({
+      endpoint: { status: "running", message: "Checking AWS profile..." },
+      auth: { status: "pending", message: "" },
+      models: { status: "pending", message: "" },
+      chat: { status: "pending", message: "" },
+    });
+
+    const profile = (settingsPreset as any)?.awsProfile || null;
+    const region = (settingsPreset as any)?.awsRegion || null;
+    const model = settingsPreset?.model || null;
+
+    const result = await commands.bedrockTestConnection(profile, region, model);
+    if (result.status === "error") {
+      setTestResults({
+        endpoint: { status: "fail", message: `Command failed: ${result.error}` },
+        auth: { status: "skip", message: "Skipped" },
+        models: { status: "skip", message: "Skipped" },
+        chat: { status: "skip", message: "Skipped" },
+      });
+      setTestStatus("done");
+      return;
+    }
+
+    const diag = result.data;
+    setTestResults({
+      endpoint: {
+        status: diag.profile_valid ? "pass" : "fail",
+        message: diag.profile_valid ? `Profile '${profile || "default"}' is valid` : (diag.error || "Profile check failed"),
+      },
+      auth: {
+        status: diag.credentials_valid ? "pass" : "fail",
+        message: diag.credentials_valid ? "AWS credentials valid" : (diag.error || "Credentials invalid"),
+      },
+      models: {
+        status: diag.credentials_valid ? "pass" : (diag.profile_valid ? "fail" : "skip"),
+        message: diag.credentials_valid ? "Bedrock API accessible" : (diag.error || "Skipped"),
+      },
+      chat: {
+        status: diag.model_accessible ? "pass" : (diag.credentials_valid && model ? "fail" : "skip"),
+        message: diag.model_accessible ? `Model '${model}' accessible` : (model ? (diag.error || "Model not accessible") : "No model selected"),
+      },
+    });
+    setTestStatus("done");
+  }, [settingsPreset]);
+
   const runDiagnostics = useCallback(async () => {
-    if (settingsPreset?.provider === "screenpipe-cloud" || settingsPreset?.provider === "bedrock") return;
+    if (settingsPreset?.provider === "screenpipe-cloud") return;
+    if (settingsPreset?.provider === "bedrock") {
+      return runBedrockDiagnostics();
+    }
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
@@ -963,7 +1013,7 @@ const AISection = ({
     }
 
     setTestStatus("done");
-  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settingsPreset?.model]);
+  }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settingsPreset?.model, runBedrockDiagnostics]);
 
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
@@ -1138,20 +1188,23 @@ const AISection = ({
         }
 
         case "bedrock": {
-          // TODO: dynamically fetch available models from Bedrock using the
-          // selected AWS profile. Would need a Tauri command that shells out to
-          // `aws bedrock list-inference-profiles --profile <awsProfile> --region <awsRegion>`
-          // and parses the result. For now, hardcoded list of common Anthropic models.
-          // Models must match Pi's built-in registry (@mariozechner/pi-ai models.generated.js).
-          // Pi v0.51.1 does not include Sonnet 4.6 or Opus 4.6 -- adding them here will cause
-          // "Model not found" errors. Update this list when Pi is updated.
-          setModels([
-            { id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", name: "Claude Sonnet 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-5-20251101-v1:0", name: "Claude Opus 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", name: "Claude Haiku 4.5", provider: "bedrock" },
-            { id: "us.anthropic.claude-sonnet-4-20250514-v1:0", name: "Claude Sonnet 4", provider: "bedrock" },
-            { id: "us.anthropic.claude-opus-4-20250514-v1:0", name: "Claude Opus 4", provider: "bedrock" },
-          ]);
+          const profile = (settingsPreset as any)?.awsProfile || null;
+          const region = (settingsPreset as any)?.awsRegion || null;
+          const result = await commands.bedrockListModels(profile, region);
+          if (result.status === "ok" && result.data.length > 0) {
+            setModels(result.data.map((m) => ({
+              id: m.id,
+              name: m.name,
+              provider: "bedrock",
+            })));
+          } else {
+            setModels([]);
+            toast({
+              title: "Could not fetch Bedrock models",
+              description: "Check your AWS profile and region, then try again.",
+              variant: "destructive",
+            });
+          }
           break;
         }
 
@@ -1310,7 +1363,7 @@ const AISection = ({
             type="bedrock"
             title="AWS Bedrock"
             description="Use AWS Bedrock with your AWS credentials (no API key needed)"
-            imageSrc="/images/custom.png"
+            imageSrc="/images/bedrock-logo.png"
             selected={settingsPreset?.provider === "bedrock"}
             onClick={() => handleAiProviderChange("bedrock")}
           />
@@ -1395,6 +1448,48 @@ const AISection = ({
         />
       )}
 
+      {settingsPreset?.provider === "bedrock" && (
+        <>
+          <div className="w-full">
+            <Label htmlFor="awsProfile">AWS Profile</Label>
+            <p className="text-xs text-muted-foreground mb-2">
+              AWS CLI profile name (from ~/.aws/config). Leave empty to use default profile.
+            </p>
+            <Input
+              id="awsProfile"
+              type="text"
+              value={(settingsPreset as any)?.awsProfile || ""}
+              onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
+              onBlur={() => fetchModels()}
+              placeholder="default"
+              className="w-full"
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+            />
+          </div>
+
+          <div className="w-full">
+            <Label htmlFor="awsRegion">AWS Region</Label>
+            <p className="text-xs text-muted-foreground mb-2">
+              AWS region for Bedrock (e.g., us-east-1, us-west-2).
+            </p>
+            <Input
+              id="awsRegion"
+              type="text"
+              value={(settingsPreset as any)?.awsRegion || ""}
+              onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
+              onBlur={() => fetchModels()}
+              placeholder="us-east-1"
+              className="w-full"
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+            />
+          </div>
+        </>
+      )}
+
 
       {(settingsPreset?.provider === "anthropic" || settingsPreset?.provider === "acp" || settingsPreset?.provider === "custom" || (isApiKeyRequired &&
         settingsPreset?.provider === "openai")) && (
@@ -1444,39 +1539,6 @@ const AISection = ({
             </div>
           </div>
         )}
-
-      {settingsPreset?.provider === "bedrock" && (
-        <div className="w-full">
-          <div className="flex flex-col gap-4 mb-4 w-full">
-            <Label htmlFor="awsProfile" className="flex items-center gap-1">
-              AWS Profile
-            </Label>
-            <Input
-              id="awsProfile"
-              value={(settingsPreset as any)?.awsProfile || ""}
-              onChange={(e) => updateSettingsPreset({ awsProfile: e.target.value } as any)}
-              placeholder="default"
-            />
-            <p className="text-xs text-muted-foreground">
-              AWS profile name from ~/.aws/config (leave empty for default)
-            </p>
-          </div>
-          <div className="flex flex-col gap-4 mb-4 w-full">
-            <Label htmlFor="awsRegion" className="flex items-center gap-1">
-              AWS Region
-            </Label>
-            <Input
-              id="awsRegion"
-              value={(settingsPreset as any)?.awsRegion || ""}
-              onChange={(e) => updateSettingsPreset({ awsRegion: e.target.value } as any)}
-              placeholder="us-east-1"
-            />
-            <p className="text-xs text-muted-foreground">
-              AWS region for Bedrock API calls
-            </p>
-          </div>
-        </div>
-      )}
 
       {settingsPreset?.provider === "openai-chatgpt" && (
         <div className="w-full">
@@ -2000,8 +2062,8 @@ const providerImageSrc: Record<string, string> = {
   openai: "/images/openai.png",
   "openai-chatgpt": "/images/openai.png",
   anthropic: "/images/claude-ai.svg",
-  bedrock: "/images/custom.png",
   "native-ollama": "/images/ollama.png",
+  bedrock: "/images/bedrock-logo.png",
   custom: "/images/custom.png",
   pi: "/images/screenpipe.png",
   screenpipe: "/images/screenpipe.png",

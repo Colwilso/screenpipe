@@ -34,6 +34,7 @@ use window::ShowRewindWindow;
 
 mod analytics;
 mod auth_session;
+mod bedrock;
 #[allow(deprecated)]
 mod icons;
 use crate::analytics::start_analytics;

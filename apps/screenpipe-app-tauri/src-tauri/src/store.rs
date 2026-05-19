@@ -1110,9 +1110,9 @@ pub struct AIPreset {
     /// The external adapter to launch when `provider` is `acp`.
     #[serde(rename = "acpAgent", default)]
     pub acp_agent: Option<crate::pi::AcpAgentConfig>,
-    #[serde(rename = "awsProfile", default)]
+    #[serde(rename = "awsProfile", default, skip_serializing_if = "Option::is_none")]
     pub aws_profile: Option<String>,
-    #[serde(rename = "awsRegion", default)]
+    #[serde(rename = "awsRegion", default, skip_serializing_if = "Option::is_none")]
     pub aws_region: Option<String>,
 }
 
