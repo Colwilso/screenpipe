@@ -184,23 +184,7 @@ This will help maintainers review and ultimately resolve and merge contributions
 - This ensures macOS TCC recognizes the app across rebuilds (permissions persist)
 - Other devs without the cert will see permission issues — onboarding has "continue anyway" button after 5s
 - The app must be in `/Applications` for macOS to grant TCC permissions properly
-- Deploy after building:
-  ```bash
-  rm -rf "/Applications/Alioth.app"
-  cp -R "src-tauri/target/release/bundle/macos/Alioth.app" "/Applications/Alioth.app"
-  chmod +x "/Applications/Alioth.app/Contents/MacOS/bun"
-  codesign --force --sign "Screenpipe Dev Signing" --deep "/Applications/Alioth.app"
-  open "/Applications/Alioth.app"
-  ```
-- The `chmod +x` on bun is needed because Tauri's bundler strips execute bits
-- Other devs need their own self-signed code signing cert (via openssl + security import)
-
-## Post-Merge Verification
-After every upstream merge, run:
-```bash
-bun test __tests__/merge-integration-checklist.test.ts
-```
-This verifies: Bedrock credential chain (5 links), preset defaults, binary permissions, signing config, Alioth branding, and Activity nav wiring. All 16 tests must pass before building.
+- See "Full deploy sequence" under Git Usage for the complete build+deploy+cache-clear steps
 
 ## macOS Build Dependencies
 ```bash
@@ -210,6 +194,71 @@ brew install pkg-config ffmpeg jq cmake wget git-lfs
 ### VisionManager resilience
 
 The VisionManager uses event-driven capture triggered by OS events (clicks, app switches, visual changes, idle timer). If monitors disconnect (e.g., undocking a laptop), the monitor_watcher retries `start()` every 5 seconds until displays become available again. Audio capture has independent recovery and continues working even when vision is stalled.
+
+## Fork & Branch Strategy
+
+This is **Colin's fork** (Alioth) of upstream screenpipe. The product name is Alioth, not screenpipe.
+
+### Remotes
+| Remote   | URL | Purpose |
+|----------|-----|---------|
+| `origin` | github.com/screenpipe/screenpipe | Upstream (read-only, for pulling updates) |
+| `fork`   | github.com/Colwilso/screenpipe | Colin's fork (Alioth) -- push here |
+
+### Branch rules
+1. **Always check which branch you're on** (`git branch`, `git log --oneline -3`) before doing any work. The mainline for Alioth is `fork/main`.
+2. **Feature branches** (e.g., `feat/bedrock-provider`, `feat/mcp-bridge-extension`) must be merged into `main` promptly -- do not let them accumulate. Long-lived unmerged branches cause repeated merge conflicts and lost customizations.
+3. **After any merge**, run the post-merge verification checklist (see below) before building. Merges from branches that forked before Alioth branding will overwrite customizations silently.
+4. **Merge frequently** from upstream to stay current. Stale forks create exponentially harder merge conflicts.
+
+### Alioth customizations that get overwritten by merges
+These are the things that upstream screenpipe does NOT have and that every merge will try to revert:
+- `tauri.conf.json`: `productName` must be `"Alioth"` (not `"screenpipe - Development"`)
+- `app/home/page.tsx`: sidebar header says `alioth`, Activity nav item exists with BarChart3 icon
+- `components/activity/` directory: the Activity dashboard (chart, app usage, log table)
+- `lib/activity-categories.ts` and `lib/hooks/use-activity-data.ts`
+- `components/settings/ai-presets.tsx`: single Bedrock provider card with `bedrock-logo.png`
+
+### Post-merge checklist (mandatory before building)
+```bash
+# 1. Verify branding
+grep '"productName": "Alioth"' apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+grep 'alioth' apps/screenpipe-app-tauri/app/home/page.tsx
+grep 'BarChart3' apps/screenpipe-app-tauri/app/home/page.tsx
+grep '"activity"' apps/screenpipe-app-tauri/app/home/page.tsx
+
+# 2. Run integration tests if available
+bun test __tests__/merge-integration-checklist.test.ts
+
+# 3. Verify no duplicate provider cards
+grep -c 'type="bedrock"' apps/screenpipe-app-tauri/components/settings/ai-presets.tsx
+# should be 1, not 2
+```
+
+### WebKit cache (critical)
+After rebuilding and deploying, **always clear the WebKit cache** before launching:
+```bash
+rm -rf ~/Library/WebKit/screenpi.pe.dev/WebsiteData ~/Library/Caches/screenpi.pe.dev
+```
+Tauri's WKWebView caches frontend JS aggressively. Without clearing, the app serves stale code from a previous build even after replacing the .app bundle. This causes phantom bugs where verified source code doesn't match runtime behavior.
+
+### Full deploy sequence
+```bash
+# Build
+cd apps/screenpipe-app-tauri
+rm -rf .next  # force clean frontend build
+bun tauri build --features metal,apple-intelligence
+
+# Deploy
+rm -rf "/Applications/Alioth.app"
+cp -R "src-tauri/target/release/bundle/macos/Alioth.app" "/Applications/Alioth.app"
+chmod +x "/Applications/Alioth.app/Contents/MacOS/bun"
+codesign --force --sign "Screenpipe Dev Signing" --deep "/Applications/Alioth.app"
+
+# Clear cache and launch
+rm -rf ~/Library/WebKit/screenpi.pe.dev/WebsiteData ~/Library/Caches/screenpi.pe.dev
+open "/Applications/Alioth.app"
+```
 
 ## A/B test learnings (Mar-Apr 2026)
 - "automations" converts better than "pipes" for checkout (+32-95% lift)
