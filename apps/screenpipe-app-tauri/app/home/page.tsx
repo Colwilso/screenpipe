@@ -24,6 +24,7 @@ import {
   Phone,
   Plug,
   NotebookPen,
+  BarChart3,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
 import { useChatStore, type SessionStatus } from "@/lib/stores/chat-store";
@@ -58,6 +59,7 @@ import { useTeam } from "@/lib/hooks/use-team";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
 import { PipeActivityIndicator } from "@/components/pipe-activity-indicator";
+import { ActivityDashboard } from "@/components/activity/activity-dashboard";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/meeting-state";
 import type { MeetingRecord } from "@/lib/utils/meeting-format";
@@ -70,12 +72,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
-type MainSection = "home" | "timeline" | "memories" | "pipes" | "connections" | "meetings" | "help";
+type MainSection = "home" | "timeline" | "memories" | "pipes" | "connections" | "meetings" | "activity" | "help";
 type ConnectionFocusRequest = { id: string | null; requestId: number };
 
 // All valid URL sections for the home page
 const ALL_SECTIONS = [
-  "home", "timeline", "pipes", "help", "memories", "connections", "meetings", "history",
+  "home", "timeline", "pipes", "help", "memories", "connections", "meetings", "activity", "history",
   "feedback", // backwards compat → maps to "help"
 ];
 
@@ -743,6 +745,8 @@ function HomeContent() {
             onFocusModeChange={handleMeetingFocusModeChange}
           />
         );
+      case "activity":
+        return <ActivityDashboard onNavigateToTimeline={() => setActiveSection("timeline")} />;
       case "help":
         return <FeedbackSection />;
       case "history":
@@ -776,6 +780,7 @@ function HomeContent() {
     { id: "meetings", label: "Meeting notes", icon: <NotebookPen className="h-3.5 w-3.5" /> },
     { id: "memories", label: "Memories", icon: <Sparkles className="h-3.5 w-3.5" /> },
     { id: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
+    { id: "activity", label: "Activity", icon: <BarChart3 className="h-3.5 w-3.5" /> },
   ].filter((s) => !isSectionHidden(s.id));
 
   // Listen for navigation events from other windows (e.g. tray, Rust-side links)
@@ -877,7 +882,7 @@ function HomeContent() {
               {/* Row 1: name (collapse moved out — pinned top-left next
                   to the traffic lights, see above). */}
               <div className={cn("flex items-center", sidebarCollapsed ? "justify-center" : "justify-between")}>
-                {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>screenpipe</h1>}
+                {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>alioth</h1>}
               </div>
               {/* Row 2: device status + action buttons */}
               {!sidebarCollapsed && (() => {

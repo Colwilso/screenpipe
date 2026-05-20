@@ -1285,15 +1285,6 @@ const AISection = ({
           />
 
           <AIProviderCard
-            type="bedrock"
-            title="AWS Bedrock"
-            description="Use AWS Bedrock with your AWS credentials (no API key needed)"
-            imageSrc="/images/custom.png"
-            selected={settingsPreset?.provider === "bedrock"}
-            onClick={() => handleAiProviderChange("bedrock")}
-          />
-
-          <AIProviderCard
             type="custom"
             title="Custom"
             description="Connect to your own AI provider or self-hosted models"
