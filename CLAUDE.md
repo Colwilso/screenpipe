@@ -59,22 +59,36 @@ cd packages/screenpipe-js/browser-sdk && bun run build # @screenpipe/browser
 cd packages/screenpipe-js/cli && bun run build         # @screenpipe/dev CLI
 ```
 
-### Running the engine standalone
+### Running screenpipe
 
-The Tauri desktop app (`bun tauri dev`) auto-starts the engine internally, but this is unreliable in dev mode. For manual standalone starts, use the npm-installed CLI (`screenpipe@0.3.180` at `/opt/homebrew/bin/screenpipe`):
+**Always use the Tauri dev build**, not the npm CLI:
 
 ```bash
-# Standard start (background, logs to file)
-screenpipe record --port 3030 --disable-telemetry --use-system-default-audio > /tmp/screenpipe-engine.log 2>&1 &
+# Quick start (convenience script from repo root)
+./run-screenpipe-dev.sh
 
-# Verify
-curl -s http://localhost:3030/health
+# Or manually:
+# Kill any stale engine on port 3030 first
+lsof -ti :3030 | xargs kill 2>/dev/null
 
-# Alternate port (useful when Tauri app owns 3030)
-screenpipe record --port 3035 --disable-telemetry --use-system-default-audio
+# Start the app (engine + UI + Pi)
+cd apps/screenpipe-app-tauri && bun tauri dev
 ```
 
-Note: There is no cargo-built engine binary. The workspace root `cargo build` does not produce a standalone `screenpipe` or `screenpipe-engine` binary -- the Tauri app embeds the engine crates as library dependencies. The npm CLI is the only standalone engine available.
+The Tauri app embeds the engine as a library dependency. Local changes to `screenpipe-core` (pipes, presets, agents) only take effect in the Tauri build. The npm CLI (`/opt/homebrew/bin/screenpipe`) is a published package with none of our local patches.
+
+**Never start the npm engine on port 3030.** If it's already running when `bun tauri dev` launches, the embedded server silently fails to bind and pipes run through the unpatched npm binary. Always kill port 3030 before starting the Tauri app.
+
+**Convenience scripts in repo root:**
+- `./run-screenpipe-dev.sh` — Start Tauri app in dev mode (kills port 3030, starts app)
+- `./run-screenpipe-build.sh` — Build Tauri app for release (macOS Apple Silicon)
+
+## Linting & Formatting
+```bash
+cargo fmt --check                   # Check Rust formatting
+cargo fmt                           # Fix Rust formatting
+cargo clippy --features metal,apple-intelligence  # Rust lints
+```
 
 ## Testing
 ```bash
@@ -164,15 +178,46 @@ Always add visuals to issues or PR bodies using either:
 This will help maintainers review and ultimately resolve and merge contributions faster
 
 ## macOS Dev Builds
-- Dev builds are signed with a developer certificate for consistent permissions
+- Product name is **Alioth** (not "screenpipe") -- `tauri.conf.json` → `productName`
+- Dev builds are signed with a self-signed "Screenpipe Dev Signing" certificate
 - Config: `apps/screenpipe-app-tauri/src-tauri/tauri.conf.json` → `bundle.macOS.signingIdentity`
 - This ensures macOS TCC recognizes the app across rebuilds (permissions persist)
 - Other devs without the cert will see permission issues — onboarding has "continue anyway" button after 5s
+- The app must be in `/Applications` for macOS to grant TCC permissions properly
+- Deploy after building:
+  ```bash
+  rm -rf "/Applications/Alioth.app"
+  cp -R "src-tauri/target/release/bundle/macos/Alioth.app" "/Applications/Alioth.app"
+  chmod +x "/Applications/Alioth.app/Contents/MacOS/bun"
+  codesign --force --sign "Screenpipe Dev Signing" --deep "/Applications/Alioth.app"
+  open "/Applications/Alioth.app"
+  ```
+- The `chmod +x` on bun is needed because Tauri's bundler strips execute bits
+- Other devs need their own self-signed code signing cert (via openssl + security import)
+
+## Post-Merge Verification
+After every upstream merge, run:
+```bash
+bun test __tests__/merge-integration-checklist.test.ts
+```
+This verifies: Bedrock credential chain (5 links), preset defaults, binary permissions, signing config, Alioth branding, and Activity nav wiring. All 16 tests must pass before building.
 
 ## macOS Build Dependencies
 ```bash
 brew install pkg-config ffmpeg jq cmake wget git-lfs
 ```
+
+### VisionManager resilience
+
+The VisionManager uses event-driven capture triggered by OS events (clicks, app switches, visual changes, idle timer). If monitors disconnect (e.g., undocking a laptop), the monitor_watcher retries `start()` every 5 seconds until displays become available again. Audio capture has independent recovery and continues working even when vision is stalled.
+
+## A/B test learnings (Mar-Apr 2026)
+- "automations" converts better than "pipes" for checkout (+32-95% lift)
+- shorter landing page (no search/chat/privacy sections) converts better (+78% lift)
+- hero headline "agents that watch you" vs "your computer finally works" -- no difference
+- showing price in hero CTA ("$99/mo") slightly hurts vs plain "DOWNLOAD" (-18%)
+- prominent guarantee banner above pricing -- no effect
+- annual plan shown first doubles annual uptake (36% vs 18%), similar total checkout rate
 
 ## LiteLLM Proxy (local AI routing)
 
