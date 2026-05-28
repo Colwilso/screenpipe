@@ -46,6 +46,7 @@ import { StandaloneChat } from "@/components/standalone-chat";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
+import { useRouter } from "next/navigation";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
@@ -89,6 +90,7 @@ const MODAL_SECTIONS = new Set<string>([
 ]);
 
 function SettingsPageContent() {
+  const router = useRouter();
   const [activeSection, setActiveSection] = useQueryState("section", {
     defaultValue: "home",
     parse: (value) => {
@@ -174,20 +176,22 @@ function SettingsPageContent() {
     return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
-  // Watch pipe: navigate to chat when user clicks "watch" on a running pipe
+  // Watch pipe: navigate back to home when user clicks "watch" on a running pipe
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     listen<{ pipeName: string; executionId: number }>("watch_pipe", () => {
-      setActiveSection("home");
+      router.push("/home");
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };
-  }, [setActiveSection]);
+  }, [router]);
 
-  // Settings modal state
-  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
-  const [modalSection, setModalSection] = useState<SettingsModalSection>("general");
+  // Settings modal state — always opens on this page since this IS the settings page
+  const [settingsModalOpen, setSettingsModalOpen] = useState(true);
+  const [modalSection, setModalSection] = useState<SettingsModalSection>(
+    MODAL_SECTIONS.has(activeSection) ? activeSection as SettingsModalSection : "general"
+  );
 
-  // Open modal when URL points to a modal section
+  // Sync modal section when URL changes
   useEffect(() => {
     if (MODAL_SECTIONS.has(activeSection)) {
       setModalSection(activeSection as SettingsModalSection);
@@ -203,11 +207,8 @@ function SettingsPageContent() {
 
   const closeModal = useCallback(() => {
     setSettingsModalOpen(false);
-    // Reset URL to last main section
-    if (MODAL_SECTIONS.has(activeSection)) {
-      setActiveSection("home");
-    }
-  }, [activeSection, setActiveSection]);
+    router.push("/home");
+  }, [router]);
 
   const renderMainSection = () => {
     switch (activeSection) {
@@ -251,7 +252,7 @@ function SettingsPageContent() {
     }
   };
 
-  // Top-level nav items
+  // Top-level nav items — these navigate back to /home with the appropriate section
   const mainSections = [
     { id: "home", label: "Home", icon: <Home className="h-4 w-4" /> },
     { id: "pipes", label: "Pipes", icon: <Workflow className="h-4 w-4" /> },
@@ -284,18 +285,21 @@ function SettingsPageContent() {
     const unlisten = listen<{ url: string }>("navigate", (event) => {
       const url = new URL(event.payload.url, window.location.origin);
       const section = url.searchParams.get("section");
-      if (section && ALL_SECTIONS.includes(section)) {
-        const mapped = section === "feedback" ? "help"
-          : (section === "disk-usage" || section === "cloud-archive" || section === "cloud-sync") ? "storage"
-          : section;
+      if (!section || !ALL_SECTIONS.includes(section)) return;
+      const mapped = section === "feedback" ? "help"
+        : (section === "disk-usage" || section === "cloud-archive" || section === "cloud-sync") ? "storage"
+        : section;
+      if (MODAL_SECTIONS.has(mapped)) {
         setActiveSection(mapped);
+      } else {
+        router.push(`/home?section=${mapped}`);
       }
     });
 
     return () => {
       unlisten.then((unlistenFn) => unlistenFn());
     };
-  }, [setActiveSection]);
+  }, [setActiveSection, router]);
 
   const isFullHeight = activeSection === "home" || activeSection === "timeline";
 
@@ -366,13 +370,13 @@ function SettingsPageContent() {
               {/* Main sections */}
               <div className="space-y-0.5">
                 {mainSections.map((section) => {
-                  const isActive = activeSection === section.id && !settingsModalOpen;
+                  const isActive = false;
                   const btn = (
                     <button
                       key={section.id}
                       onClick={() => {
-                        setActiveSection(section.id);
-                        setSettingsModalOpen(false);
+                        const target = section.id === "home" ? "/home" : `/home?section=${section.id}`;
+                        router.push(target);
                       }}
                       className={cn(
                         "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
@@ -502,12 +506,11 @@ function SettingsPageContent() {
 
                 {/* Help */}
                 {(() => {
-                  const isActive = activeSection === "help" && !settingsModalOpen;
+                  const isActive = false;
                   const btn = (
                     <button
                       onClick={() => {
-                        setActiveSection("help");
-                        setSettingsModalOpen(false);
+                        router.push("/home?section=help");
                       }}
                       className={cn(
                         "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
