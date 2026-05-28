@@ -176,6 +176,7 @@ impl CaptureSession {
                 shutdown_tx.subscribe(),
                 Some(meeting_detector),
                 close_orphaned_meetings_on_start,
+                config.disable_meeting_typed_text,
             );
             info!("meeting watcher started (v2 UI scanning)");
         } else {

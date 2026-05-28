@@ -173,6 +173,8 @@ pub struct AppState {
     pub retention_state: crate::retention::RetentionState,
     /// Vault lock manager — encrypts data at rest when locked
     pub vault: screenpipe_vault::VaultManager,
+    /// When true, meeting notes will not include typed text
+    pub disable_meeting_typed_text: bool,
     /// Active manually-started meeting id (set via POST /meetings/start, cleared via POST /meetings/stop)
     pub manual_meeting: Arc<tokio::sync::RwLock<Option<i64>>>,
     /// Browser extension bridge — relays JS eval requests to the connected extension
@@ -219,6 +221,8 @@ pub struct SCServer {
     /// Shared pipe permission token registry — set before starting so PipeManager can use it.
     pub pipe_permissions:
         Arc<DashMap<String, Arc<screenpipe_core::pipes::permissions::PipePermissions>>>,
+    /// When true, meeting notes will not include typed text
+    pub disable_meeting_typed_text: bool,
     /// Shared manual meeting lock — pass in from binary so persister and server share the same state.
     pub manual_meeting: Option<Arc<tokio::sync::RwLock<Option<i64>>>>,
     /// Owned browser instance — set by the desktop shell so it can attach an
@@ -265,6 +269,7 @@ impl SCServer {
             hot_frame_cache: None,
             power_manager: None,
             pipe_permissions: Arc::new(DashMap::new()),
+            disable_meeting_typed_text: true,
             manual_meeting: None,
             owned_browser: None,
             api_auth: false,
@@ -524,6 +529,7 @@ impl SCServer {
             retention_state: crate::retention::RetentionState::new(),
             pipe_permissions: self.pipe_permissions.clone(),
             vault: screenpipe_vault::VaultManager::new(self.screenpipe_dir.clone()),
+            disable_meeting_typed_text: self.disable_meeting_typed_text,
             manual_meeting: self
                 .manual_meeting
                 .clone()

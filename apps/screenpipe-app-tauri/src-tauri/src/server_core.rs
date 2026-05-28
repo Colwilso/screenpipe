@@ -307,6 +307,7 @@ impl ServerCore {
         server.hot_frame_cache = Some(hot_frame_cache.clone());
         server.power_manager = Some(power_manager.clone());
         server.manual_meeting = Some(manual_meeting.clone());
+        server.disable_meeting_typed_text = config.disable_meeting_typed_text;
         server.api_auth = config.api_auth;
         server.api_auth_key = config.api_auth_key.clone();
         // Cloud JWT for /v1/chat/completions proxy. config.user_id carries

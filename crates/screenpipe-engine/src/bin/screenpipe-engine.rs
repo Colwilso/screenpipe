@@ -1021,6 +1021,7 @@ async fn main() -> anyhow::Result<()> {
     server.hot_frame_cache = Some(hot_frame_cache);
     server.power_manager = Some(power_manager);
     server.manual_meeting = Some(manual_meeting.clone());
+    server.disable_meeting_typed_text = config.disable_meeting_typed_text;
     server.api_auth = config.api_auth;
     server.api_auth_key = config.api_auth_key.clone();
     // Cloud JWT for the /v1/chat/completions proxy. CLI/binary path reads
@@ -1536,6 +1537,7 @@ async fn main() -> anyhow::Result<()> {
             shutdown_tx.subscribe(),
             Some(meeting_detector),
             true,
+            config.disable_meeting_typed_text,
         ))
     } else {
         info!("meeting watcher skipped because audio capture is disabled");

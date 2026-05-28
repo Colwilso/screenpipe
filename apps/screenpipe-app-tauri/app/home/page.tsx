@@ -1183,7 +1183,7 @@ function HomeContent() {
               {/* Bottom items */}
               <div className={cn("space-y-0.5 border-t pt-2", isTranslucent ? "vibrant-sidebar-border" : "border-border")}>
                 {/* Team link — hide invite promo in enterprise (unless team exists) */}
-                {(!isSectionHidden("team") || teamState.team) && (() => {
+                {false && (() => {
                   const teamLabel = teamState.team
                     ? `Your team (${teamState.members.length})`
                     : "Invite your team";
@@ -1211,8 +1211,8 @@ function HomeContent() {
                   return btn;
                 })()}
 
-                {/* Get free month — hidden in enterprise */}
-                {!isSectionHidden("referral") && (() => {
+                {/* Get free month — hidden (private fork) */}
+                {false && (() => {
                   const btn = (
                     <button
                       onClick={() => openSettings("referral")}

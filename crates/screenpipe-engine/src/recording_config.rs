@@ -145,6 +145,9 @@ pub struct RecordingConfig {
     /// See `RecordingSettings.disable_meeting_detector` for details.
     pub disable_meeting_detector: bool,
 
+    /// When true, meeting notes will not include typed text.
+    pub disable_meeting_typed_text: bool,
+
     /// Mitsukeru fork: overrides for event-driven capture parameters.
     /// None = follow active PowerProfile.
     pub idle_capture_interval_ms: Option<u64>,
@@ -291,6 +294,7 @@ impl RecordingConfig {
             max_snapshot_width: settings.max_snapshot_width,
             disable_snapshot_compaction: settings.disable_snapshot_compaction,
             disable_meeting_detector: settings.disable_meeting_detector,
+            disable_meeting_typed_text: settings.disable_meeting_typed_text,
             idle_capture_interval_ms: settings.idle_capture_interval_ms,
             visual_check_interval_ms: settings.visual_check_interval_ms,
             visual_change_threshold: settings.visual_change_threshold,

@@ -566,7 +566,7 @@ pub(crate) async fn stop_meeting_handler(
 
     state
         .db
-        .end_meeting_with_typed_text(id, &now, true)
+        .end_meeting_with_typed_text(id, &now, !state.disable_meeting_typed_text)
         .await
         .map_err(|e| {
             (

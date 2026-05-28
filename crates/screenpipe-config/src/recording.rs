@@ -169,6 +169,11 @@ pub struct RecordingSettings {
     #[serde(rename = "disableMeetingDetector", default)]
     pub disable_meeting_detector: bool,
 
+    /// When true, meeting notes will NOT include text typed during the meeting.
+    /// Prevents sensitive input (passwords, etc.) from leaking into notes.
+    #[serde(rename = "disableMeetingTypedText", default = "default_true")]
+    pub disable_meeting_typed_text: bool,
+
     // ── Mitsukeru fork: event-driven capture overrides ─────────────────
     // ミツケル拡張：PowerProfile に依らず個別パラメータを直接指定するための上書き値。
     // None の場合は通常通り PowerProfile が決定。デスクトップ常時記録のような用途で
@@ -438,6 +443,7 @@ impl Default for RecordingSettings {
             max_snapshot_width: default_max_snapshot_width(),
             disable_snapshot_compaction: false,
             disable_meeting_detector: false,
+            disable_meeting_typed_text: true,
             idle_capture_interval_ms: None,
             visual_check_interval_ms: None,
             visual_change_threshold: None,

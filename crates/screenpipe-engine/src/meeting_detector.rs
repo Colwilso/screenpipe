@@ -2239,6 +2239,7 @@ pub async fn run_meeting_detection_loop(
     scan_interval: Option<Duration>,
     detector: Option<Arc<screenpipe_audio::meeting_detector::MeetingDetector>>,
     close_orphaned_meetings_on_start: bool,
+    disable_meeting_typed_text: bool,
 ) {
     let profiles = load_detection_profiles();
     let scanner = Arc::new(MeetingUiScanner::new());
@@ -2480,7 +2481,7 @@ pub async fn run_meeting_detection_loop(
             state = new_state;
             if let Some(meeting_id) = ended_id {
                 let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
+                match db.end_meeting_with_typed_text(meeting_id, &now, !disable_meeting_typed_text).await {
                     Ok(()) => {
                         if let Err(e) = screenpipe_events::send_event(
                             "meeting_ended",
@@ -2692,7 +2693,7 @@ pub async fn run_meeting_detection_loop(
                 StateAction::EndMeeting { meeting_id } => {
                     if meeting_id >= 0 {
                         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                        match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
+                        match db.end_meeting_with_typed_text(meeting_id, &now, !disable_meeting_typed_text).await {
                             Ok(()) => {
                                 info!("meeting v2: meeting ended (id={})", meeting_id);
                                 // Emit event so triggered pipes can react

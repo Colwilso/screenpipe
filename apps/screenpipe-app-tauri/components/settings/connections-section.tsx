@@ -1217,7 +1217,7 @@ function OAuthPanel({
   onDisconnected?: () => void;
 }) {
   const { settings } = useSettings();
-  const isPro = !!settings.user?.cloud_subscribed;
+  const isPro = true;
   const [status, setStatus] = useState<"idle" | "loading">("idle");
   const [accounts, setAccounts] = useState<OAuthAccount[]>([]);
   const [disconnecting, setDisconnecting] = useState<string | null>(null);

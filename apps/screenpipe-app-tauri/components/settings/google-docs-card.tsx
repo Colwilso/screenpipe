@@ -23,7 +23,7 @@ interface DriveFile {
 
 export function GoogleDocsCard() {
   const { settings } = useSettings();
-  const isPro = !!settings.user?.cloud_subscribed;
+  const isPro = true;
   const [connected, setConnected] = useState(false);
   const [email, setEmail] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);

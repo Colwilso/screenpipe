@@ -45,7 +45,7 @@ export function PostInstallConnectionsModal({
   connections,
 }: PostInstallConnectionsModalProps) {
   const { settings } = useSettings();
-  const isPro = !!settings.user?.cloud_subscribed;
+  const isPro = true;
   const [statuses, setStatuses] = useState<Record<string, ConnectionStatus>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
