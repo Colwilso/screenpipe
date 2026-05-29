@@ -32,7 +32,9 @@ static OAUTH: OAuthConfig = OAuthConfig {
             "offline_access openid profile \
              Mail.Read Mail.ReadWrite Mail.Send \
              Calendars.Read Calendars.ReadWrite \
-             Files.Read Files.ReadWrite",
+             Files.Read Files.ReadWrite \
+             Chat.ReadWrite \
+             Team.ReadBasic.All ChannelMessage.Read.All",
         ),
         ("prompt", "consent"),
     ],
