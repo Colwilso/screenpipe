@@ -32,7 +32,9 @@ static OAUTH: OAuthConfig = OAuthConfig {
             "offline_access openid profile \
              Mail.Read Mail.ReadWrite Mail.Send \
              Calendars.Read Calendars.ReadWrite \
-             Files.Read Files.ReadWrite",
+             Files.Read Files.ReadWrite \
+             Chat.ReadWrite \
+             Team.ReadBasic.All ChannelMessage.Read.All",
         ),
         // select_account so a second connect shows Microsoft's account picker
         // instead of silently consenting under the already-signed-in account —
