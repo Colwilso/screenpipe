@@ -215,9 +215,17 @@ This is **Colin's fork** (Alioth) of upstream screenpipe. The product name is Al
 These are the things that upstream screenpipe does NOT have and that every merge will try to revert:
 - `tauri.conf.json`: `productName` must be `"Alioth"` (not `"screenpipe - Development"`)
 - `app/home/page.tsx`: sidebar header says `alioth`, Activity nav item exists with BarChart3 icon
+- `app/home/page.tsx`: "Invite your team" and "Get free month" buttons hidden (`{false && ...}`)
 - `components/activity/` directory: the Activity dashboard (chart, app usage, log table)
 - `lib/activity-categories.ts` and `lib/hooks/use-activity-data.ts`
 - `components/settings/ai-presets.tsx`: single Bedrock provider card with `bedrock-logo.png`
+- `components/settings/connections-section.tsx`, `google-docs-card.tsx`, `gmail-card.tsx`, `post-install-connections-modal.tsx`: `isPro = true` (bypasses cloud subscription check)
+- `src-tauri/src/oauth.rs`: Rust-side pro gate removed (allows OAuth connect without subscription)
+- `crates/screenpipe-connect/src/connections/microsoft365.rs`: Teams scopes removed (only Mail/Calendar/OneDrive)
+- `crates/screenpipe-config/src/recording.rs`: `disableMeetingTypedText` field (defaults true -- prevents passwords from leaking into meeting notes)
+
+### Known limitations (not fixable via code)
+- **Microsoft 365 OAuth**: The Amazon Entra ID tenant blocks all unverified third-party apps. Screenpipe's Azure AD app registration (`be765a6d-...`) is unverified, so the M365 "connect" button will show an "admin approval required" error for `@amazon.com` accounts. No scope reduction or code change fixes this -- requires either IT admin consent or using a personal Microsoft account.
 
 ### Post-merge checklist (mandatory before building)
 ```bash
@@ -233,6 +241,17 @@ bun test __tests__/merge-integration-checklist.test.ts
 # 3. Verify no duplicate provider cards
 grep -c 'type="bedrock"' apps/screenpipe-app-tauri/components/settings/ai-presets.tsx
 # should be 1, not 2
+
+# 4. Verify pro gate is removed (Alioth has no cloud subscription)
+grep 'isPro = true' apps/screenpipe-app-tauri/components/settings/connections-section.tsx
+grep -v 'cloud_subscribed' apps/screenpipe-app-tauri/src-tauri/src/oauth.rs | grep -q 'Pro subscription' && echo "FAIL: pro gate re-added" || echo "OK: no pro gate"
+
+# 5. Verify team/referral buttons are hidden
+grep -c '{false && (() =>' apps/screenpipe-app-tauri/app/home/page.tsx
+# should be 2 (team + referral)
+
+# 6. Verify meeting typed text config exists
+grep 'disable_meeting_typed_text' crates/screenpipe-config/src/recording.rs
 ```
 
 ### WebKit cache (critical)
