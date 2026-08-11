@@ -333,6 +333,7 @@ impl PiExecutor {
             user_token: Arc::new(ArcSwap::new(Arc::new(user_token))),
             api_url: SCREENPIPE_API_URL.to_string(),
             api_auth_key: None,
+            aws_bedrock_creds: std::sync::Mutex::new((None, None)),
         }
     }
 
