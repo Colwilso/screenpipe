@@ -1604,10 +1604,6 @@ pub struct PiProviderConfig {
     /// Optional system prompt from AI preset (appended to Pi's built-in system prompt)
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// AWS profile name for Bedrock provider
-    pub aws_profile: Option<String>,
-    /// AWS region for Bedrock provider
-    pub aws_region: Option<String>,
 }
 
 fn default_max_tokens() -> i32 {
